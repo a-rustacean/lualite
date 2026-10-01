@@ -38,7 +38,28 @@ inline fn mkToken2(kind: Token.Kind, start: usize, len: u32) Token {
     };
 }
 
-pub fn peakToken(lexer: *const @This()) !?Token {
+inline fn mkToken3(kind: Token.Kind, start: usize, end: usize) Token {
+    return .{
+        .kind = kind,
+        .span = .{
+            .start = @intCast(start),
+            .end = @intCast(end),
+        },
+    };
+}
+
+// assumes the lexer is currently at either single or double quote
+fn lexString(lexer: *const @This()) !Token {
+    const quote: u8 = lexer.source[lexer.current_char_idx];
+    var end = lexer.current_char_idx + 1;
+
+    while (true) : (end += 1) {
+        if (end >= lexer.source.len) return error.UnexpectedEOF;
+        if (lexer.source[end] == quote) return mkToken3(.str, lexer.current_char_idx, end + 1);
+    }
+}
+
+pub fn peakToken(lexer: *const @This()) !Token {
     const start = lexer.current_char_idx;
 
     if (start >= lexer.source.len) return mkToken2(.eof, start, 0);
@@ -53,9 +74,7 @@ pub fn peakToken(lexer: *const @This()) !?Token {
         // TAB, LF, CR, space (whitespace)
         0x09, 0x0A, 0x0D, 0x20 => mkToken(.skip, start),
         // 0x22
-        '"' => {
-            @panic("TODO: lex string");
-        },
+        '"' => try lexer.lexString(),
         // 0x23
         '#' => mkToken(.hash, start),
         // 0x25
@@ -63,9 +82,7 @@ pub fn peakToken(lexer: *const @This()) !?Token {
         // 0x26
         '&' => mkToken(.amp, start),
         // 0x27
-        '\'' => {
-            @panic("TODO: lex string");
-        },
+        '\'' => try lexer.lexString(),
         // 0x28
         '(' => mkToken(.lparen, start),
         // 0x29
