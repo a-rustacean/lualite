@@ -60,6 +60,71 @@ fn lexString(lexer: *const @This()) !Token {
     }
 }
 
+// assumes the lexer is currently at A..Z | a..z | _
+fn lexIdent(lexer: *const @This()) Token {
+    const start = lexer.current_char_idx;
+    var end = start + 1;
+
+    while (true) : (end += 1) {
+        if (end >= lexer.source.len) break;
+        switch (lexer.source[end]) {
+            '0'...'9', 'A'...'Z', 'a'...'z', '_' => {},
+            _ => break,
+        }
+    }
+
+    const ident = lexer.source[start..end];
+
+    // smallest ident is 2 chars
+    if (ident.len < 2) return mkToken2(.ident, start, ident.len);
+
+    switch (ident[0]) {
+        'a' => if (std.mem.eql(u8, ident, "and")) return mkToken2(.@"and", start, ident.len),
+        'b' => if (std.mem.eql(u8, ident, "break")) return mkToken2(.@"break", start, ident.len),
+        'd' => if (std.mem.eql(u8, ident, "do")) return mkToken2(.do, start, ident.len),
+        'e' => if (std.mem.eql(u8, ident, "else")) {
+            return mkToken2(.@"else", start, ident.len);
+        } else if (std.mem.eql(u8, ident, "elseif")) {
+            return mkToken2(.elseif, start, ident.len);
+        } else if (std.mem.eql(u8, ident, "end")) {
+            return mkToken2(.end, start, ident.len);
+        },
+        'f' => if (std.mem.eql(u8, ident, "false")) {
+            return mkToken2(.false, start, ident.len);
+        } else if (std.mem.eql(u8, ident, "for")) {
+            return mkToken2(.@"for", start, ident.len);
+        } else if (std.mem.eql(u8, ident, "function")) {
+            return mkToken2(.function, start, ident.len);
+        },
+        'g' => if (std.mem.eql(u8, ident, "goto")) return mkToken2(.goto, start, ident.len),
+        'i' => if (std.mem.eql(u8, ident, "if")) {
+            return mkToken2(.@"if", start, ident.len);
+        } else if (std.mem.eql(u8, ident, "in")) {
+            return mkToken2(.in, start, ident.len);
+        },
+        'l' => if (std.mem.eql(u8, ident, "local")) return mkToken2(.local, start, ident.len),
+        'n' => if (std.mem.eql(u8, ident, "nil")) {
+            return mkToken2(.nil, start, ident.len);
+        } else if (std.mem.eql(u8, ident, "not")) {
+            return mkToken2(.not, start, ident.len);
+        },
+        'o' => if (std.mem.eql(u8, ident, "or")) return mkToken2(.@"or", start, ident.len),
+        'r' => if (std.mem.eql(u8, ident, "repeat")) {
+            return mkToken2(.repeat, start, ident.len);
+        } else if (std.mem.eql(u8, ident, "return")) {
+            return mkToken2(.@"return", start, ident.len);
+        },
+        't' => if (std.mem.eql(u8, ident, "then")) {
+            return mkToken2(.then, start, ident.len);
+        } else if (std.mem.eql(u8, ident, "true")) {
+            return mkToken2(.true, start, ident.len);
+        },
+        'u' => if (std.mem.eql(u8, ident, "until")) return mkToken2(.until, start, ident.len),
+        'w' => if (std.mem.eql(u8, ident, "while")) return mkToken2(.@"while", start, ident.len),
+        _ => return mkToken2(.ident, start, ident.len),
+    }
+}
+
 pub fn peakToken(lexer: *const @This()) !Token {
     const start = lexer.current_char_idx;
 
@@ -158,10 +223,8 @@ pub fn peakToken(lexer: *const @This()) !Token {
             // ">>"
             mkToken2(.shift_right, start, 2),
         // 0x41 ... 0x5A
-        'A'...'Z', '_', 'a'...'z' => {
-            @panic("TODO: lex identifiers");
-        },
-        // 0x5B
+        'A'...'Z', '_', 'a'...'z' => try lexer.lexIdent(),
+        // 0x5B, TODO: long strings
         '[' => mkToken(.lbrack, start),
         // 0x5D
         ']' => mkToken(.rbrack, start),
