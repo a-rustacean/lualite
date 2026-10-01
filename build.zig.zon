@@ -1,0 +1,11 @@
+.{
+    .name = .lualite,
+    .version = "0.0.0",
+    .fingerprint = 0x6ebaaa5195aa9d01,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
