@@ -54,10 +54,16 @@ fn lexString(lexer: *const @This()) !Token {
     const quote: u8 = lexer.source[lexer.current_char_idx];
     var curr = lexer.current_char_idx + 1;
 
-    while (true) : (curr += 1) {
-        if (curr >= lexer.source.len) return error.UnexpectedEOF;
-        if (lexer.source[curr] == quote) return mkToken3(.str, lexer.current_char_idx, curr + 1);
+    while (curr < lexer.source.len) : (curr += 1) {
+        switch (lexer.source[curr]) {
+            '\\' => curr += 1, // skip escaped character
+            quote => return mkToken3(.str, lexer.current_char_idx, curr + 1),
+            '\n', '\r' => return error.UnexpectedNewline,
+            else => {},
+        }
     }
+
+    return error.UnexpectedEOF;
 }
 
 // assumes the lexer is currently at A..Z | a..z | _
