@@ -26,14 +26,15 @@ inline fn mkToken(kind: Token.Kind, start: usize) Token {
     };
 }
 
-inline fn mkToken2(kind: Token.Kind, start: usize, len: u32) Token {
+inline fn mkToken2(kind: Token.Kind, start: usize, len: usize) Token {
     const start32: u32 = @intCast(start);
+    const len32: u32 = @intCast(len);
 
     return .{
         .kind = kind,
         .span = .{
             .start = start32,
-            .end = start32 + len,
+            .end = start32 + len32,
         },
     };
 }
