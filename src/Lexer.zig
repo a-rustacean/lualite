@@ -52,11 +52,11 @@ inline fn mkToken3(kind: Token.Kind, start: usize, end: usize) Token {
 // assumes the lexer is currently at either single or double quote
 fn lexString(lexer: *const @This()) !Token {
     const quote: u8 = lexer.source[lexer.current_char_idx];
-    var end = lexer.current_char_idx + 1;
+    var curr = lexer.current_char_idx + 1;
 
-    while (true) : (end += 1) {
-        if (end >= lexer.source.len) return error.UnexpectedEOF;
-        if (lexer.source[end] == quote) return mkToken3(.str, lexer.current_char_idx, end + 1);
+    while (true) : (curr += 1) {
+        if (curr >= lexer.source.len) return error.UnexpectedEOF;
+        if (lexer.source[curr] == quote) return mkToken3(.str, lexer.current_char_idx, curr + 1);
     }
 }
 
