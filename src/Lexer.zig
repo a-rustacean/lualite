@@ -137,7 +137,7 @@ pub fn peekToken(lexer: *const @This()) !Token {
     if (start >= lexer.source.len) return mkToken2(.eof, start, 0);
 
     const char = lexer.source[start];
-    if (char >= std.math.maxInt(u7)) return error.NonAscii;
+    if (char > std.math.maxInt(u7)) return error.NonAscii;
 
     const ascii_char: u7 = @intCast(char);
     const token: Token = switch (ascii_char) {
