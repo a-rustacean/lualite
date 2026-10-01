@@ -125,7 +125,7 @@ fn lexIdent(lexer: *const @This()) Token {
     }
 }
 
-pub fn peakToken(lexer: *const @This()) !Token {
+pub fn peekToken(lexer: *const @This()) !Token {
     const start = lexer.current_char_idx;
 
     if (start >= lexer.source.len) return mkToken2(.eof, start, 0);
