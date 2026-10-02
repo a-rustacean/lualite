@@ -119,6 +119,67 @@ test "lone opening bracket still lexes" {
     try expectToken("[ ", .lbrack, 0, 1);
 }
 
+test "long string [[...]]" {
+    try expectToken("[[abc]]", .long_str, 0, 7);
+    try expectToken("[[]]", .long_str, 0, 4);
+    // a lone `]` is content, only `]]` closes
+    try expectToken("[[a]b]]", .long_str, 0, 7);
+    // newlines are content, so long strings can span lines
+    try expectToken("[[a\nb]]", .long_str, 0, 7);
+    // no escape processing, the backslash is just a byte
+    try expectToken("[[a\\nb]]", .long_str, 0, 8);
+}
+
+test "long string closes at the first `]]`" {
+    // everything past the literal is separate code
+    try expectToken("[[a]]b]]", .long_str, 0, 5);
+
+    // peekToken only ever returns the first token, so point a lexer past
+    // the literal to check what follows it
+    const trailing = Lexer{ .source = "[[a]]b]] y", .current_char_idx = 9 };
+    const after = try trailing.peekToken();
+    try std.testing.expectEqual(Token.Kind.ident, after.kind);
+    try std.testing.expectEqual(@as(u32, 9), after.span.start);
+    try std.testing.expectEqual(@as(u32, 10), after.span.end);
+}
+
+test "long string [==[...]==]" {
+    try expectToken("[==[abc]==]", .long_str, 0, 11);
+    try expectToken("[=[abc]=]", .long_str, 0, 9);
+    try expectToken("[=[]=]", .long_str, 0, 6);
+    try expectToken("[==[]==]", .long_str, 0, 8);
+    // brackets of a different level are ordinary content
+    try expectToken("[==[[a]]]==]", .long_str, 0, 12);
+}
+
+test "long string with higher nesting level" {
+    // the closer must match the level: `]===]`, not `]==]`
+    try expectToken("[===[a]]==]===]", .long_str, 0, 15);
+    // same for level 2: `]==b]==]` is content, `]==]` closes
+    try expectToken("[==[a]==b]==]", .long_str, 0, 13);
+}
+
+test "unterminated long string is UnexpectedEOF" {
+    try expectErr("[[abc", error.UnexpectedEOF);
+    try expectErr("[[", error.UnexpectedEOF);
+    try expectErr("[=[abc", error.UnexpectedEOF);
+    try expectErr("[==[abc", error.UnexpectedEOF);
+    // closer present but at the wrong nesting level
+    try expectErr("[===[abc]==]", error.UnexpectedEOF);
+}
+
+test "bracket that does not open a long string is lbrack" {
+    // nothing follows the bracket
+    try expectToken("[ ", .lbrack, 0, 1);
+    // indexing and table literals still lex
+    try expectToken("[1]", .lbrack, 0, 1);
+    try expectToken("[a[b]]", .lbrack, 0, 1);
+    try expectToken("[]]", .lbrack, 0, 1);
+    // an `=` run that never reaches a `[`
+    try expectToken("[==]", .lbrack, 0, 1);
+    try expectToken("[==", .lbrack, 0, 1);
+}
+
 test "integer numerals" {
     try expectToken("42", .decimal, 0, 2);
     try expectToken("0", .decimal, 0, 1);
