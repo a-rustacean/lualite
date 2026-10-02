@@ -118,3 +118,79 @@ test "lone opening bracket still lexes" {
     try expectToken("[", .lbrack, 0, 1);
     try expectToken("[ ", .lbrack, 0, 1);
 }
+
+test "integer numerals" {
+    try expectToken("42", .decimal, 0, 2);
+    try expectToken("0", .decimal, 0, 1);
+    // leading zeros are decimal, not octal
+    try expectToken("007", .decimal, 0, 3);
+    try expectToken("  12  ", .decimal, 2, 4);
+    // a sign is never part of a numeral
+    try expectToken("1+x", .decimal, 0, 1);
+    try expectToken("1-x", .decimal, 0, 1);
+    try expectToken("1--c\nx", .decimal, 0, 1);
+}
+
+test "fractional numerals" {
+    try expectToken("4.2", .float, 0, 3);
+    try expectToken("0.5", .float, 0, 3);
+    // trailing dot with no digits is still a float
+    try expectToken("1.", .float, 0, 2);
+    try expectToken("1.5+x", .float, 0, 3);
+}
+
+test "leading dot numerals" {
+    try expectToken(".5", .float, 0, 2);
+    try expectToken(".5+x", .float, 0, 2);
+    try expectToken(".5e2", .float, 0, 4);
+}
+
+test "dot that does not start a numeral" {
+    // a dot is only part of a numeral when a digit follows it
+    try expectToken(".", .dot, 0, 1);
+    try expectToken(".a", .dot, 0, 1);
+    try expectToken("..", .dot2, 0, 2);
+    try expectToken("...", .dot3, 0, 3);
+    try expectToken("..5", .dot2, 0, 2);
+}
+
+test "exponent numerals" {
+    try expectToken("1e10", .float, 0, 4);
+    try expectToken("1E10", .float, 0, 4);
+    try expectToken("1e+10", .float, 0, 5);
+    try expectToken("1e-5", .float, 0, 4);
+    try expectToken("1.5e-3", .float, 0, 6);
+    try expectToken(".5E+1", .float, 0, 5);
+}
+
+test "hex numerals" {
+    try expectToken("0xff", .decimal, 0, 4);
+    try expectToken("0XFF", .decimal, 0, 4);
+    // `E` is a hex digit here, not an exponent mark
+    try expectToken("0xE", .decimal, 0, 3);
+    try expectToken("0x1.8", .float, 0, 5);
+    try expectToken("0x1p4", .float, 0, 5);
+    try expectToken("0x1P-4", .float, 0, 6);
+    try expectToken("0x.1p1", .float, 0, 6);
+    // the `+` ends the numeral, only `p` may be followed by a sign
+    try expectToken("0xe+1", .decimal, 0, 3);
+    // `e` is a hex digit, not an exponent mark, so it stays in the literal
+    try expectToken("0x1.5e2", .float, 0, 7);
+}
+
+test "malformed numbers" {
+    // numeral touching a letter
+    try expectErr("3a", error.MalformedNumber);
+    try expectErr("1_", error.MalformedNumber);
+    try expectErr("0xg", error.MalformedNumber);
+    // `..` is concatenation, not part of the numeral
+    try expectErr("1..2", error.MalformedNumber);
+    // no digits after the prefix or the exponent mark
+    try expectErr("0x", error.MalformedNumber);
+    try expectErr("0x.", error.MalformedNumber);
+    try expectErr("1e", error.MalformedNumber);
+    try expectErr("1e+", error.MalformedNumber);
+    try expectErr("1p4", error.MalformedNumber);
+    // only one exponent mark is allowed
+    try expectErr("1e5e5", error.MalformedNumber);
+}
