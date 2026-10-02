@@ -402,7 +402,10 @@ pub fn peekToken(lexer: *const @This()) Error!Token {
                 // "[[...]]" or "[==[...]==]"
                 mkTokenEnd(.long_str, span.start, span.end)
             else
-                // "["
+                // "[". Lua 5.4 raises `invalid long string delimiter` for an
+                // `=`-run that never reaches a second `[`, e.g. `[==`; we
+                // report the bracket instead and leave that diagnostic to
+                // the parser.
                 mkToken(.lbrack, start),
             // 0x5D
             ']' => mkToken(.rbrack, start),
