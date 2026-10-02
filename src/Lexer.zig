@@ -6,7 +6,6 @@ pub const Error = error{
     UnexpectedEOF,
     UnexpectedNewline,
     InvalidChar,
-    NonAscii,
 };
 
 source: []const u8,
@@ -145,12 +144,10 @@ pub fn peekToken(lexer: *const @This()) Error!Token {
     if (start >= lexer.source.len) return mkToken2(.eof, start, 0);
 
     const char = lexer.source[start];
-    if (char > std.math.maxInt(u7)) return error.NonAscii;
 
-    const ascii_char: u7 = @intCast(char);
-    const token: Token = switch (ascii_char) {
-        // control characters (error)
-        0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F, '!', '$', '?', '@', '\\', '`', 0x7F => return error.InvalidChar,
+    const token: Token = switch (char) {
+        // control characters / non-ascii
+        0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F, 0x7F...0xFF, '!', '$', '?', '@', '\\', '`' => return error.InvalidChar,
         // TAB, LF, CR, space (whitespace)
         0x09, 0x0A, 0x0D, 0x20 => mkToken(.skip, start),
         // 0x22
