@@ -2,6 +2,13 @@ const std = @import("std");
 
 const Token = @import("Token.zig");
 
+pub const Error = error{
+    UnexpectedEOF,
+    UnexpectedNewline,
+    InvalidChar,
+    NonAscii,
+};
+
 source: []const u8,
 current_char_idx: usize,
 token: Token = .{
@@ -48,7 +55,7 @@ inline fn mkToken3(kind: Token.Kind, start: usize, end: usize) Token {
 }
 
 // assumes the lexer is currently at either single or double quote
-fn lexString(lexer: *const @This()) !Token {
+fn lexString(lexer: *const @This()) Error!Token {
     const quote: u8 = lexer.source[lexer.current_char_idx];
     var curr = lexer.current_char_idx + 1;
 
@@ -132,7 +139,7 @@ fn lexIdent(lexer: *const @This()) Token {
     return mkToken2(.ident, start, ident.len);
 }
 
-pub fn peekToken(lexer: *const @This()) !Token {
+pub fn peekToken(lexer: *const @This()) Error!Token {
     const start = lexer.current_char_idx;
 
     if (start >= lexer.source.len) return mkToken2(.eof, start, 0);
