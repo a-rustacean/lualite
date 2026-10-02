@@ -164,8 +164,19 @@ pub fn peekToken(lexer: *const @This()) Error!Token {
             '+' => mkToken(.plus, start),
             // 0x2C
             ',' => mkToken(.comma, start),
-            // 0x2D, TODO: support comments
-            '-' => mkToken(.minus, start),
+            // 0x2D
+            '-' => if (((start + 1) >= lexer.source.len) or (lexer.source[start + 1] != '-'))
+                // "-"
+                mkToken(.minus, start)
+            else if (std.mem.findAny(u8, lexer.source[(start + 2)..], "\n\r")) |idx| {
+                // "--" comment, up to but excluding the newline
+                start = (start + 2) + idx + 1;
+                continue;
+            } else {
+                // "--" comment running to the end of the source
+                start = lexer.source.len;
+                continue;
+            },
             // 0x2E
             '.' => if (((start + 1) >= lexer.source.len) or (lexer.source[start + 1] != '.'))
                 // "."
