@@ -79,7 +79,7 @@ pub const Kind = enum(u8) {
     str,
 };
 
-const Span = struct {
+pub const Span = struct {
     start: u32,
     end: u32,
 };
