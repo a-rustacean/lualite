@@ -130,6 +130,58 @@ fn lexIdent(lexer: *const @This(), start: usize) Token {
     return mkToken2(.ident, start, ident.len);
 }
 
+// tries to lex a long string/comment, if no start pattern found returns null
+pub fn lexLong(lexer: *const @This(), start: usize) Error!?Token.Span {
+    if (start + 1 >= lexer.source.len) return null;
+    if (lexer.source[start] != '[') return null;
+
+    const next_char = lexer.source[start + 1];
+
+    switch (next_char) {
+        '=' => {
+            var eql_count: usize = 0;
+            var open = start + 1;
+
+            while (open < lexer.source.len and lexer.source[open] == '=') : (open += 1) {
+                eql_count += 1;
+            }
+
+            if (open >= lexer.source.len or lexer.source[open] != '[') return null;
+
+            // long start pattern confirmed
+
+            var scan = open + 1;
+
+            while (true) {
+                // closing run is ']' followed by eql_count '=' followed by ']'
+                if (scan + eql_count + 2 > lexer.source.len) return error.UnexpectedEOF;
+
+                if (lexer.source[scan] == ']' and
+                    std.mem.allEqual(u8, lexer.source[scan + 1 .. scan + eql_count + 1], '=') and
+                    lexer.source[scan + eql_count + 1] == ']')
+                {
+                    return .{
+                        .start = @intCast(start),
+                        .end = @intCast(scan + eql_count + 2),
+                    };
+                }
+
+                scan += 1;
+            }
+        },
+        '[' => {
+            if (std.mem.find(u8, lexer.source[(start + 2)..], "]]")) |idx| {
+                const end = start + 2 + idx + 2;
+                return .{
+                    .start = @intCast(start),
+                    .end = @intCast(end),
+                };
+            } else return error.UnexpectedEOF;
+        },
+        else => return null,
+    }
+}
+
 pub fn peekToken(lexer: *const @This()) Error!Token {
     var start = lexer.current_char_idx;
 
@@ -168,7 +220,10 @@ pub fn peekToken(lexer: *const @This()) Error!Token {
             '-' => if (((start + 1) >= lexer.source.len) or (lexer.source[start + 1] != '-'))
                 // "-"
                 mkToken(.minus, start)
-            else if (std.mem.findAny(u8, lexer.source[(start + 2)..], "\n\r")) |idx| {
+            else if (try lexLong(lexer, start + 2)) |span| {
+                start = span.end;
+                continue;
+            } else if (std.mem.findAny(u8, lexer.source[(start + 2)..], "\n\r")) |idx| {
                 // "--" comment, up to but excluding the newline
                 start = (start + 2) + idx + 1;
                 continue;
