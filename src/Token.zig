@@ -75,6 +75,7 @@ pub const Kind = enum(u8) {
 
     // string literal
     str,
+    long_str,
 };
 
 pub const Span = struct {

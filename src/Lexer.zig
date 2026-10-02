@@ -397,8 +397,13 @@ pub fn peekToken(lexer: *const @This()) Error!Token {
                 mkToken2(.shift_right, start, 2),
             // 0x41 ... 0x5A
             'A'...'Z', '_', 'a'...'z' => lexer.lexIdent(start),
-            // 0x5B, TODO: long strings
-            '[' => mkToken(.lbrack, start),
+            // 0x5B
+            '[' => if (try lexLong(lexer, start)) |span|
+                // "[[...]]" or "[==[...]==]"
+                mkToken3(.long_str, span.start, span.end)
+            else
+                // "["
+                mkToken(.lbrack, start),
             // 0x5D
             ']' => mkToken(.rbrack, start),
             // 0x5E
