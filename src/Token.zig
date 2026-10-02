@@ -1,6 +1,5 @@
 pub const Kind = enum(u8) {
     eof,
-    undetermined,
     skip, // whitespace, line breaks, comments
 
     // identifier
