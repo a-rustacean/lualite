@@ -252,23 +252,23 @@ pub fn lexLong(lexer: *const @This(), start: usize) Error!?Token.Span {
 
             // long start pattern confirmed
 
-            var scan = open + 1;
+            var cursor = open + 1;
 
             while (true) {
                 // closing run is ']' followed by eql_count '=' followed by ']'
-                if (scan + eql_count + 2 > lexer.source.len) return error.UnexpectedEOF;
+                if (cursor + eql_count + 2 > lexer.source.len) return error.UnexpectedEOF;
 
-                if (lexer.source[scan] == ']' and
-                    std.mem.allEqual(u8, lexer.source[scan + 1 .. scan + eql_count + 1], '=') and
-                    lexer.source[scan + eql_count + 1] == ']')
+                if (lexer.source[cursor] == ']' and
+                    std.mem.allEqual(u8, lexer.source[cursor + 1 .. cursor + eql_count + 1], '=') and
+                    lexer.source[cursor + eql_count + 1] == ']')
                 {
                     return .{
                         .start = @intCast(start),
-                        .end = @intCast(scan + eql_count + 2),
+                        .end = @intCast(cursor + eql_count + 2),
                     };
                 }
 
-                scan += 1;
+                cursor += 1;
             }
         },
         '[' => {
@@ -284,8 +284,22 @@ pub fn lexLong(lexer: *const @This(), start: usize) Error!?Token.Span {
     }
 }
 
+/// Lexes the token at `current_char_idx` without consuming it.
 pub fn peekToken(lexer: *const @This()) Error!Token {
-    var start = lexer.current_char_idx;
+    return lexer.scan(lexer.current_char_idx);
+}
+
+/// Lexes the token at `current_char_idx` and consumes it by moving the cursor
+/// to the end of its span. Past the last token this is a no-op, so calling it
+/// again just re-yields `.eof`.
+pub fn nextToken(lexer: *@This()) Error!Token {
+    const token = try lexer.scan(lexer.current_char_idx);
+    lexer.current_char_idx = token.span.end;
+    return token;
+}
+
+fn scan(lexer: *const @This(), from: usize) Error!Token {
+    var start = from;
 
     while (start < lexer.source.len) {
         const char = lexer.source[start];

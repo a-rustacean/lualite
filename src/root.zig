@@ -266,3 +266,70 @@ test "vertical tab and form feed are whitespace" {
     try expectToken("\x0B\x0Cx", .ident, 2, 3);
     try expectToken("\x0C\x0Bx", .ident, 2, 3);
 }
+
+test "nextToken consumes the token" {
+    var lexer = Lexer{ .source = "local x = \"hi\"", .current_char_idx = 0 };
+
+    const local = try lexer.nextToken();
+    try std.testing.expectEqual(Token.Kind.local, local.kind);
+    try std.testing.expectEqual(@as(usize, 5), lexer.current_char_idx);
+
+    const x = try lexer.nextToken();
+    try std.testing.expectEqual(Token.Kind.ident, x.kind);
+    try std.testing.expectEqual(@as(u32, 6), x.span.start);
+    try std.testing.expectEqual(@as(u32, 7), x.span.end);
+    try std.testing.expectEqual(@as(usize, 7), lexer.current_char_idx);
+
+    try std.testing.expectEqual(Token.Kind.eq, (try lexer.nextToken()).kind);
+
+    const str = try lexer.nextToken();
+    try std.testing.expectEqual(Token.Kind.str, str.kind);
+    try std.testing.expectEqual(@as(u32, 10), str.span.start);
+    try std.testing.expectEqual(@as(u32, 14), str.span.end);
+    try std.testing.expectEqual(@as(usize, 14), lexer.current_char_idx);
+
+    try std.testing.expectEqual(Token.Kind.eof, (try lexer.nextToken()).kind);
+}
+
+test "nextToken skips whitespace and comments" {
+    var lexer = Lexer{ .source = "  -- c\n  x", .current_char_idx = 0 };
+
+    const x = try lexer.nextToken();
+    try std.testing.expectEqual(Token.Kind.ident, x.kind);
+    try std.testing.expectEqual(@as(u32, 9), x.span.start);
+    try std.testing.expectEqual(@as(u32, 10), x.span.end);
+}
+
+test "nextToken repeats eof without moving" {
+    var lexer = Lexer{ .source = "x", .current_char_idx = 0 };
+    _ = try lexer.nextToken();
+    try std.testing.expectEqual(@as(usize, 1), lexer.current_char_idx);
+
+    const first = try lexer.nextToken();
+    const second = try lexer.nextToken();
+
+    try std.testing.expectEqual(Token.Kind.eof, first.kind);
+    try std.testing.expectEqual(first.kind, second.kind);
+    try std.testing.expectEqual(first.span.start, second.span.start);
+    try std.testing.expectEqual(@as(usize, 1), lexer.current_char_idx);
+}
+
+test "nextToken from mid source" {
+    var lexer = Lexer{ .source = "[[a]]b]] y", .current_char_idx = 9 };
+
+    const y = try lexer.nextToken();
+    try std.testing.expectEqual(Token.Kind.ident, y.kind);
+    try std.testing.expectEqual(@as(u32, 9), y.span.start);
+    try std.testing.expectEqual(@as(u32, 10), y.span.end);
+    try std.testing.expectEqual(@as(usize, 10), lexer.current_char_idx);
+}
+
+test "nextToken leaves the cursor put on error" {
+    var lexer = Lexer{ .source = "x $", .current_char_idx = 0 };
+    _ = try lexer.nextToken();
+    try std.testing.expectEqual(@as(usize, 1), lexer.current_char_idx);
+
+    try std.testing.expectError(error.InvalidChar, lexer.nextToken());
+    // the offending `$` is still there to be retried or reported on
+    try std.testing.expectEqual(@as(usize, 1), lexer.current_char_idx);
+}
