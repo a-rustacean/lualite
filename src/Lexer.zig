@@ -6,6 +6,7 @@ pub const Error = error{
     UnexpectedEOF,
     UnexpectedNewline,
     InvalidChar,
+    MalformedNumber,
 };
 
 source: []const u8,
@@ -130,6 +131,107 @@ fn lexIdent(lexer: *const @This(), start: usize) Token {
     return mkToken2(.ident, start, ident.len);
 }
 
+inline fn isDigit(c: u8) bool {
+    return (c >= '0') and (c <= '9');
+}
+
+inline fn isHexDigit(c: u8) bool {
+    return isDigit(c) or ((c >= 'a') and (c <= 'f')) or ((c >= 'A') and (c <= 'F'));
+}
+
+// same set as `lexIdent`'s first character
+inline fn isAlpha(c: u8) bool {
+    return ((c >= 'a') and (c <= 'z')) or ((c >= 'A') and (c <= 'Z')) or (c == '_');
+}
+
+inline fn isNumeralDigit(c: u8, hex: bool) bool {
+    return if (hex) isHexDigit(c) else isDigit(c);
+}
+
+// hex numerals are marked with `p`/`P`, decimal ones with `e`/`E`
+inline fn isExponentMark(c: u8, hex: bool) bool {
+    return if (hex) (c == 'p') or (c == 'P') else (c == 'e') or (c == 'E');
+}
+
+// index of the first character at or after `i` that is not a numeral digit
+fn digitRunEnd(source: []const u8, i: usize, hex: bool) usize {
+    var end = i;
+
+    while (end < source.len and isNumeralDigit(source[end], hex)) : (end += 1) {}
+
+    return end;
+}
+
+// `start` points at a digit, or at `.` immediately followed by a digit.
+//
+// Handles Lua's numeral grammar:
+//
+//     digits ('.' digits?)? exponent?
+//   | '.' digits exponent?
+//   | '0' ('x' | 'X') hexdigits ('.' hexdigits?)? hexexponent?
+//
+// An exponent sign is only accepted directly after an exponent mark, so `1e-5`
+// is a single numeral while `1-5` is a subtraction. The literal must hold at
+// least one digit, and may not touch a `.` or a letter, which is what makes
+// `0x`, `1e`, `3a` and `1..2` malformed.
+fn lexNumber(lexer: *const @This(), start: usize) Error!Token {
+    const source = lexer.source;
+
+    var curr = start;
+    var is_float = false;
+    var hex = false;
+
+    if (source[curr] == '.') {
+        // `.5`, the caller already confirmed a digit follows the dot
+        is_float = true;
+        curr += 1;
+    } else if ((source[curr] == '0') and (curr + 1 < source.len) and
+        ((source[curr + 1] == 'x') or (source[curr + 1] == 'X')))
+    {
+        hex = true;
+        curr += 2; // `0x`
+    }
+
+    const int_end = digitRunEnd(source, curr, hex);
+    const int_digits = int_end - curr;
+    curr = int_end;
+
+    var digits = int_digits;
+
+    // optional fractional part, the digits after the dot are optional
+    if ((curr < source.len) and (source[curr] == '.')) {
+        is_float = true;
+        curr += 1;
+
+        const frac_end = digitRunEnd(source, curr, hex);
+        digits += frac_end - curr;
+        curr = frac_end;
+    }
+
+    // optional exponent
+    if ((curr < source.len) and isExponentMark(source[curr], hex)) {
+        is_float = true;
+        curr += 1;
+
+        if ((curr < source.len) and ((source[curr] == '+') or (source[curr] == '-'))) {
+            curr += 1;
+        }
+
+        const exp_end = digitRunEnd(source, curr, hex);
+        if (exp_end == curr) return error.MalformedNumber;
+        curr = exp_end;
+    }
+
+    // a second dot is never part of a numeral, so `1..2` is malformed
+    if ((curr < source.len) and (source[curr] == '.')) return error.MalformedNumber;
+    // a numeral touching a letter is malformed, e.g. `3a`
+    if ((curr < source.len) and isAlpha(source[curr])) return error.MalformedNumber;
+    // rejects `0x` and `0x.`
+    if (digits == 0) return error.MalformedNumber;
+
+    return mkToken3(if (is_float) .float else .decimal, start, curr);
+}
+
 // tries to lex a long string/comment, if no start pattern found returns null
 pub fn lexLong(lexer: *const @This(), start: usize) Error!?Token.Span {
     if (start + 1 >= lexer.source.len) return null;
@@ -231,7 +333,11 @@ pub fn peekToken(lexer: *const @This()) Error!Token {
                 continue;
             },
             // 0x2E
-            '.' => if (((start + 1) >= lexer.source.len) or (lexer.source[start + 1] != '.'))
+            '.' => if (((start + 1) < lexer.source.len) and isDigit(lexer.source[start + 1]))
+                // ".5", a leading dot numeral; `..` and `...` can never be
+                // one since a digit is never a dot
+                try lexer.lexNumber(start)
+            else if (((start + 1) >= lexer.source.len) or (lexer.source[start + 1] != '.'))
                 // "."
                 mkToken(.dot, start)
             else if (((start + 2) >= lexer.source.len) or (lexer.source[start + 2] != '.'))
@@ -248,9 +354,7 @@ pub fn peekToken(lexer: *const @This()) Error!Token {
                 // "//"
                 mkToken2(.slash2, start, 2),
             // 0x30 ... 0x39
-            '0'...'9' => {
-                @panic("TODO: Lex numbers");
-            },
+            '0'...'9' => try lexer.lexNumber(start),
             // 0x3A
             ':' => if (((start + 1) >= lexer.source.len) or (lexer.source[start + 1] != ':'))
                 // ":"
