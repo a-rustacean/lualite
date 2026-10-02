@@ -196,16 +196,14 @@ pub fn peekToken(lexer: *const @This()) Error!Token {
                 start += 1;
                 continue;
             },
-            // 0x22
-            '"' => try lexer.lexString(start),
+            // 0x22, 0x27
+            '"', '\'' => try lexer.lexString(start),
             // 0x23
             '#' => mkToken(.hash, start),
             // 0x25
             '%' => mkToken(.percent, start),
             // 0x26
             '&' => mkToken(.amp, start),
-            // 0x27
-            '\'' => try lexer.lexString(start),
             // 0x28
             '(' => mkToken(.lparen, start),
             // 0x29
