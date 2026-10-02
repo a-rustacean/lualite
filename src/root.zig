@@ -255,3 +255,14 @@ test "malformed numbers" {
     // only one exponent mark is allowed
     try expectErr("1e5e5", error.MalformedNumber);
 }
+
+test "vertical tab and form feed are whitespace" {
+    // Lua's llex lists `\f` and `\v` as spaces alongside TAB, LF and CR
+    try expectToken("a\x0Bb", .ident, 0, 1);
+    try expectToken("a\x0Cb", .ident, 0, 1);
+    try expectToken("\x0Bb", .ident, 1, 2);
+    try expectToken("\x0Cb", .ident, 1, 2);
+    // a run of them is skipped like any other whitespace
+    try expectToken("\x0B\x0Cx", .ident, 2, 3);
+    try expectToken("\x0C\x0Bx", .ident, 2, 3);
+}

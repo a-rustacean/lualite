@@ -292,9 +292,9 @@ pub fn peekToken(lexer: *const @This()) Error!Token {
 
         const token: Token = switch (char) {
             // control characters / non-ascii
-            0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F, 0x7F...0xFF, '!', '$', '?', '@', '\\', '`' => return error.InvalidChar,
-            // TAB, LF, CR, space (whitespace)
-            0x09, 0x0A, 0x0D, 0x20 => {
+            0x00...0x08, 0x0E...0x1F, 0x7F...0xFF, '!', '$', '?', '@', '\\', '`' => return error.InvalidChar,
+            // TAB, VT, FF, LF, CR, space (whitespace)
+            0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20 => {
                 start += 1;
                 continue;
             },
