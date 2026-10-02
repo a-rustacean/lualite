@@ -13,7 +13,7 @@ test "peekToken smoke" {
 }
 
 fn expectToken(source: []const u8, kind: Token.Kind, start: u32, end: u32) !void {
-    const lexer = Lexer{ .source = source, .current_char_idx = 0 };
+    var lexer = Lexer{ .source = source, .current_char_idx = 0 };
 
     const token = try lexer.peekToken();
 
@@ -22,8 +22,8 @@ fn expectToken(source: []const u8, kind: Token.Kind, start: u32, end: u32) !void
     try std.testing.expectEqual(end, token.span.end);
 }
 
-fn expectErr(source: []const u8, expected: anyerror) !void {
-    const lexer = Lexer{ .source = source, .current_char_idx = 0 };
+fn expectErr(source: []const u8, expected: Lexer.Error) !void {
+    var lexer = Lexer{ .source = source, .current_char_idx = 0 };
 
     try std.testing.expectError(expected, lexer.peekToken());
 }
@@ -69,31 +69,31 @@ test "long comment with higher nesting level" {
 }
 
 test "long comment span covers the whole bracket" {
-    const nested = Lexer{ .source = "--[==[abc]==] y", .current_char_idx = 0 };
+    var nested = Lexer{ .source = "--[==[abc]==] y", .current_char_idx = 0 };
     const nested_span = (try nested.lexLong(2)).?;
     try std.testing.expectEqual(@as(u32, 2), nested_span.start);
     try std.testing.expectEqual(@as(u32, 13), nested_span.end);
 
-    const flat = Lexer{ .source = "--[[abc]] y", .current_char_idx = 0 };
+    var flat = Lexer{ .source = "--[[abc]] y", .current_char_idx = 0 };
     const flat_span = (try flat.lexLong(2)).?;
     try std.testing.expectEqual(@as(u32, 2), flat_span.start);
     try std.testing.expectEqual(@as(u32, 9), flat_span.end);
 }
 
 test "lexLong returns null without a long bracket start" {
-    const plain = Lexer{ .source = "--[abc", .current_char_idx = 0 };
+    var plain = Lexer{ .source = "--[abc", .current_char_idx = 0 };
     try std.testing.expect((try plain.lexLong(2)) == null);
 
     // `==` run that never reaches a `[`
-    const dangling = Lexer{ .source = "--[==abc", .current_char_idx = 0 };
+    var dangling = Lexer{ .source = "--[==abc", .current_char_idx = 0 };
     try std.testing.expect((try dangling.lexLong(2)) == null);
 
     // not a bracket at all
-    const not_bracket = Lexer{ .source = "--x", .current_char_idx = 0 };
+    var not_bracket = Lexer{ .source = "--x", .current_char_idx = 0 };
     try std.testing.expect((try not_bracket.lexLong(2)) == null);
 
     // past the end of the source
-    const past_end = Lexer{ .source = "--", .current_char_idx = 0 };
+    var past_end = Lexer{ .source = "--", .current_char_idx = 0 };
     try std.testing.expect((try past_end.lexLong(2)) == null);
 }
 
@@ -136,7 +136,7 @@ test "long string closes at the first `]]`" {
 
     // peekToken only ever returns the first token, so point a lexer past
     // the literal to check what follows it
-    const trailing = Lexer{ .source = "[[a]]b]] y", .current_char_idx = 9 };
+    var trailing = Lexer{ .source = "[[a]]b]] y", .current_char_idx = 9 };
     const after = try trailing.peekToken();
     try std.testing.expectEqual(Token.Kind.ident, after.kind);
     try std.testing.expectEqual(@as(u32, 9), after.span.start);
@@ -332,4 +332,55 @@ test "nextToken leaves the cursor put on error" {
     try std.testing.expectError(error.InvalidChar, lexer.nextToken());
     // the offending `$` is still there to be retried or reported on
     try std.testing.expectEqual(@as(usize, 1), lexer.current_char_idx);
+}
+
+test "err_span points at the failure" {
+    // an unterminated string spans the opening quote to the end
+    var str = Lexer{ .source = "\"abc", .current_char_idx = 0 };
+    try std.testing.expectError(error.UnexpectedEOF, str.peekToken());
+    try std.testing.expectEqual(@as(u32, 0), str.err_span.start);
+    try std.testing.expectEqual(@as(u32, 4), str.err_span.end);
+
+    // the newline that ended the string, not the whole token
+    var newline = Lexer{ .source = "\"a\nb\"", .current_char_idx = 0 };
+    try std.testing.expectError(error.UnexpectedNewline, newline.peekToken());
+    try std.testing.expectEqual(@as(u32, 2), newline.err_span.start);
+    try std.testing.expectEqual(@as(u32, 3), newline.err_span.end);
+
+    // the numeral scanned so far
+    var numeral = Lexer{ .source = "0x", .current_char_idx = 0 };
+    try std.testing.expectError(error.MalformedNumber, numeral.peekToken());
+    try std.testing.expectEqual(@as(u32, 0), numeral.err_span.start);
+    try std.testing.expectEqual(@as(u32, 2), numeral.err_span.end);
+
+    // the unterminated long bracket, from `[` to the end
+    var long = Lexer{ .source = "--[=[abc", .current_char_idx = 0 };
+    try std.testing.expectError(error.UnexpectedEOF, long.peekToken());
+    try std.testing.expectEqual(@as(u32, 2), long.err_span.start);
+    try std.testing.expectEqual(@as(u32, 8), long.err_span.end);
+}
+
+test "invalid characters" {
+    // control characters, LF and CR excepted
+    try expectErr("\x00", error.InvalidChar);
+    try expectErr("\x01x", error.InvalidChar);
+    try expectErr("\x08", error.InvalidChar);
+    try expectErr("\x0E", error.InvalidChar);
+    try expectErr("\x1F", error.InvalidChar);
+    try expectErr("\x7F", error.InvalidChar);
+    // non-ascii
+    try expectErr("\x80", error.InvalidChar);
+    try expectErr("\xFF", error.InvalidChar);
+    // printable ascii that starts no Lua token
+    try expectErr("!", error.InvalidChar);
+    try expectErr("$", error.InvalidChar);
+    try expectErr("?", error.InvalidChar);
+    try expectErr("@", error.InvalidChar);
+    try expectErr("\\", error.InvalidChar);
+    try expectErr("`", error.InvalidChar);
+    // the span is the single offending byte
+    var lexer = Lexer{ .source = "x $", .current_char_idx = 2 };
+    try std.testing.expectError(error.InvalidChar, lexer.peekToken());
+    try std.testing.expectEqual(@as(u32, 2), lexer.err_span.start);
+    try std.testing.expectEqual(@as(u32, 3), lexer.err_span.end);
 }

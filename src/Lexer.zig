@@ -12,6 +12,21 @@ pub const Error = error{
 source: []const u8,
 current_char_idx: usize,
 
+/// Span of the input that caused the last error, set by `fail`. Only
+/// meaningful right after a call returned an `Error`.
+err_span: Token.Span = .{ .start = 0, .end = 0 },
+
+/// Records where the failure happened and returns `e` unchanged, so call
+/// sites keep using `try` while the offset stays recoverable.
+fn fail(self: *@This(), e: Error, start: usize, end: usize) Error {
+    self.err_span = .{
+        .start = @intCast(start),
+        .end = @intCast(end),
+    };
+
+    return e;
+}
+
 inline fn mkToken(kind: Token.Kind, start: usize) Token {
     const start32: u32 = @intCast(start);
 
@@ -48,7 +63,7 @@ inline fn mkTokenEnd(kind: Token.Kind, start: usize, end: usize) Token {
 }
 
 // `start` points at either single or double quote
-fn lexString(lexer: *const @This(), start: usize) Error!Token {
+fn lexString(lexer: *@This(), start: usize) Error!Token {
     const quote: u8 = lexer.source[start];
     var curr = start + 1;
 
@@ -57,12 +72,12 @@ fn lexString(lexer: *const @This(), start: usize) Error!Token {
 
         switch (c) {
             '\\' => curr += 1, // skip escaped character
-            '\n', '\r' => return error.UnexpectedNewline,
+            '\n', '\r' => return lexer.fail(error.UnexpectedNewline, curr, curr + 1),
             else => if (c == quote) return mkTokenEnd(.str, start, curr + 1),
         }
     }
 
-    return error.UnexpectedEOF;
+    return lexer.fail(error.UnexpectedEOF, start, lexer.source.len);
 }
 
 // `start` points at A..Z | a..z | _
@@ -174,7 +189,7 @@ fn digitRunEnd(source: []const u8, i: usize, hex: bool) usize {
 // is a single numeral while `1-5` is a subtraction. The literal must hold at
 // least one digit, and may not touch a `.` or a letter, which is what makes
 // `0x`, `1e`, `3a` and `1..2` malformed.
-fn lexNumber(lexer: *const @This(), start: usize) Error!Token {
+fn lexNumber(lexer: *@This(), start: usize) Error!Token {
     const source = lexer.source;
 
     var curr = start;
@@ -218,22 +233,22 @@ fn lexNumber(lexer: *const @This(), start: usize) Error!Token {
         }
 
         const exp_end = digitRunEnd(source, curr, hex);
-        if (exp_end == curr) return error.MalformedNumber;
+        if (exp_end == curr) return lexer.fail(error.MalformedNumber, start, curr);
         curr = exp_end;
     }
 
     // a second dot is never part of a numeral, so `1..2` is malformed
-    if ((curr < source.len) and (source[curr] == '.')) return error.MalformedNumber;
+    if ((curr < source.len) and (source[curr] == '.')) return lexer.fail(error.MalformedNumber, start, curr);
     // a numeral touching a letter is malformed, e.g. `3a`
-    if ((curr < source.len) and isAlpha(source[curr])) return error.MalformedNumber;
+    if ((curr < source.len) and isAlpha(source[curr])) return lexer.fail(error.MalformedNumber, start, curr);
     // rejects `0x` and `0x.`
-    if (digits == 0) return error.MalformedNumber;
+    if (digits == 0) return lexer.fail(error.MalformedNumber, start, curr);
 
     return mkTokenEnd(if (is_float) .float else .decimal, start, curr);
 }
 
 // tries to lex a long string/comment, if no start pattern found returns null
-pub fn lexLong(lexer: *const @This(), start: usize) Error!?Token.Span {
+pub fn lexLong(lexer: *@This(), start: usize) Error!?Token.Span {
     if (start + 1 >= lexer.source.len) return null;
     if (lexer.source[start] != '[') return null;
 
@@ -256,7 +271,7 @@ pub fn lexLong(lexer: *const @This(), start: usize) Error!?Token.Span {
 
             while (true) {
                 // closing run is ']' followed by eql_count '=' followed by ']'
-                if (cursor + eql_count + 2 > lexer.source.len) return error.UnexpectedEOF;
+                if (cursor + eql_count + 2 > lexer.source.len) return lexer.fail(error.UnexpectedEOF, start, lexer.source.len);
 
                 if (lexer.source[cursor] == ']' and
                     std.mem.allEqual(u8, lexer.source[cursor + 1 .. cursor + eql_count + 1], '=') and
@@ -278,14 +293,16 @@ pub fn lexLong(lexer: *const @This(), start: usize) Error!?Token.Span {
                     .start = @intCast(start),
                     .end = @intCast(end),
                 };
-            } else return error.UnexpectedEOF;
+            } else return lexer.fail(error.UnexpectedEOF, start, lexer.source.len);
         },
         else => return null,
     }
 }
 
-/// Lexes the token at `current_char_idx` without consuming it.
-pub fn peekToken(lexer: *const @This()) Error!Token {
+/// Lexes the token at `current_char_idx` without consuming it. Whitespace and
+/// comments are skipped, so on failure `err_span` points at the offending
+/// input rather than at the cursor.
+pub fn peekToken(lexer: *@This()) Error!Token {
     return lexer.scan(lexer.current_char_idx);
 }
 
@@ -298,7 +315,7 @@ pub fn nextToken(lexer: *@This()) Error!Token {
     return token;
 }
 
-fn scan(lexer: *const @This(), from: usize) Error!Token {
+fn scan(lexer: *@This(), from: usize) Error!Token {
     var start = from;
 
     while (start < lexer.source.len) {
@@ -306,7 +323,7 @@ fn scan(lexer: *const @This(), from: usize) Error!Token {
 
         const token: Token = switch (char) {
             // control characters / non-ascii
-            0x00...0x08, 0x0E...0x1F, 0x7F...0xFF, '!', '$', '?', '@', '\\', '`' => return error.InvalidChar,
+            0x00...0x08, 0x0E...0x1F, 0x7F...0xFF, '!', '$', '?', '@', '\\', '`' => return lexer.fail(error.InvalidChar, start, start + 1),
             // TAB, VT, FF, LF, CR, space (whitespace)
             0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20 => {
                 start += 1;
