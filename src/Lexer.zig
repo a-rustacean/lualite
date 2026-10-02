@@ -238,7 +238,7 @@ pub fn peekToken(lexer: *const @This()) !Token {
         // 0x5D
         ']' => mkToken(.rbrack, start),
         // 0x5E
-        '^' => mkToken(.carrot, start),
+        '^' => mkToken(.caret, start),
         // 0x7B
         '{' => mkToken(.lcurly, start),
         // 0x7C

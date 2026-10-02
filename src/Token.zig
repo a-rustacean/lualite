@@ -38,7 +38,7 @@ pub const Kind = enum(u8) {
     slash,
     slash2,
     percent,
-    carrot,
+    caret,
     amp,
     tilde,
     tilde_eq,
