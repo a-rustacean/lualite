@@ -10,13 +10,6 @@ pub const Error = error{
 
 source: []const u8,
 current_char_idx: usize,
-token: Token = .{
-    .kind = .eof,
-    .span = .{
-        .start = 0,
-        .end = 0,
-    },
-},
 
 inline fn mkToken(kind: Token.Kind, start: usize) Token {
     const start32: u32 = @intCast(start);
