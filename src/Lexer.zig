@@ -46,10 +46,10 @@ inline fn mkToken3(kind: Token.Kind, start: usize, end: usize) Token {
     };
 }
 
-// assumes the lexer is currently at either single or double quote
-fn lexString(lexer: *const @This()) Error!Token {
-    const quote: u8 = lexer.source[lexer.current_char_idx];
-    var curr = lexer.current_char_idx + 1;
+// `start` points at either single or double quote
+fn lexString(lexer: *const @This(), start: usize) Error!Token {
+    const quote: u8 = lexer.source[start];
+    var curr = start + 1;
 
     while (curr < lexer.source.len) : (curr += 1) {
         const c = lexer.source[curr];
@@ -57,16 +57,15 @@ fn lexString(lexer: *const @This()) Error!Token {
         switch (c) {
             '\\' => curr += 1, // skip escaped character
             '\n', '\r' => return error.UnexpectedNewline,
-            else => if (c == quote) return mkToken3(.str, lexer.current_char_idx, curr + 1),
+            else => if (c == quote) return mkToken3(.str, start, curr + 1),
         }
     }
 
     return error.UnexpectedEOF;
 }
 
-// assumes the lexer is currently at A..Z | a..z | _
-fn lexIdent(lexer: *const @This()) Token {
-    const start = lexer.current_char_idx;
+// `start` points at A..Z | a..z | _
+fn lexIdent(lexer: *const @This(), start: usize) Token {
     var end = start + 1;
 
     while (true) : (end += 1) {
@@ -144,7 +143,7 @@ pub fn peekToken(lexer: *const @This()) Error!Token {
         // TAB, LF, CR, space (whitespace)
         0x09, 0x0A, 0x0D, 0x20 => mkToken(.skip, start),
         // 0x22
-        '"' => try lexer.lexString(),
+        '"' => try lexer.lexString(start),
         // 0x23
         '#' => mkToken(.hash, start),
         // 0x25
@@ -152,7 +151,7 @@ pub fn peekToken(lexer: *const @This()) Error!Token {
         // 0x26
         '&' => mkToken(.amp, start),
         // 0x27
-        '\'' => try lexer.lexString(),
+        '\'' => try lexer.lexString(start),
         // 0x28
         '(' => mkToken(.lparen, start),
         // 0x29
@@ -227,7 +226,7 @@ pub fn peekToken(lexer: *const @This()) Error!Token {
             // ">>"
             mkToken2(.shift_right, start, 2),
         // 0x41 ... 0x5A
-        'A'...'Z', '_', 'a'...'z' => lexer.lexIdent(),
+        'A'...'Z', '_', 'a'...'z' => lexer.lexIdent(start),
         // 0x5B, TODO: long strings
         '[' => mkToken(.lbrack, start),
         // 0x5D
