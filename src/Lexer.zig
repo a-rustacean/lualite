@@ -1,9 +1,7 @@
 const std = @import("std");
-const Allocator = std.mem.Allocator;
 
 const Token = @import("Token.zig");
 
-gpa: Allocator,
 source: []const u8,
 current_char_idx: usize,
 token: Token = .{
