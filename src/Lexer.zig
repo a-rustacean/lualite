@@ -55,11 +55,12 @@ fn lexString(lexer: *const @This()) !Token {
     var curr = lexer.current_char_idx + 1;
 
     while (curr < lexer.source.len) : (curr += 1) {
-        switch (lexer.source[curr]) {
+        const c = lexer.source[curr];
+
+        switch (c) {
             '\\' => curr += 1, // skip escaped character
-            quote => return mkToken3(.str, lexer.current_char_idx, curr + 1),
             '\n', '\r' => return error.UnexpectedNewline,
-            else => {},
+            else => if (c == quote) return mkToken3(.str, lexer.current_char_idx, curr + 1),
         }
     }
 
@@ -75,13 +76,13 @@ fn lexIdent(lexer: *const @This()) Token {
         if (end >= lexer.source.len) break;
         switch (lexer.source[end]) {
             '0'...'9', 'A'...'Z', 'a'...'z', '_' => {},
-            _ => break,
+            else => break,
         }
     }
 
     const ident = lexer.source[start..end];
 
-    // smallest ident is 2 chars
+    // smallest keyword is 2 chars
     if (ident.len < 2) return mkToken2(.ident, start, ident.len);
 
     switch (ident[0]) {
@@ -127,8 +128,10 @@ fn lexIdent(lexer: *const @This()) Token {
         },
         'u' => if (std.mem.eql(u8, ident, "until")) return mkToken2(.until, start, ident.len),
         'w' => if (std.mem.eql(u8, ident, "while")) return mkToken2(.@"while", start, ident.len),
-        _ => return mkToken2(.ident, start, ident.len),
+        else => {},
     }
+
+    return mkToken2(.ident, start, ident.len);
 }
 
 pub fn peekToken(lexer: *const @This()) !Token {
@@ -229,7 +232,7 @@ pub fn peekToken(lexer: *const @This()) !Token {
             // ">>"
             mkToken2(.shift_right, start, 2),
         // 0x41 ... 0x5A
-        'A'...'Z', '_', 'a'...'z' => try lexer.lexIdent(),
+        'A'...'Z', '_', 'a'...'z' => lexer.lexIdent(),
         // 0x5B, TODO: long strings
         '[' => mkToken(.lbrack, start),
         // 0x5D
