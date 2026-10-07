@@ -6,6 +6,10 @@ const Diagnostic = @import("Diagnostic.zig");
 source: []const u8,
 current_char_idx: usize,
 
+const CheckPoint = struct {
+    char_idx: usize,
+};
+
 const Error = error{ ReportFailed, LexerFailed };
 
 fn report(
@@ -309,6 +313,16 @@ pub fn nextToken(lexer: *@This(), reporter: *Diagnostic.Reporter) Error!Token {
     const token = try lexer.scan(reporter, lexer.current_char_idx);
     lexer.current_char_idx = token.span.end;
     return token;
+}
+
+pub fn checkpoint(lexer: *const @This()) CheckPoint {
+    return .{
+        .char_idx = lexer.current_char_idx,
+    };
+}
+
+pub fn rewind(lexer: *@This(), cp: CheckPoint) void {
+    lexer.current_char_idx = cp.char_idx;
 }
 
 fn scan(lexer: *const @This(), reporter: *Diagnostic.Reporter, from: usize) Error!Token {
