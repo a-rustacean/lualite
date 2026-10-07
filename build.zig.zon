@@ -1,6 +1,12 @@
 .{
     .name = .lualite,
     .version = "0.0.0",
+    .dependencies = .{
+        .fehler = .{
+            .url = "git+https://github.com/ciathefed/fehler?ref=v0.7.0#3e23144aafd28ec6502ffd23fcd0cacf81fc3810",
+            .hash = "fehler-0.7.0-8HnVmWizAAAogDb8PFePSq4RJFAiwpmbcBrhzjRydsyR",
+        },
+    },
     .fingerprint = 0x6ebaaa5195aa9d01,
     .minimum_zig_version = "0.16.0",
     .paths = .{
