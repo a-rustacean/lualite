@@ -60,6 +60,10 @@ fn sourceRange(
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
+    const arena = init.arena.allocator();
+
+    const argv = try std.process.Args.toSlice(init.minimal.args, arena);
+    const file_arg = if (argv.len > 1) argv[1] else null;
 
     const sample =
         \\local x = "unterminated
@@ -67,8 +71,13 @@ pub fn main(init: std.process.Init) !void {
         \\local z = 0x
         \\local w = $5
     ;
-    const source: []const u8 = sample;
-    const filename: []const u8 = "<input>";
+
+    var source: []const u8 = sample;
+    var filename: []const u8 = "<input>";
+    if (file_arg) |path| {
+        source = try std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(1 << 20));
+        filename = path;
+    }
 
     var reporter: fehler.ErrorReporter = fehler.ErrorReporter.init(allocator);
     defer reporter.deinit();
