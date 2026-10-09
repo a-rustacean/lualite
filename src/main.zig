@@ -220,7 +220,8 @@ pub fn main(init: std.process.Init) !void {
     var source: []const u8 = sample;
     var filename: []const u8 = "<input>";
     if (file_arg) |path| {
-        source = try std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(1 << 20));
+        // the arena, the source outlives the parse and is never freed by hand
+        source = try std.Io.Dir.cwd().readFileAlloc(init.io, path, arena, .limited(1 << 20));
         filename = path;
     }
 
@@ -228,42 +229,64 @@ pub fn main(init: std.process.Init) !void {
     defer reporter.deinit();
     try reporter.addSource(filename, source);
 
-    var diag_reporter: lualite.Diagnostic.Reporter = .{ .gpa = allocator };
-    defer diag_reporter.errors.deinit(allocator);
+    var diagnostics: Diagnostic.Reporter = .{ .gpa = allocator };
+    defer diagnostics.errors.deinit(allocator);
 
-    var lexer = Lexer{ .source = source, .current_char_idx = 0 };
+    // the parse owns its nodes. The diagnostics live outside it so they can
+    // outlive the parser and be rendered at the end.
+    var parse_arena: std.heap.ArenaAllocator = .init(allocator);
+    var parser = lualite.Parser.fromSource(source, &parse_arena, &diagnostics);
+    defer parser.deinit();
 
-    while (true) {
-        const start_errs = diag_reporter.errors.items.len;
-        const token = lexer.nextToken(&diag_reporter) catch |err| {
-            if (err == error.LexerFailed) {
-                // pick up everything reported since the last good token and
-                // skip past the offending span to collect more diagnostics
-                var next_idx = lexer.current_char_idx + 1;
-                for (diag_reporter.errors.items[start_errs..]) |e| {
-                    reportOne(&reporter, filename, source, e);
-                    if (e.span.end > next_idx) next_idx = e.span.end;
-                }
-                lexer.current_char_idx = next_idx;
-                continue;
-            }
-            return err;
-        };
+    // the parser lexes as it goes, so a lexer error and a syntax error both land in
+    // the same reporter in the order they were found
+    _ = parser.parseChunk() catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // whatever went wrong is already in the reporter
+        error.ReportFailed, error.ParserFailed => {},
+    };
 
-        if (token.kind == .eof) break;
-    }
-
+    for (diagnostics.errors.items) |e| reportOne(&reporter, filename, source, e);
 }
 
 fn reportOne(
     reporter: *fehler.ErrorReporter,
     filename: []const u8,
     source: []const u8,
-    e: lualite.Diagnostic.Error,
+    e: Diagnostic.Error,
 ) void {
+    // the message is the expectation where there is one, since that is the part
+    // the reader can act on
+    const message = if (e.expected) |expected| expectedMessage(expected) else kindMessage(e.kind);
+
+    // what to say under it. For a closer that never came, naming the block left
+    // open beats naming the token the parser happened to stop on.
+    const help = if (e.opened_at) |opened|
+        unclosedHelp(source, e.opened_name, opened)
+    else if (e.found) |found|
+        foundMessage(found)
+    else
+        kindHelp(e.kind);
+
     reporter.report(
-        fehler.Diagnostic.init(.err, kindMessage(e.kind))
+        fehler.Diagnostic.init(.err, message)
             .withRange(sourceRange(filename, source, e.span))
-            .withHelp(kindHelp(e.kind)),
+            .withHelp(help),
     );
 }
+
+// e.g. "to close the `if` that starts on line 4"
+fn unclosedHelp(source: []const u8, name: []const u8, opened: Token.Span) []const u8 {
+    const line = lineCol(source, opened.start).line;
+
+    return std.fmt.bufPrint(
+        &unclosed_buffer,
+        "to close the `{s}` that starts on line {d}",
+        .{ name, line },
+    ) catch "to close a block that starts earlier in the file";
+}
+
+// written by unclosedHelp and handed straight to report, which prints before
+// returning. Nothing holds the slice past that call, which is what lets the
+// buffer be shared rather than per-diagnostic.
+var unclosed_buffer: [96]u8 = undefined;
