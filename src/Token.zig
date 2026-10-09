@@ -83,5 +83,20 @@ pub const Span = struct {
     end: u32,
 };
 
+// the smallest span covering both, which is what a node built out of several
+// tokens needs
+pub fn merge(a: Span, b: Span) Span {
+    return .{
+        .start = @min(a.start, b.start),
+        .end = @max(a.end, b.end),
+    };
+}
+
+// a span of no width at offset, for the tokens a construct implies rather than
+// spells out
+pub fn at(offset: u32) Span {
+    return .{ .start = offset, .end = offset };
+}
+
 span: Span,
 kind: Kind,
