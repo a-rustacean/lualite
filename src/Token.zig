@@ -98,5 +98,15 @@ pub fn at(offset: u32) Span {
     return .{ .start = offset, .end = offset };
 }
 
+// TAB, VT, FF, LF, CR and space, the whitespace Lua counts as such. Both halves
+// of `\z` need it: the lexer to know how far the escape reaches, and whoever
+// decodes the string to know how much whitespace to drop.
+pub fn isSpace(c: u8) bool {
+    return switch (c) {
+        0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20 => true,
+        else => false,
+    };
+}
+
 span: Span,
 kind: Kind,
