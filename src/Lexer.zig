@@ -68,14 +68,28 @@ fn lexString(lexer: *const @This(), reporter: *Diagnostic.Reporter, start: usize
     const quote: u8 = lexer.source[start];
     var curr = start + 1;
 
-    while (curr < lexer.source.len) : (curr += 1) {
+    // the step is at the bottom rather than the header, since `\z` has to end on the
+    // byte its whitespace ran out at and a header step would step over it
+    scan: while (curr < lexer.source.len) {
         const c = lexer.source[curr];
 
         switch (c) {
-            '\\' => curr += 1, // skip escaped character
+            '\\' => {
+                if (curr + 1 < lexer.source.len and lexer.source[curr + 1] == 'z') {
+                    // `\z` stands for the whitespace behind it, newline and all. It is the one
+                    // escape that reaches past a line break and still leaves the
+                    // string open.
+                    curr += 2;
+                    while (curr < lexer.source.len and Token.isSpace(lexer.source[curr])) curr += 1;
+                    continue :scan;
+                }
+                curr += 1; // skip the escaped character
+            },
             '\n', '\r' => return report(reporter, .unexpected_newline, curr, curr + 1),
             else => if (c == quote) return mkTokenEnd(.str, start, curr + 1),
         }
+
+        curr += 1;
     }
 
     return report(reporter, .unexpected_eof, start, lexer.source.len);
