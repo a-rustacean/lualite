@@ -2,7 +2,6 @@ const std = @import("std");
 const fehler = @import("fehler");
 const lualite = @import("lualite");
 
-const Lexer = lualite.Lexer;
 const Token = lualite.Token;
 const Diagnostic = lualite.Diagnostic;
 
@@ -179,9 +178,8 @@ fn lineCol(source: []const u8, offset: usize) struct { line: usize, col: usize }
     return .{ .line = line, .col = col };
 }
 
-// fehler columns are inclusive and fehler treats a span crossing newlines by
-// underlining each line to its end, so clamp multi-line spans to the end of
-// the first line.
+// fehler columns are inclusive and a span crossing newlines is underlined to
+// the end of each line, so clamp a multi-line span to the end of its first line
 fn sourceRange(
     filename: []const u8,
     source: []const u8,
