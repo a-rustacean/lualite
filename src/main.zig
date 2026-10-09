@@ -208,10 +208,13 @@ pub fn main(init: std.process.Init) !void {
     const file_arg = if (argv.len > 1) argv[1] else null;
 
     const sample =
-        \\local x = "unterminated
-        \\local y = 3a
-        \\local z = 0x
-        \\local w = $5
+        \\local greet = function(name)
+        \\  return "hi " .. name
+        \\end
+        \\local x = 3a
+        \\greet("world")
+        \\local y = = 1
+        \\print(greet)
     ;
 
     var source: []const u8 = sample;
