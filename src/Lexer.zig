@@ -63,7 +63,7 @@ inline fn mkTokenEnd(kind: Token.Kind, start: usize, end: usize) Token {
     };
 }
 
-// `start` points at either single or double quote
+// start points at either single or double quote
 fn lexString(lexer: *const @This(), reporter: *Diagnostic.Reporter, start: usize) Error!Token {
     const quote: u8 = lexer.source[start];
     var curr = start + 1;
@@ -95,7 +95,7 @@ fn lexString(lexer: *const @This(), reporter: *Diagnostic.Reporter, start: usize
     return report(reporter, .unexpected_eof, start, lexer.source.len);
 }
 
-// `start` points at A..Z | a..z | _
+// start points at A..Z | a..z | _
 fn lexIdent(lexer: *const @This(), start: usize) Token {
     var end = start + 1;
 
@@ -169,7 +169,7 @@ inline fn isHexDigit(c: u8) bool {
     return isDigit(c) or ((c >= 'a') and (c <= 'f')) or ((c >= 'A') and (c <= 'F'));
 }
 
-// same set as `lexIdent`'s first character
+// the same set lexIdent accepts as a first character
 inline fn isAlpha(c: u8) bool {
     return ((c >= 'a') and (c <= 'z')) or ((c >= 'A') and (c <= 'Z')) or (c == '_');
 }
@@ -192,18 +192,18 @@ fn digitRunEnd(source: []const u8, i: usize, hex: bool) usize {
     return end;
 }
 
-// `start` points at a digit, or at `.` immediately followed by a digit.
+// start points at a digit, or at a `.` immediately followed by a digit.
 //
-// Handles Lua's numeral grammar:
+// Lua's numeral grammar:
 //
 //     digits ('.' digits?)? exponent?
 //   | '.' digits exponent?
 //   | '0' ('x' | 'X') hexdigits ('.' hexdigits?)? hexexponent?
 //
-// An exponent sign is only accepted directly after an exponent mark, so `1e-5`
-// is a single numeral while `1-5` is a subtraction. The literal must hold at
-// least one digit, and may not touch a `.` or a letter, which is what makes
-// `0x`, `1e`, `3a` and `1..2` malformed.
+// An exponent sign is only accepted right after an exponent mark, so `1e-5` is
+// one numeral while `1-5` is a subtraction. The literal needs at least one digit
+// and may not touch a `.` or a letter, which is what makes `0x`, `1e`, `3a` and
+// `1..2` malformed.
 fn lexNumber(lexer: *const @This(), reporter: *Diagnostic.Reporter, start: usize) Error!Token {
     const source = lexer.source;
 
@@ -262,7 +262,7 @@ fn lexNumber(lexer: *const @This(), reporter: *Diagnostic.Reporter, start: usize
     return mkTokenEnd(if (is_float) .float else .decimal, start, curr);
 }
 
-// tries to lex a long string/comment, if no start pattern found returns null
+// tries to lex a long string or comment, returns null if no start pattern found
 fn lexLong(lexer: *const @This(), reporter: *Diagnostic.Reporter, start: usize) Error!?Token.Span {
     if (start + 1 >= lexer.source.len) return null;
     if (lexer.source[start] != '[') return null;
@@ -280,12 +280,12 @@ fn lexLong(lexer: *const @This(), reporter: *Diagnostic.Reporter, start: usize) 
 
             if (open >= lexer.source.len or lexer.source[open] != '[') return null;
 
-            // long start pattern confirmed
+            // the long start pattern is confirmed
 
             var cursor = open + 1;
 
             while (true) {
-                // closing run is ']' followed by eql_count '=' followed by ']'
+                // the closing run is ']', eql_count '=', then ']'
                 if (cursor + eql_count + 2 > lexer.source.len) return report(reporter, .unexpected_eof, start, lexer.source.len);
 
                 if (lexer.source[cursor] == ']' and
@@ -314,15 +314,14 @@ fn lexLong(lexer: *const @This(), reporter: *Diagnostic.Reporter, start: usize) 
     }
 }
 
-/// Lexes the token at `current_char_idx` without consuming it. Whitespace and
-/// comments are skipped.
+// lexes the token at current_char_idx without consuming it, skipping whitespace
+// and comments
 pub fn peekToken(lexer: *const @This(), reporter: *Diagnostic.Reporter) Error!Token {
     return lexer.scan(reporter, lexer.current_char_idx);
 }
 
-/// Lexes the token at `current_char_idx` and consumes it by moving the cursor
-/// to the end of its span. Past the last token this is a no-op, so calling it
-/// again just re-yields `.eof`.
+// lexes the token at current_char_idx and consumes it by moving the cursor to
+// the end of its span. Past the last token this is a no-op and yields eof again.
 pub fn nextToken(lexer: *@This(), reporter: *Diagnostic.Reporter) Error!Token {
     const token = try lexer.scan(reporter, lexer.current_char_idx);
     lexer.current_char_idx = token.span.end;
@@ -346,9 +345,9 @@ fn scan(lexer: *const @This(), reporter: *Diagnostic.Reporter, from: usize) Erro
         const char = lexer.source[start];
 
         const token: Token = switch (char) {
-            // control characters / non-ascii
+            // control characters and non-ascii
             0x00...0x08, 0x0E...0x1F, 0x7F...0xFF, '!', '$', '?', '@', '\\', '`' => return report(reporter, .invalid_char, start, start + 1),
-            // TAB, VT, FF, LF, CR, space (whitespace)
+            // TAB, VT, FF, LF, CR and space
             0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20 => {
                 start += 1;
                 continue;
@@ -389,8 +388,8 @@ fn scan(lexer: *const @This(), reporter: *Diagnostic.Reporter, from: usize) Erro
             },
             // 0x2E
             '.' => if (((start + 1) < lexer.source.len) and isDigit(lexer.source[start + 1]))
-                // ".5", a leading dot numeral; `..` and `...` can never be
-                // one since a digit is never a dot
+                // ".5", a leading dot numeral. `..` and `...` can never be one,
+                // a digit is never a dot.
                 try lexer.lexNumber(reporter, start)
             else if (((start + 1) >= lexer.source.len) or (lexer.source[start + 1] != '.'))
                 // "."
@@ -458,9 +457,9 @@ fn scan(lexer: *const @This(), reporter: *Diagnostic.Reporter, from: usize) Erro
                 mkTokenEnd(.long_str, span.start, span.end)
             else
                 // "[". Lua 5.4 raises `invalid long string delimiter` for an
-                // `=`-run that never reaches a second `[`, e.g. `[==`; we
-                // report the bracket instead and leave that diagnostic to
-                // the parser.
+                // `=`-run that never reaches a second `[`, e.g. `[==`. The
+                // bracket is reported instead and that diagnostic left to the
+                // parser.
                 mkToken(.lbrack, start),
             // 0x5D
             ']' => mkToken(.rbrack, start),
