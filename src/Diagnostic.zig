@@ -17,11 +17,8 @@ pub const Reporter = struct {
     errors: std.ArrayList(Error) = .empty,
     gpa: std.mem.Allocator,
 
-    pub fn report(reporter: *Reporter, kind: Error.Kind, span: Token.Span) !void {
-        try reporter.errors.append(reporter.gpa, .{
-            .kind = kind,
-            .span = span,
-        });
+    pub fn report(reporter: *Reporter, diagnostic: Error) !void {
+        try reporter.errors.append(reporter.gpa, diagnostic);
     }
 
     pub fn deinit(reporter: *Reporter) void {

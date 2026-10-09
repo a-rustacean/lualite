@@ -18,9 +18,9 @@ fn report(
     start: usize,
     end: usize,
 ) Error {
-    reporter.report(kind, .{
-        .start = @intCast(start),
-        .end = @intCast(end),
+    reporter.report(.{
+        .kind = kind,
+        .span = .{ .start = @intCast(start), .end = @intCast(end) },
     }) catch {
         return error.ReportFailed;
     };
