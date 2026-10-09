@@ -136,8 +136,8 @@ fn foundMessage(found: Token.Kind) []const u8 {
     return token_words_of(found).found;
 }
 
-fn kindMessage(kind: lualite.Diagnostic.Error.Kind) []const u8 {
-    return switch (kind) {
+fn kindMessage(e: Diagnostic.Error) []const u8 {
+    return switch (e.kind) {
         .unexpected_eof => "unexpected end of file",
         .unexpected_newline => "unexpected newline",
         .invalid_char => "invalid character",
@@ -151,8 +151,8 @@ fn kindMessage(kind: lualite.Diagnostic.Error.Kind) []const u8 {
     };
 }
 
-fn kindHelp(kind: lualite.Diagnostic.Error.Kind) []const u8 {
-    return switch (kind) {
+fn kindHelp(e: Diagnostic.Error) []const u8 {
+    return switch (e.kind) {
         .unexpected_eof => "the input ended before the token was complete",
         .unexpected_newline => "strings cannot contain raw newlines; use '\\n' or a long string",
         .invalid_char => "this byte cannot start any Lua token",
@@ -257,7 +257,7 @@ fn reportOne(
 ) void {
     // the message is the expectation where there is one, since that is the part
     // the reader can act on
-    const message = if (e.expected) |expected| expectedMessage(expected) else kindMessage(e.kind);
+    const message = if (e.expected) |expected| expectedMessage(expected) else kindMessage(e);
 
     // what to say under it. For a closer that never came, naming the block left
     // open beats naming the token the parser happened to stop on.
@@ -266,7 +266,7 @@ fn reportOne(
     else if (e.found) |found|
         foundMessage(found)
     else
-        kindHelp(e.kind);
+        kindHelp(e);
 
     reporter.report(
         fehler.Diagnostic.init(.err, message)
