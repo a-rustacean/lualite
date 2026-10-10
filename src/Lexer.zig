@@ -83,7 +83,17 @@ fn lexString(lexer: *const @This(), reporter: *Diagnostic.Reporter, start: usize
                     while (curr < lexer.source.len and Token.isSpace(lexer.source[curr])) curr += 1;
                     continue :scan;
                 }
+
                 curr += 1; // skip the escaped character
+
+                // `\<newline>` is a newline rather than the end of the string, which
+                // is how a long value is broken up. A CR LF pair is the one newline
+                // rather than two, since the source is text rather than bytes.
+                if (curr < lexer.source.len and lexer.source[curr] == '\r' and
+                    curr + 1 < lexer.source.len and lexer.source[curr + 1] == '\n')
+                {
+                    curr += 1;
+                }
             },
             '\n', '\r' => return report(reporter, .unexpected_newline, curr, curr + 1),
             else => if (c == quote) return mkTokenEnd(.str, start, curr + 1),
@@ -339,8 +349,10 @@ pub fn rewind(lexer: *@This(), cp: CheckPoint) void {
 }
 
 fn scan(lexer: *const @This(), reporter: *Diagnostic.Reporter, from: usize) Error!Token {
-    var start = from;
-
+    // A file may open with `#!` naming the interpreter to run it under, and Lua
+    // skips that line before it lexes anything. Only at the very start, since a
+    // `#` anywhere else is the length operator.
+    var start = if (from == 0) lexer.skipShebang() else from;
     while (start < lexer.source.len) {
         const char = lexer.source[start];
 
@@ -486,6 +498,18 @@ fn scan(lexer: *const @This(), reporter: *Diagnostic.Reporter, from: usize) Erro
     return mkTokenLen(.eof, start, 0);
 }
 
+// A file may open with `#!` naming the interpreter to run it under, and Lua skips
+// the whole first line before it lexes anything. Only at the very start, since a
+// `#` anywhere else is the length operator. Any `#` opens the line, not just `#!`,
+// which is what `skipcomment` in lauxlib.c checks for.
+fn skipShebang(lexer: *const @This()) usize {
+    if (lexer.source.len == 0 or lexer.source[0] != '#') return 0;
+
+    var i: usize = 1;
+    while (i < lexer.source.len and lexer.source[i] != '\n') : (i += 1) {}
+    return i;
+}
+
 fn expectToken(source: []const u8, kind: Token.Kind, start: u32, end: u32) !void {
     var lexer = @This(){ .source = source, .current_char_idx = 0 };
     var reporter: Diagnostic.Reporter = .{ .gpa = std.testing.allocator };
@@ -525,6 +549,33 @@ test "line comment runs to end of line" {
     try expectToken("-- x\ny", .ident, 5, 6);
     try expectToken("-- x\ry", .ident, 5, 6);
     try expectToken("-- x\n\ny", .ident, 6, 7);
+}
+
+// A file may open with the interpreter to run it under, and Lua skips that whole
+// line before lexing anything. Any `#` opens it, not just `#!`.
+test "a shebang line is skipped whole" {
+    try expectToken("#!/usr/bin/env lua\ny", .ident, 19, 20);
+    try expectToken("#!/usr/bin/lua", .eof, 14, 14);
+    try expectToken("#!/usr/bin/env lua\r\ny", .ident, 20, 21);
+
+    // the line is skipped rather than lexed, so what is on it does not matter
+    try expectToken("#! not even Lua !!\ny", .ident, 19, 20);
+}
+
+test "only a # at the very start opens that line" {
+    // anywhere else, a `#` is the length operator
+    try expectToken("y\n#comment", .ident, 0, 1);
+    try expectToken(" x #comment", .ident, 1, 2);
+
+    // and the second line of a pair is not skipped either: what it holds is the
+    // first real token, which is the `#` Lua refuses
+    var lexer = @This(){ .source = "#!/usr/bin/env lua\n#!/usr/bin/env lua", .current_char_idx = 0 };
+    var reporter: Diagnostic.Reporter = .{ .gpa = std.testing.allocator };
+    defer reporter.deinit();
+
+    const first = try lexer.peekToken(&reporter);
+    try std.testing.expectEqual(Token.Kind.hash, first.kind);
+    try std.testing.expectEqual(@as(u32, 19), first.span.start);
 }
 
 test "line comment to eof" {

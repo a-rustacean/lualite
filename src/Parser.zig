@@ -413,6 +413,17 @@ pub const Test = struct {
         }
     }
 
+    // how many diagnostics the source produced, for the checks that have to stop
+    // at one and not pile up
+    pub fn expectCount(t: *@This(), expected: usize) !void {
+        const found = t.reporter.errors.items;
+        if (found.len != expected) {
+            std.debug.print("expected {d} diagnostic(s), found {d}", .{ expected, found.len });
+            for (found) |e| std.debug.print("\n  {t}", .{e.kind});
+            return error.WrongDiagnosticCount;
+        }
+    }
+
     // the token the parser found at index instead
     pub fn expectFound(t: *@This(), index: usize, expected: Token.Kind) !void {
         const all = t.reporter.errors.items;

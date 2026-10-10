@@ -4,6 +4,9 @@ const Parser = @import("../Parser.zig");
 const Token = @import("../Token.zig");
 const Ast = @import("../Ast.zig");
 const Diagnostic = @import("../Diagnostic.zig");
+// both the type and the functions over it, since the two do not sit in one place
+const num = @import("../Number.zig");
+const Number = num.Number;
 
 const Function = @import("Function.zig");
 const Table = @import("Table.zig");
@@ -388,17 +391,41 @@ pub fn argumentsSpan(arguments: Ast.Arguments) Token.Span {
     };
 }
 
-// both numeral spellings parse as a float, hex forms with a p exponent
-// included, since the lexer has already checked the grammar
-fn parseNumber(parser: *Parser, token: Token) Parser.Error!f64 {
+// A numeral as Lua would read it: an integer where it fits, else a float. The
+// two spellings are not symmetrical, since a hex numeral wraps into an integer and
+// a decimal one that overruns becomes a float, which is what
+// `l_str2int` in lobject.c does.
+fn parseNumber(parser: *Parser, token: Token) Parser.Error!Number {
     const text = parser.slice(token.span);
-    return std.fmt.parseFloat(f64, text) catch unreachable;
+    if (num.parse(text)) |value| return value;
+    return parser.fail(.expected_token, token, .expression);
 }
 
-// a short string, with raw as written and value with the escapes resolved
+// A short string, with raw as written and value with the escapes resolved.
+//
+// The lexer has only checked where the string ends, which `\z` changes and `\u`
+// changes too. What each escape is allowed to be is decided here, the way
+// `read_string` in llex.c decides it, and a bad one is reported rather than
+// guessed at. The decoder carries on afterwards, so one bad escape costs the
+// rest of its string rather than the rest of the chunk.
+
+// the span of an escape as written, from its backslash to wherever it ended.
+// `base` is where `raw` starts in the source, which is just past the opening
+// quote, so an index into one is an offset into the other.
+fn escapeSpan(base: u32, start: usize, end: usize) Token.Span {
+    return .{
+        .start = base + @as(u32, @intCast(start)),
+        .end = base + @as(u32, @intCast(end)),
+    };
+}
+
 fn parseShortString(parser: *Parser, token: Token) Parser.Error!Ast.StringLiteral {
     const allocator = parser.allocator();
-    const raw = parser.slice(token.span)[1 .. token.span.end - token.span.start - 1];
+
+    // the quotes are the span's first and last byte, and `raw` is between them
+    const quoted = parser.slice(token.span);
+    const raw = quoted[1 .. quoted.len - 1];
+    const base = token.span.start + 1;
 
     var value: std.ArrayList(u8) = .empty;
     errdefer value.deinit(allocator);
@@ -411,6 +438,7 @@ fn parseShortString(parser: *Parser, token: Token) Parser.Error!Ast.StringLitera
             continue;
         }
 
+        const start = i;
         i += 1; // the backslash
         if (i >= raw.len) break; // a trailing `\`, which the lexer should have rejected
 
@@ -426,32 +454,34 @@ fn parseShortString(parser: *Parser, token: Token) Parser.Error!Ast.StringLitera
             't' => try value.append(allocator, '\t'),
             'v' => try value.append(allocator, 0x0B),
             '\\', '"', '\'' => try value.append(allocator, escape),
-            'x' => {
-                const run = hexRun(raw, i, 2);
-                // Lua rejects a `\x` with no digits behind it, and the lexer
-                // lets it through, so keep the letter rather than invent a byte
-                if (run.len == 0) {
-                    try value.append(allocator, 'x');
-                } else {
-                    try value.append(allocator, @truncate(run.value));
-                    i += run.len;
-                }
+
+            // `\<newline>` is a newline, which is how a long value is broken up.
+            // A CR LF pair is one, since the source is text rather than bytes.
+            '\n' => try value.append(allocator, '\n'),
+            '\r' => {
+                if (i < raw.len and raw[i] == '\n') i += 1;
+                try value.append(allocator, '\n');
             },
-            '0'...'9' => {
-                // `\ddd`, up to three decimal digits
-                var digits: u32 = escape - '0';
-                var taken: usize = 1;
-                while (taken < 3 and i < raw.len and isDigit(raw[i])) : (taken += 1) {
-                    digits = digits * 10 + (raw[i] - '0');
-                    i += 1;
-                }
-                try value.append(allocator, @truncate(digits));
-            },
+
+            'x' => try parseHexEscape(parser, raw, &i, &value, start, base),
+            'u' => try parseUnicodeEscape(parser, raw, &i, &value, start, base),
+            '0'...'9' => try parseDecimalEscape(parser, raw, &i, &value, escape, start, base),
+
             'z' => {
                 // zaps the span of whitespace that follows
                 while (i < raw.len and Token.isSpace(raw[i])) i += 1;
             },
-            else => try value.append(allocator, escape),
+
+            else => {
+                // Lua refuses rather than dropping the backslash, since there is
+                // no telling what was meant
+                try parser.report(.{
+                    .kind = .invalid_escape_sequence,
+                    .span = escapeSpan(base, start, i),
+                    .name = raw[start..i],
+                });
+                try value.append(allocator, escape);
+            },
         }
     }
 
@@ -460,6 +490,166 @@ fn parseShortString(parser: *Parser, token: Token) Parser.Error!Ast.StringLitera
         .raw = raw,
         .value = try value.toOwnedSlice(allocator),
     };
+}
+
+// `\xNN`, exactly two hex digits, each of which Lua insists on
+fn parseHexEscape(
+    parser: *Parser,
+    raw: []const u8,
+    i: *usize,
+    value: *std.ArrayList(u8),
+    start: usize,
+    base: u32,
+) Parser.Error!void {
+    var byte: u32 = 0;
+    for (0..2) |_| {
+        if (i.* >= raw.len or !isHexDigit(raw[i.*])) {
+            // the escape stops at whatever is there, which may be the end of the
+            // string rather than a character the reader can name
+            const taken = @min(i.* + 1, raw.len);
+            i.* = taken;
+            try parser.report(.{
+                .kind = .hex_digit_expected,
+                .span = escapeSpan(base, start, taken),
+                .name = raw[start..taken],
+            });
+            return;
+        }
+
+        byte = byte * 16 + hexValue(raw[i.*]);
+        i.* += 1;
+    }
+
+    try value.append(parser.allocator(), @truncate(byte));
+}
+
+// `\u{XXXX}`, the code point as UTF-8. Lua allows anything up to 0x7FFFFFFF here,
+// surrogates included, and it is `utf8.char` rather than this escape that
+// refuses those.
+fn parseUnicodeEscape(
+    parser: *Parser,
+    raw: []const u8,
+    i: *usize,
+    value: *std.ArrayList(u8),
+    start: usize,
+    base: u32,
+) Parser.Error!void {
+    if (i.* >= raw.len or raw[i.*] != '{') {
+        try parser.report(.{
+            .kind = .malformed_unicode_escape,
+            .span = escapeSpan(base, start, i.*),
+            .name = "missing '{'",
+        });
+        return;
+    }
+    i.* += 1;
+
+    // at least one digit. Lua says the same about an empty `\u{}` as about one
+    // with nothing usable behind the brace.
+    if (i.* >= raw.len or !isHexDigit(raw[i.*])) {
+        try parser.report(.{
+            .kind = .hex_digit_expected,
+            .span = escapeSpan(base, start, i.*),
+            .name = raw[start..i.*],
+        });
+        return;
+    }
+
+    var code: u32 = 0;
+    while (i.* < raw.len and isHexDigit(raw[i.*])) {
+        // checked before the shift rather than after, which is how Lua keeps the
+        // intermediate inside the range it compares it against
+        if (code > (0x7FFFFFFF >> 4)) {
+            try parser.report(.{
+                .kind = .unicode_escape_too_large,
+                .span = escapeSpan(base, start, i.* + 1),
+                .name = raw[start .. i.* + 1],
+                .value = code,
+            });
+            while (i.* < raw.len and isHexDigit(raw[i.*])) i.* += 1;
+            return;
+        }
+
+        code = code * 16 + hexValue(raw[i.*]);
+        i.* += 1;
+    }
+
+    if (i.* >= raw.len or raw[i.*] != '}') {
+        try parser.report(.{
+            .kind = .malformed_unicode_escape,
+            .span = escapeSpan(base, start, i.*),
+            .name = "missing '}'",
+        });
+        return;
+    }
+    i.* += 1;
+
+    try appendUtf8(parser.allocator(), value, code);
+}
+
+// `\ddd`, up to three decimal digits and no more than 255
+fn parseDecimalEscape(
+    parser: *Parser,
+    raw: []const u8,
+    i: *usize,
+    value: *std.ArrayList(u8),
+    escape: u8,
+    start: usize,
+    base: u32,
+) Parser.Error!void {
+    var digits: u32 = escape - '0';
+    var taken: usize = 1;
+
+    while (taken < 3 and i.* < raw.len and isDigit(raw[i.*])) : (taken += 1) {
+        digits = digits * 10 + (raw[i.*] - '0');
+        i.* += 1;
+    }
+
+    // Lua reads all three digits and then refuses, rather than stopping short and
+    // reading whatever is left of them as more of the string
+    if (digits > 255) {
+        try parser.report(.{
+            .kind = .decimal_escape_too_large,
+            .span = escapeSpan(base, start, i.*),
+            .name = raw[start..i.*],
+            .value = digits,
+        });
+        return;
+    }
+
+    try value.append(parser.allocator(), @truncate(digits));
+}
+
+// The code point as UTF-8, a transcription of `luaO_utf8esc`. It writes the
+// continuation bytes backwards from the end of a buffer, each one taking six more
+// bits, and stops when what is left fits in a lead byte. Surrogates are not
+// refused, since `utf8.char` is where that is decided rather than here.
+fn appendUtf8(allocator: std.mem.Allocator, value: *std.ArrayList(u8), code: u32) !void {
+    var bytes: [6]u8 = undefined;
+    var n: usize = 1;
+    var x = code;
+
+    if (x < 0x80) {
+        bytes[bytes.len - 1] = @truncate(x);
+    } else {
+        // the most that still fits in a lead byte, narrowed by half each round
+        var mfb: u32 = 0x3F;
+
+        while (true) {
+            bytes[bytes.len - n] = 0x80 | @as(u8, @truncate(x & 0x3F));
+            n += 1;
+            x >>= 6;
+            mfb >>= 1;
+
+            if (x <= mfb) break;
+        }
+
+        // ~mfb is the mask of the bits the lead byte takes, and doubling it is
+        // where it sits in the byte
+        bytes[bytes.len - n] = @as(u8, @truncate(~mfb << 1)) | @as(u8, @truncate(x));
+    }
+
+    try value.appendSlice(allocator, bytes[bytes.len - n ..]);
 }
 
 // a long string taken whole, no escapes at all. A newline straight after the
@@ -486,21 +676,6 @@ fn parseLongString(parser: *Parser, token: Token) Parser.Error!Ast.StringLiteral
         .raw = raw,
         .value = value,
     };
-}
-
-const HexRun = struct {
-    value: u32,
-    len: usize,
-};
-
-fn hexRun(raw: []const u8, i: usize, max: usize) HexRun {
-    var run: HexRun = .{ .value = 0, .len = 0 };
-
-    while (run.len < max and i + run.len < raw.len and isHexDigit(raw[i + run.len])) : (run.len += 1) {
-        run.value = run.value * 16 + hexValue(raw[i + run.len]);
-    }
-
-    return run;
 }
 
 fn isDigit(c: u8) bool {
@@ -558,11 +733,17 @@ fn binarySymbol(operator: Ast.BinaryOperator) []const u8 {
     };
 }
 
+// written by render and written out before returning, so nothing holds it past
+// that call
+var render_buffer: [num.buffer_size]u8 = undefined;
+
 fn render(writer: *std.Io.Writer, expr: Ast.Expression) anyerror!void {
     switch (expr) {
         .nil => try writer.writeAll("nil"),
         .boolean => |e| try writer.writeAll(if (e.value) "true" else "false"),
-        .number => |e| try writer.print("{d}", .{e.value}),
+        // through the number's own printer, so an integer stays without a `.0` and
+        // a float keeps the one Lua gives it
+        .number => |e| try writer.writeAll(num.toBytes(e.value, &render_buffer) catch "?"),
         .string => |e| try writer.print("[\"{s}\"]", .{e.raw}),
         .vararg => try writer.writeAll("..."),
         .variable => |e| try renderVariable(writer, e.*),
@@ -761,17 +942,30 @@ test "every operator reaches the tree it names" {
 }
 
 test "numeral literals keep their value" {
+    // rendered through the number's own printer, so an integer has no `.0` and a
+    // float keeps the one Lua gives it
     try expectTree("1", "1");
     try expectTree("1.5", "1.5");
     try expectTree(".5", "0.5");
-    try expectTree("1e2", "100");
+    try expectTree("1e2", "100.0");
     try expectTree("1E-2", "0.01");
     try expectTree("0x10", "16");
     try expectTree("0xff", "255");
-    try expectTree("0x1p4", "16");
+    try expectTree("0x1p4", "16.0");
     try expectTree("0x.8", "0.5");
-    try expectTree("0xA.8p1", "21");
+    try expectTree("0xA.8p1", "21.0");
     try expectTree("-0x10", "(- 16)");
+}
+
+// The two spellings are not symmetrical, which is what `l_str2int` in lobject.c
+// says: a hex numeral wraps into an integer and a decimal one that overruns
+// becomes a float.
+test "a numeral out of range reads the way Lua reads it" {
+    try expectTree("0xffffffffffffffff", "-1");
+    try expectTree("0x10000000000000000", "0");
+    try expectTree("9223372036854775807", "9223372036854775807");
+    try expectTree("9223372036854775808", "9.2233720368548e+18");
+    try expectTree("-9223372036854775809", "(- 9.2233720368548e+18)");
 }
 
 test "short strings decode their escapes" {
@@ -781,7 +975,7 @@ test "short strings decode their escapes" {
     var t = Parser.Test.init();
     defer t.deinit();
 
-    const expr = try t.parseExpression("\"a\\nb\\t\\65\\x42\\q\"");
+    const expr = try t.parseExpression("\"a\\nb\\t\\65\\x42\"");
     try t.expectClean();
 
     const string = switch (expr) {
@@ -789,10 +983,201 @@ test "short strings decode their escapes" {
         else => return error.NotAString,
     };
 
-    // \ddd and \xNN are both plain bytes, and an unknown escape keeps the
-    // character it named
-    try std.testing.expectEqualStrings("a\nb\tABq", string.value);
-    try std.testing.expectEqualStrings("a\\nb\\t\\65\\x42\\q", string.raw);
+    // \ddd and \xNN are both plain bytes
+    try std.testing.expectEqualStrings("a\nb\tAB", string.value);
+    try std.testing.expectEqualStrings("a\\nb\\t\\65\\x42", string.raw);
+}
+
+// Lua refuses an escape it does not know rather than dropping the backslash,
+// since there is no telling what was meant. The decoder reports it and carries
+// on, so the rest of the string is still decoded.
+test "an unknown escape is refused rather than decoded" {
+    var t = Parser.Test.init();
+    defer t.deinit();
+
+    const expr = try t.parseExpression("\"a\\qb\"");
+    try t.expectCount(1);
+    try t.expectKind(0, .invalid_escape_sequence);
+
+    const string = switch (expr) {
+        .string => |node| node,
+        else => return error.NotAString,
+    };
+    try std.testing.expectEqualStrings("aqb", string.value);
+}
+
+test "a decimal escape over 255 is refused" {
+    var t = Parser.Test.init();
+    defer t.deinit();
+
+    // Lua reads all three digits and then refuses, rather than stopping short and
+    // reading what is left of them as more of the string
+    const expr = try t.parseExpression("\"\\300\"");
+    try t.expectCount(1);
+    try t.expectKind(0, .decimal_escape_too_large);
+
+    const string = switch (expr) {
+        .string => |node| node,
+        else => return error.NotAString,
+    };
+    try std.testing.expectEqualStrings("", string.value);
+}
+
+test "255 is the largest decimal escape" {
+    var t = Parser.Test.init();
+    defer t.deinit();
+
+    const expr = try t.parseExpression("\"\\255\\0\"");
+    try t.expectClean();
+
+    const string = switch (expr) {
+        .string => |node| node,
+        else => return error.NotAString,
+    };
+    try std.testing.expectEqualStrings(&[_]u8{ 0xFF, 0x00 }, string.value);
+}
+
+test "a hex escape needs exactly two digits" {
+    var t = Parser.Test.init();
+    defer t.deinit();
+
+    _ = try t.parseExpression("\"\\x4\"");
+    try t.expectCount(1);
+    try t.expectKind(0, .hex_digit_expected);
+}
+
+test "a \\u{...} escape decodes to UTF-8" {
+    var t = Parser.Test.init();
+    defer t.deinit();
+
+    const expr = try t.parseExpression("\"\\u{1F600}\\u{41}\\u{0}\"");
+    try t.expectClean();
+
+    const string = switch (expr) {
+        .string => |node| node,
+        else => return error.NotAString,
+    };
+
+    // one byte, four bytes, then a NUL
+    const expected = [_]u8{ 0xF0, 0x9F, 0x98, 0x80, 'A', 0x00 };
+    try std.testing.expectEqualSlices(u8, &expected, string.value);
+}
+
+test "a \\u escape refuses what Lua refuses" {
+    // each in a reporter of its own, since the checks are about one shape each
+    {
+        var t = Parser.Test.init();
+        defer t.deinit();
+
+        // no brace
+        _ = try t.parseExpression("\"\\u41\"");
+        try t.expectCount(1);
+        try t.expectKind(0, .malformed_unicode_escape);
+    }
+    {
+        var t = Parser.Test.init();
+        defer t.deinit();
+
+        // no closing brace
+        _ = try t.parseExpression("\"\\u{41\"");
+        try t.expectCount(1);
+        try t.expectKind(0, .malformed_unicode_escape);
+    }
+    {
+        var t = Parser.Test.init();
+        defer t.deinit();
+
+        // nothing at all between the braces
+        _ = try t.parseExpression("\"\\u{}\"");
+        try t.expectCount(1);
+        try t.expectKind(0, .hex_digit_expected);
+    }
+    {
+        var t = Parser.Test.init();
+        defer t.deinit();
+
+        // past the largest code point
+        _ = try t.parseExpression("\"\\u{80000000}\"");
+        try t.expectCount(1);
+        try t.expectKind(0, .unicode_escape_too_large);
+    }
+}
+
+test "a \\u escape encodes at the length the code point needs" {
+    // the lengths Lua's own encoder gives, checked against what it prints
+    const cases = [_]struct { code: []const u8, len: usize }{
+        .{ .code = "80", .len = 2 },
+        .{ .code = "7FF", .len = 2 },
+        .{ .code = "800", .len = 3 },
+        .{ .code = "FFFF", .len = 3 },
+        .{ .code = "10000", .len = 4 },
+        .{ .code = "D800", .len = 3 },
+        .{ .code = "7FFFFFFF", .len = 6 },
+    };
+
+    for (cases) |case| {
+        var t = Parser.Test.init();
+        defer t.deinit();
+
+        const expr = try t.parseExpression(
+            try std.fmt.allocPrint(t.arena.allocator(), "\"\\u{{{s}}}\"", .{case.code}),
+        );
+        try t.expectClean();
+
+        const string = switch (expr) {
+            .string => |node| node,
+            else => return error.NotAString,
+        };
+        try std.testing.expectEqual(case.len, string.value.len);
+    }
+}
+
+test "the largest code point a \\u escape accepts is 0x7FFFFFFF" {
+    var t = Parser.Test.init();
+    defer t.deinit();
+
+    const expr = try t.parseExpression("\"\\u{7FFFFFFF}\"");
+    try t.expectClean();
+
+    const string = switch (expr) {
+        .string => |node| node,
+        else => return error.NotAString,
+    };
+
+    // six bytes, and a surrogate is allowed here even though utf8.char refuses
+    // one, since it is the escape that is being tested
+    try std.testing.expectEqual(@as(usize, 6), string.value.len);
+    try std.testing.expectEqual(@as(u8, 0xFD), string.value[0]);
+}
+
+// a backslash before a newline is a newline, which is how a long value is broken
+// up, and a CR LF pair is one newline rather than two
+test "a backslash before a newline is a newline" {
+    var t = Parser.Test.init();
+    defer t.deinit();
+
+    const expr = try t.parseExpression("\"a\\\nb\"");
+    try t.expectClean();
+
+    const string = switch (expr) {
+        .string => |node| node,
+        else => return error.NotAString,
+    };
+    try std.testing.expectEqualStrings("a\nb", string.value);
+}
+
+test "a backslash before a CRLF is one newline" {
+    var t = Parser.Test.init();
+    defer t.deinit();
+
+    const expr = try t.parseExpression("\"a\\\r\nb\"");
+    try t.expectClean();
+
+    const string = switch (expr) {
+        .string => |node| node,
+        else => return error.NotAString,
+    };
+    try std.testing.expectEqualStrings("a\nb", string.value);
 }
 
 test "\\z skips the whitespace behind it" {

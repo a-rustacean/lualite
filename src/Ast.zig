@@ -1,6 +1,9 @@
 const Token = @import("Token.zig");
 const Span = Token.Span;
 
+// the union itself rather than the file it is in, which reads as the type
+const Number = @import("Number.zig").Number;
+
 pub const Chunk = struct {
     span: Span,
     block: Block,
@@ -285,7 +288,11 @@ pub const BooleanExpression = struct {
 
 pub const NumberExpression = struct {
     span: Span,
-    value: f64,
+    // the value as Lua would read it, which is an integer or a float and not one
+    // number type. `1` and `1.0` compare equal but are not the same value, and the
+    // difference shows in `math.type`, in `//`, in the bitwise operators and in
+    // what `tostring` makes of it
+    value: Number,
 };
 
 pub const StringLiteral = struct {
