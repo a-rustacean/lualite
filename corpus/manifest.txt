@@ -1,0 +1,26 @@
+# The corpus the differential harness runs over, one source per line.
+#
+#   name  |  url  |  sha
+#
+# Fields are separated by |, not whitespace, because a local path may contain
+# spaces. The sha pins the checkout so a rerun compares the same bytes;
+# fetch.sh clones it shallow. Only paths git reports are enumerated, and only
+# the ones ending in .lua, so vendored blobs and non-Lua data stay out.
+#
+# The Lua-language-server clone and the local Zed bundle overlap: the extension
+# bundles a release of the same project. Both are kept, because its meta/ half
+# is generated C API stub data while script/ is hand written, and they lean on
+# different corners of the front end.
+
+luvit        | https://github.com/luvit/luvit                  | a63febcb9108ed8b49c5bf7ea316a808441d6740
+luarocks     | https://github.com/luarocks/luarocks             | a422d213b38c488472ec3bec70f372bb63784cdb
+algorithms   | https://github.com/TheAlgorithms/Lua             | cedc141018ad48884318fe08a6db278664b17128
+penlight     | https://github.com/lunarmodules/Penlight          | dfa483dddc0d751be1047667f4580dd90319169c
+resty-core   | https://github.com/openresty/lua-resty-core      | 97ff492ea13f205b221359a636a784096afd2c81
+lite         | https://github.com/rxi/lite                      | 38bd9b3326c02e43f244623f97a622b11f074415
+lua-ls       | https://github.com/LuaLS/lua-language-server     | 66d6405138fd472334d87785c1f90388eabfa9d7
+
+# Already on this machine, so they cost nothing to keep in the run. A local
+# source whose directory is absent is skipped, which is what CI does.
+zed-lualsp   | local:/Users/dilshad/Library/Application Support/Zed/extensions/work/lua/lua-language-server-3.19.1
+nixos-config | local:/Users/dilshad/.config/nixos-config

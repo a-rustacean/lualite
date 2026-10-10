@@ -2,3 +2,4 @@ zig-out
 .zig-cache
 .wakatime-project
 zig-pkg
+corpus/out
