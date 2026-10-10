@@ -43,8 +43,9 @@ pub const Value = union(enum) {
         };
     }
 
-    /// Equality as `==` has it, which crosses over between the two number types
-    /// and compares strings by content rather than by identity.
+    /// Equality as `==` has it, which crosses over between the two number types,
+    /// compares strings by content rather than by identity, and compares the rest
+    /// by identity.
     pub fn equal(a: Value, b: Value) bool {
         return switch (a) {
             .nil => b == .nil,
@@ -60,8 +61,23 @@ pub const Value = union(enum) {
                 .string => |y| Str.equal(x, y),
                 else => false,
             },
-            // everything else is compared by identity, which is a pointer compare
-            else => false,
+            // A table, a closure and a thread are equal to themselves and to
+            // nothing else. `luaV_equalval` compares the pointers rather than
+            // anything inside them, so `t == t` holds and two tables holding the
+            // same contents do not compare equal. `__eq` is not consulted here;
+            // that is metamethod work, which is Phase 7.
+            .table => |x| switch (b) {
+                .table => |y| x == y,
+                else => false,
+            },
+            .function => |x| switch (b) {
+                .function => |y| x == y,
+                else => false,
+            },
+            .thread => |x| switch (b) {
+                .thread => |y| x == y,
+                else => false,
+            },
         };
     }
 
@@ -147,6 +163,40 @@ test "two strings with the same bytes are equal whichever way round" {
     try testing.expect(a.equal(b));
     try testing.expect(b.equal(a));
     try testing.expect(!a.equal(c));
+}
+
+test "a table, a closure and a thread are equal only to themselves" {
+    var tracker: Object.Tracker = .init(testing.allocator);
+    defer tracker.deinit();
+
+    const table = try tracker.alloc(Table, .table);
+    const same = try tracker.alloc(Table, .table);
+    const function = try tracker.alloc(Function, .function);
+    const other_function = try tracker.alloc(Function, .function);
+    const thread = try tracker.alloc(Thread, .thread);
+    const other_thread = try tracker.alloc(Thread, .thread);
+
+    // `t == t` is true, which it was not before: identity is a pointer compare
+    try testing.expect((Value{ .table = table }).equal(.{ .table = table }));
+    try testing.expect((Value{ .function = function }).equal(.{ .function = function }));
+    try testing.expect((Value{ .thread = thread }).equal(.{ .thread = thread }));
+
+    // two of a kind that are not the same one are not equal, since nothing inside
+    // them is consulted
+    try testing.expect(!(Value{ .table = table }).equal(.{ .table = same }));
+    try testing.expect(!(Value{ .function = function }).equal(.{ .function = other_function }));
+    try testing.expect(!(Value{ .thread = thread }).equal(.{ .thread = other_thread }));
+
+    // and they are never equal to a value of another type
+    try testing.expect(!(Value{ .table = table }).equal(.nil));
+    try testing.expect(!(Value{ .function = function }).equal(.{ .table = table }));
+
+    tracker.free(table);
+    tracker.free(same);
+    tracker.free(function);
+    tracker.free(other_function);
+    tracker.free(thread);
+    tracker.free(other_thread);
 }
 
 test "everything but nil and false is truthy" {
