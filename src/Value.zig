@@ -203,6 +203,17 @@ pub const NativeFunction = enum {
     file_seek,
     file_lines,
     file_lines_iterator,
+    coroutine_create,
+    coroutine_resume,
+    coroutine_yield,
+    coroutine_status,
+    coroutine_running,
+    coroutine_isyieldable,
+    coroutine_close,
+    coroutine_wrap,
+    /// The callable `coroutine.wrap` hands back: a function whose `bound` is
+    /// the thread and whose `native` is this entry.
+    coroutine_wrap_call,
 };
 
 /// A table. Its mechanics live in Table.zig, which is where the array and hash
@@ -219,6 +230,11 @@ pub const Function = struct {
     function_index: u32,
     captures: []*Cell,
     environment: *Cell,
+    /// A Lua closure has no native behind it. `coroutine.wrap` builds a
+    /// function value that does: calling it runs `native` with `bound` in
+    /// front of every argument, which is how the thread stays attached.
+    native: ?NativeFunction = null,
+    bound: Value = .nil,
 };
 
 pub const Cell = struct { value: Value };
@@ -227,6 +243,9 @@ pub const Cell = struct { value: Value };
 /// pointer, so that a thread is one object for the collector to reach.
 pub const Thread = struct {
     common: Object.Common,
+    /// The runtime's `Coroutine` behind this thread. Typed as an opaque
+    /// pointer so the value layer does not have to import the VM.
+    coroutine: ?*anyopaque = null,
 };
 
 const testing = std.testing;

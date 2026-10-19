@@ -442,7 +442,7 @@ pub fn main(init: std.process.Init) !void {
         _ = vm.run(&chunk) catch |err| switch (err) {
             error.ExitRequested => requested_exit_status = vm.exit_status orelse 0,
             else => {
-                if (vm.error_offset) |offset| {
+                if (vm.exec.error_offset) |offset| {
                     const location = lines.lineCol(source, offset);
                     std.debug.print("{s}:{d}:{d}: runtime error: {s}\n", .{ filename, location.line, location.col, @errorName(err) });
                 } else {

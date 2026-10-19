@@ -21,7 +21,7 @@ The front-end is complete for its scope and has no stubs:
 
 261 tests pass (`zig build test`), 68 differential cases against a reference Lua
 5.4 agree (`differential/run.sh`), 2393 corpus files agree (`corpus/run.sh`), and
-8 runtime cases compare stdout, stderr and exit status against the reference
+9 runtime cases compare stdout, stderr and exit status against the reference
 (`runtime/run.sh`).
 `grep` for `TODO`, `unimplemented`, `@panic` across `src/` finds nothing.
 
@@ -212,6 +212,13 @@ Dynamic text chunks are now supported through `load`, `loadfile`, and `dofile`.
 Each compiled chunk keeps its parse arena and semantic program alive for
 returned closures, and `load` can bind an explicit environment.
 
+Coroutines are `std.Io.fiber` threads sharing one VM between them: a yield
+parks the whole Zig call stack on its own host stack and the next resume
+continues inside it. `create`, `resume`, `yield`, `status`, `running`,
+`isyieldable`, `close` and `wrap` behave as in 5.4.7, including error returns
+from `resume`, positions on `wrap` errors, `__close` handlers during `close`,
+and `cannot resume dead/non-suspended coroutine` guards.
+
 **Done when:** the CLI executes the language subset consistently and reports
 runtime errors with source locations.
 
@@ -298,7 +305,7 @@ the other operand's metamethod.
 ## Phase 6 — widen
 
 The core metatable hooks and string pattern matcher are implemented. The largest
-runtime gaps are coroutines, `io`, most of `os`, the remaining standard-library
+runtime gaps are `io`, most of `os`, the remaining standard-library
 functions and edge-case compatibility across Lua's runtime semantics. Dynamic
 binary chunks and incremental/generational collector modes are also unsupported.
 
@@ -321,9 +328,9 @@ What the parser harnesses cannot see is what a program computes. That is what
 interpreters and diffs stdout, stderr and the exit status, after normalising
 `0x…` object addresses (reference Lua seeds its string hash per process —
 `luai_makeseed` in `lstate.c` — so `pairs` over string keys also differs run to
-run; cases avoid depending on that order). Its eight cases cover the number and
+run; cases avoid depending on that order). Its nine cases cover the number and
 string models, tables, functions and closures, control flow, metatables, error
-messages and `string.format`. Two front-end bugs were found by hand rather than
+messages, `string.format`, and coroutines. Two front-end bugs were found by hand rather than
 by the harnesses: the `u16` slot overflow needs a generated file with 65536
 locals, and the `\` before a CRLF needs a string literal nobody writes by
 accident.

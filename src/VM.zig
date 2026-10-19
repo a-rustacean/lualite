@@ -35,7 +35,7 @@ const FileHandle = struct {
 /// the flag corners are the platform's own.
 extern "c" fn snprintf(buffer: [*]u8, size: usize, format: [*:0]const u8, ...) c_int;
 
-pub const Error = error{ OutOfMemory, MissingResolution, UnsupportedExpression, UnsupportedStatement, RuntimeError, StepLimit, ExitRequested };
+pub const Error = error{ OutOfMemory, MissingResolution, UnsupportedExpression, UnsupportedStatement, RuntimeError, StepLimit, ExitRequested, CoroutineClose };
 const Frame = struct { cells: []@import("Value.zig").Cell, pointers: []*@import("Value.zig").Cell };
 const ErrorFrame = struct { program: ?*const Semantic.Program, call_offset: ?u32 };
 const DateParts = struct { year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64, weekday: i64, yearday: i64 };
@@ -149,20 +149,130 @@ fn shortSource(buffer: *[64]u8, name: []const u8) []const u8 {
     return buffer[0 .. prefix.len + piece.len + suffix.len];
 }
 
+/// The part of the VM that says where the interpreter is: the running
+/// program, the call frames and the values in transit. A coroutine owns one of
+/// these while it is suspended, which is what makes it resumable; everything
+/// else in `VM` is shared by every coroutine, the way the reference shares one
+/// `lua_State` between its threads.
+const ExecState = struct {
+    semantics: *const Semantic.Program = undefined,
+    locals: []*@import("Value.zig").Cell = &.{},
+    upvalues: []*@import("Value.zig").Cell = &.{},
+    varargs: []const Value = &.{},
+    function_index: u32 = 0,
+    active_environment: *@import("Value.zig").Cell = undefined,
+    // One entry per running Lua function, innermost last. `call_offset` is
+    // where that function was called from in the frame below it, which is what
+    // `error` level 2 and up point at. Natives do not get a frame: a native has
+    // no position of its own to report.
+    error_frames: std.ArrayList(ErrorFrame) = .empty,
+    active_functions: std.ArrayList(*@import("Value.zig").Function) = .empty,
+    suspended_locals: std.ArrayList([]*@import("Value.zig").Cell) = .empty,
+    suspended_varargs: std.ArrayList([]const Value) = .empty,
+    suspended_results: std.ArrayList([]Value) = .empty,
+    results: std.ArrayList(Value) = .empty,
+    close_values: std.ArrayList(Value) = .empty,
+    returned: bool = false,
+    breaking: bool = false,
+    goto_name: ?[]const u8 = null,
+    thrown_error: ?Value = null,
+    steps_left: usize = 1_000_000,
+    error_offset: ?u32 = null,
+    /// The coroutine this state belongs to, once `create` or `init` links it.
+    coroutine: ?*Coroutine = null,
+};
+
+/// One coroutine: an interpreter state plus the host stack it is suspended in.
+/// `std.Io.fiber` performs the stack switch, so a yield parks the Zig call
+/// stack exactly as it is and the next resume continues inside it, still
+/// holding the interpreter's own frames.
+const Coroutine = struct {
+    const Status = enum { suspended, running, normal, dead };
+
+    vm: *VM,
+    object: *ValueModule.Thread,
+    thread_value: Value,
+    status: Status,
+    main: bool = false,
+    started: bool = false,
+    /// Set by `coroutine.close`; every suspension point then unwinds with
+    /// `error.CoroutineClose` instead of resuming the body.
+    close_requested: bool = false,
+    /// This coroutine's interpreter state; it owns the list buffers while the
+    /// coroutine is not running.
+    state: ExecState = .{},
+    /// Where the resumer's interpreter state waits while this coroutine runs.
+    /// It aliases the resumer's own lists, so it is never deinitialized here.
+    caller_state: ExecState = .{},
+    caller: ?*Coroutine = null,
+    caller_context: ?*std.Io.fiber.Context = null,
+    body: Value = .nil,
+    error_value: ?Value = null,
+    /// The values crossing the resume/yield boundary.
+    transfer: []Value = &.{},
+    stack: ?[]align(16) u8 = null,
+    context: std.Io.fiber.Context = undefined,
+};
+
+/// How much host stack a coroutine gets. Deep Lua call chains spend a few
+/// kilobytes of Zig stack per level, and the call-depth limit is 200.
+const coroutine_stack_size = 1 << 20;
+
+/// The coroutine whose naked fiber entry is about to run. A fresh fiber can
+/// take no arguments of its own, and only one is ever started at a time.
+var starting_coroutine: ?*Coroutine = null;
+
+/// Entry point for a fresh coroutine stack: park the `Coroutine` pointer
+/// where the entry stub expects its first argument, then switch in. The
+/// argument is ignored because `starting_coroutine` already names it.
+fn fiberEntry() callconv(.withStackAlign(.c, @max(16, @alignOf(std.Io.fiber.Context)))) noreturn {
+    const coroutine = starting_coroutine.?;
+    starting_coroutine = null;
+    const vm = coroutine.vm;
+    vm.runCoroutineBody(coroutine);
+    vm.leaveCoroutine(coroutine, .dead);
+    unreachable;
+}
+
+fn fiberNakedEntry() callconv(.naked) void {
+    switch (builtin.cpu.arch) {
+        .aarch64 => asm volatile (
+            \\ mov x0, sp
+            \\ b %[entry]
+            :
+            : [entry] "X" (&fiberEntry),
+        ),
+        .x86_64 => asm volatile (
+            \\ leaq 8(%%rsp), %%rdi
+            \\ jmp %[entry:P]
+            :
+            : [entry] "X" (&fiberEntry),
+        ),
+        else => @compileError("coroutines need an architecture with std.Io.fiber support"),
+    }
+}
+
+/// Switches from the current host stack into `coroutine`'s, saving where to
+/// come back to in the caller's local `Context`.
+fn switchInto(coroutine: *Coroutine) void {
+    var resumer_context: std.Io.fiber.Context = undefined;
+    coroutine.caller_context = &resumer_context;
+    var switching: std.Io.fiber.Switch = .{ .old = &resumer_context, .new = &coroutine.context };
+    _ = std.Io.fiber.contextSwitch(&switching);
+}
+
 /// Simple tree-walking runtime over the resolved AST. Keep it direct for now;
 /// introduce an IR only when a concrete optimization or backend needs one.
 pub const VM = struct {
     allocator: std.mem.Allocator,
     interner: *Str.Interner,
-    semantics: *const Semantic.Program,
+    exec: ExecState = .{},
     owned_program_arenas: std.ArrayList(*std.heap.ArenaAllocator) = .empty,
     owned_cells: std.ArrayList(*@import("Value.zig").Cell) = .empty,
     tracker: *@import("Object.zig").Tracker,
     collector: Collector,
-    locals: []*@import("Value.zig").Cell,
     globals: *Table,
     global_environment: *@import("Value.zig").Cell,
-    active_environment: *@import("Value.zig").Cell,
     string_metatable: ?*Table = null,
     writer: ?*std.Io.Writer = null,
     stderr: ?*std.Io.Writer = null,
@@ -177,27 +287,11 @@ pub const VM = struct {
     owned_functions: std.ArrayList(*@import("Value.zig").Function) = .empty,
     owned_frames: std.ArrayList(Frame) = .empty,
     owned_captures: std.ArrayList([]*@import("Value.zig").Cell) = .empty,
-    suspended_locals: std.ArrayList([]*@import("Value.zig").Cell) = .empty,
-    suspended_varargs: std.ArrayList([]const Value) = .empty,
-    suspended_results: std.ArrayList([]Value) = .empty,
-    // One entry per running Lua function, innermost last. `call_offset` is
-    // where that function was called from in the frame below it, which is what
-    // `error` level 2 and up point at. Natives do not get a frame: a native has
-    // no position of its own to report.
-    error_frames: std.ArrayList(ErrorFrame) = .empty,
-    active_functions: std.ArrayList(*@import("Value.zig").Function) = .empty,
-    upvalues: []*@import("Value.zig").Cell = &.{},
-    varargs: []const Value = &.{},
-    function_index: u32 = 0,
-    results: std.ArrayList(Value) = .empty,
-    close_values: std.ArrayList(Value) = .empty,
-    returned: bool = false,
-    breaking: bool = false,
-    goto_name: ?[]const u8 = null,
-    thrown_error: ?Value = null,
-    steps_left: usize = 1_000_000,
+    coroutines: std.ArrayList(*Coroutine) = .empty,
+    /// A body for the function value `coroutine.wrap` returns; the wrapper
+    /// dispatches on `native` and never looks at this.
+    wrapper_body: Ast.FunctionBody = undefined,
     number_buffer: [64]u8 = undefined,
-    error_offset: ?u32 = null,
     rng_state: [4]u64 = seedRandomState(0x6c75616c697465, 0x72616e646f6d),
     gc_stopped: bool = false,
     gc_pending: bool = false,
@@ -212,15 +306,16 @@ pub const VM = struct {
         var vm: VM = .{
             .allocator = allocator,
             .interner = interner,
-            .semantics = semantics,
+            .exec = .{
+                .semantics = semantics,
+                .active_environment = global_environment,
+            },
             .tracker = tracker,
             .collector = .init(allocator),
-            .locals = &.{},
             .globals = globals,
             .global_environment = global_environment,
-            .active_environment = global_environment,
         };
-        vm.locals = try vm.allocFrame(semantics.functions[0].frame_size);
+        vm.exec.locals = try vm.allocFrame(semantics.functions[0].frame_size);
         try vm.installTableLibrary();
         try vm.installStringLibrary();
         try vm.installUtf8Library();
@@ -228,10 +323,13 @@ pub const VM = struct {
         try vm.installOsLibrary();
         try vm.installIoLibrary();
         try vm.installBaseLibrary();
+        try vm.installCoroutineLibrary();
         return vm;
     }
 
     pub fn deinit(vm: *VM) void {
+        for (vm.coroutines.items) |coroutine| vm.destroyCoroutine(coroutine);
+        vm.coroutines.deinit(vm.allocator);
         vm.allocator.destroy(vm.global_environment);
         for (vm.owned_cells.items) |cell| vm.allocator.destroy(cell);
         vm.owned_cells.deinit(vm.allocator);
@@ -242,13 +340,13 @@ pub const VM = struct {
         vm.owned_frames.deinit(vm.allocator);
         for (vm.owned_captures.items) |captures| vm.allocator.free(captures);
         vm.owned_captures.deinit(vm.allocator);
-        vm.suspended_locals.deinit(vm.allocator);
-        vm.suspended_varargs.deinit(vm.allocator);
-        vm.suspended_results.deinit(vm.allocator);
-        vm.error_frames.deinit(vm.allocator);
-        vm.active_functions.deinit(vm.allocator);
-        vm.results.deinit(vm.allocator);
-        vm.close_values.deinit(vm.allocator);
+        vm.exec.suspended_locals.deinit(vm.allocator);
+        vm.exec.suspended_varargs.deinit(vm.allocator);
+        vm.exec.suspended_results.deinit(vm.allocator);
+        vm.exec.error_frames.deinit(vm.allocator);
+        vm.exec.active_functions.deinit(vm.allocator);
+        vm.exec.results.deinit(vm.allocator);
+        vm.exec.close_values.deinit(vm.allocator);
         for (vm.owned_files.items) |handle| {
             closeFileHandle(handle);
             vm.allocator.destroy(handle);
@@ -266,26 +364,26 @@ pub const VM = struct {
     }
 
     pub fn run(vm: *VM, chunk: *const Ast.Chunk) Error![]const Value {
-        vm.error_frames.append(vm.allocator, .{ .program = vm.semantics, .call_offset = null }) catch return error.OutOfMemory;
-        errdefer _ = vm.error_frames.pop();
+        vm.exec.error_frames.append(vm.allocator, .{ .program = vm.exec.semantics, .call_offset = null }) catch return error.OutOfMemory;
+        errdefer _ = vm.exec.error_frames.pop();
         try vm.execBlock(&chunk.block);
-        _ = vm.error_frames.pop();
+        _ = vm.exec.error_frames.pop();
         try vm.collectAtSafePoint();
-        return vm.results.items;
+        return vm.exec.results.items;
     }
 
     fn tick(vm: *VM) Error!void {
         if (!vm.gc_stopped and vm.tracker.count >= vm.gc_threshold) vm.gc_pending = true;
-        if (vm.steps_left == 0) return error.StepLimit;
-        vm.steps_left -= 1;
+        if (vm.exec.steps_left == 0) return error.StepLimit;
+        vm.exec.steps_left -= 1;
     }
 
     fn execBlock(vm: *VM, block: *const Ast.Block) Error!void {
-        const close_start = vm.close_values.items.len;
+        const close_start = vm.exec.close_values.items.len;
         vm.execBlockBody(block) catch |err| {
-            const original_error = vm.thrown_error;
+            const original_error = vm.exec.thrown_error;
             vm.closeScope(close_start) catch return error.RuntimeError;
-            vm.thrown_error = original_error;
+            vm.exec.thrown_error = original_error;
             return err;
         };
         try vm.closeScope(close_start);
@@ -294,10 +392,10 @@ pub const VM = struct {
     fn execBlockBody(vm: *VM, block: *const Ast.Block) Error!void {
         var statement_index: usize = 0;
         while (true) {
-            if (vm.returned or vm.breaking) return;
-            if (vm.goto_name) |target| {
+            if (vm.exec.returned or vm.exec.breaking) return;
+            if (vm.exec.goto_name) |target| {
                 if (findLabelStatement(block, target)) |label_index| {
-                    vm.goto_name = null;
+                    vm.exec.goto_name = null;
                     statement_index = label_index + 1;
                     continue;
                 }
@@ -308,8 +406,8 @@ pub const VM = struct {
             try vm.collectAtSafePoint();
             statement_index += 1;
         }
-        if (vm.goto_name != null) return;
-        if (!vm.returned) if (block.ret_statement) |ret| {
+        if (vm.exec.goto_name != null) return;
+        if (!vm.exec.returned) if (block.ret_statement) |ret| {
             try vm.execReturn(ret);
             try vm.collectAtSafePoint();
         };
@@ -317,15 +415,15 @@ pub const VM = struct {
 
     fn closeScope(vm: *VM, start: usize) Error!void {
         var close_error: ?Error = null;
-        while (vm.close_values.items.len > start) {
-            const value = vm.close_values.pop().?;
+        while (vm.exec.close_values.items.len > start) {
+            const value = vm.exec.close_values.pop().?;
             if (value == .nil or (value == .boolean and !value.boolean)) continue;
             const method = if (value == .table) try vm.metamethod(value.table, "__close") else .nil;
             if (method == .nil) {
                 close_error = error.RuntimeError;
                 continue;
             }
-            const error_value = vm.thrown_error orelse Value.nil;
+            const error_value = vm.exec.thrown_error orelse Value.nil;
             const returned = vm.invokeCallableValues(method, &.{ value, error_value }) catch |err| {
                 close_error = err;
                 continue;
@@ -336,22 +434,22 @@ pub const VM = struct {
     }
 
     fn execRepeatIteration(vm: *VM, node: *const Ast.RepeatStatement) Error!bool {
-        const close_start = vm.close_values.items.len;
+        const close_start = vm.exec.close_values.items.len;
         vm.execBlockBody(&node.block) catch |err| {
-            const original_error = vm.thrown_error;
+            const original_error = vm.exec.thrown_error;
             vm.closeScope(close_start) catch return error.RuntimeError;
-            vm.thrown_error = original_error;
+            vm.exec.thrown_error = original_error;
             return err;
         };
-        var should_stop = vm.returned or vm.goto_name != null;
-        if (vm.breaking) {
-            vm.breaking = false;
+        var should_stop = vm.exec.returned or vm.exec.goto_name != null;
+        if (vm.exec.breaking) {
+            vm.exec.breaking = false;
             should_stop = true;
         } else if (!should_stop) {
             const condition = vm.eval(node.condition) catch |err| {
-                const original_error = vm.thrown_error;
+                const original_error = vm.exec.thrown_error;
                 vm.closeScope(close_start) catch return error.RuntimeError;
-                vm.thrown_error = original_error;
+                vm.exec.thrown_error = original_error;
                 return err;
             };
             should_stop = condition.truthy();
@@ -369,12 +467,12 @@ pub const VM = struct {
     }
 
     fn execStatement(vm: *VM, statement: Ast.Statement) Error!void {
-        vm.error_offset = statementSpan(statement).start;
+        vm.exec.error_offset = statementSpan(statement).start;
         try vm.tick();
         switch (statement) {
             .empty, .label => {},
-            .goto => |node| vm.goto_name = node.name.name,
-            .@"break" => vm.breaking = true,
+            .goto => |node| vm.exec.goto_name = node.name.name,
+            .@"break" => vm.exec.breaking = true,
             .function_call => |call| {
                 _ = try vm.evalCall(call);
             },
@@ -389,7 +487,7 @@ pub const VM = struct {
                             const method = if (value == .table) try vm.metamethod(value.table, "__close") else .nil;
                             if (method == .nil) return error.RuntimeError;
                         }
-                        vm.close_values.append(vm.allocator, value) catch return error.OutOfMemory;
+                        vm.exec.close_values.append(vm.allocator, value) catch return error.OutOfMemory;
                     };
                 }
             },
@@ -399,7 +497,7 @@ pub const VM = struct {
                 const slot = try vm.localSlot(definition.name);
                 try vm.declareCell(slot, .nil);
                 const value = try vm.makeFunction(&definition.body);
-                vm.locals[slot].value = .{ .function = value };
+                vm.exec.locals[slot].value = .{ .function = value };
             },
             .function_definition => |definition| {
                 const function: Value = .{ .function = try vm.makeFunction(&definition.body) };
@@ -450,9 +548,9 @@ pub const VM = struct {
             .@"while" => |node| while ((try vm.eval(node.condition)).truthy()) {
                 try vm.tick();
                 try vm.execBlock(&node.block);
-                if (vm.returned or vm.goto_name != null) break;
-                if (vm.breaking) {
-                    vm.breaking = false;
+                if (vm.exec.returned or vm.exec.goto_name != null) break;
+                if (vm.exec.breaking) {
+                    vm.exec.breaking = false;
                     break;
                 }
             },
@@ -470,9 +568,9 @@ pub const VM = struct {
                     try vm.tick();
                     try vm.declareCell(slot, .{ .number = current });
                     try vm.execBlock(&node.block);
-                    if (vm.returned or vm.goto_name != null) break;
-                    if (vm.breaking) {
-                        vm.breaking = false;
+                    if (vm.exec.returned or vm.exec.goto_name != null) break;
+                    if (vm.exec.breaking) {
+                        vm.exec.breaking = false;
                         break;
                     }
                     current = Number.add(current, step);
@@ -496,9 +594,9 @@ pub const VM = struct {
                         try vm.declareCell(try vm.localSlot(name), if (i < yielded.len) yielded[i] else .nil);
                     }
                     try vm.execBlock(&node.block);
-                    if (vm.returned or vm.goto_name != null) break;
-                    if (vm.breaking) {
-                        vm.breaking = false;
+                    if (vm.exec.returned or vm.exec.goto_name != null) break;
+                    if (vm.exec.breaking) {
+                        vm.exec.breaking = false;
                         break;
                     }
                 }
@@ -529,8 +627,8 @@ pub const VM = struct {
     fn execReturn(vm: *VM, ret: Ast.RetStatement) Error!void {
         const values = try vm.evalList(ret.expressions);
         defer vm.allocator.free(values);
-        vm.results.appendSlice(vm.allocator, values) catch return error.OutOfMemory;
-        vm.returned = true;
+        vm.exec.results.appendSlice(vm.allocator, values) catch return error.OutOfMemory;
+        vm.exec.returned = true;
     }
 
     fn evalList(vm: *VM, expressions: []const Ast.Expression) Error![]Value {
@@ -540,7 +638,7 @@ pub const VM = struct {
             const is_last = i + 1 == expressions.len;
             if (is_last) switch (expr) {
                 .vararg => {
-                    values.appendSlice(vm.allocator, vm.varargs) catch return error.OutOfMemory;
+                    values.appendSlice(vm.allocator, vm.exec.varargs) catch return error.OutOfMemory;
                     continue;
                 },
                 .function_call => |call| {
@@ -562,7 +660,7 @@ pub const VM = struct {
     /// keep their frame cell and are simply overwritten.
     fn declareCell(vm: *VM, slot: usize, value: Value) Error!void {
         if (!vm.slotIsCaptured(slot)) {
-            vm.locals[slot].value = value;
+            vm.exec.locals[slot].value = value;
             return;
         }
         const cell = vm.allocator.create(@import("Value.zig").Cell) catch return error.OutOfMemory;
@@ -571,30 +669,30 @@ pub const VM = struct {
             vm.allocator.destroy(cell);
             return error.OutOfMemory;
         };
-        vm.locals[slot] = cell;
+        vm.exec.locals[slot] = cell;
     }
 
     fn slotIsCaptured(vm: *VM, slot: usize) bool {
-        const function = vm.semantics.functions[vm.function_index];
+        const function = vm.exec.semantics.functions[vm.exec.function_index];
         return slot < function.captured_slots.len and function.captured_slots[slot];
     }
 
     fn localSlot(vm: *VM, name: Ast.Identifier) Error!usize {
-        return switch (vm.semantics.resolutions.get(name.span.start) orelse return error.MissingResolution) {
-            .local => |slot| if (slot < vm.locals.len) slot else error.MissingResolution,
+        return switch (vm.exec.semantics.resolutions.get(name.span.start) orelse return error.MissingResolution) {
+            .local => |slot| if (slot < vm.exec.locals.len) slot else error.MissingResolution,
             else => error.UnsupportedExpression,
         };
     }
 
     fn setName(vm: *VM, name: Ast.Identifier, value: Value) Error!void {
-        switch (vm.semantics.resolutions.get(name.span.start) orelse return error.MissingResolution) {
-            .local => |slot| vm.locals[slot].value = value,
-            .upvalue => |slot| if (slot < vm.upvalues.len) {
-                vm.upvalues[slot].value = value;
+        switch (vm.exec.semantics.resolutions.get(name.span.start) orelse return error.MissingResolution) {
+            .local => |slot| vm.exec.locals[slot].value = value,
+            .upvalue => |slot| if (slot < vm.exec.upvalues.len) {
+                vm.exec.upvalues[slot].value = value;
             } else return error.MissingResolution,
             .global => {
                 if (std.mem.eql(u8, name.name, "_ENV")) {
-                    vm.active_environment.value = value;
+                    vm.exec.active_environment.value = value;
                     return;
                 }
                 const key = Value{ .string = vm.interner.intern(name.name) catch return error.OutOfMemory };
@@ -605,29 +703,29 @@ pub const VM = struct {
     }
 
     fn getName(vm: *VM, name: Ast.Identifier) Error!Value {
-        return switch (vm.semantics.resolutions.get(name.span.start) orelse return error.MissingResolution) {
-            .local => |slot| vm.locals[slot].value,
+        return switch (vm.exec.semantics.resolutions.get(name.span.start) orelse return error.MissingResolution) {
+            .local => |slot| vm.exec.locals[slot].value,
             .global => if (std.mem.eql(u8, name.name, "_ENV"))
-                vm.active_environment.value
+                vm.exec.active_environment.value
             else
                 try vm.getTableIndex(
                     try vm.environmentValue(name),
                     .{ .string = vm.interner.intern(name.name) catch return error.OutOfMemory },
                 ),
-            .upvalue => |slot| if (slot < vm.upvalues.len) vm.upvalues[slot].value else error.MissingResolution,
+            .upvalue => |slot| if (slot < vm.exec.upvalues.len) vm.exec.upvalues[slot].value else error.MissingResolution,
         };
     }
 
     fn environmentValue(vm: *VM, name: Ast.Identifier) Error!Value {
-        return switch (vm.semantics.environment_resolutions.get(name.span.start) orelse .global) {
-            .local => |slot| if (slot < vm.locals.len) vm.locals[slot].value else error.MissingResolution,
-            .upvalue => |slot| if (slot < vm.upvalues.len) vm.upvalues[slot].value else error.MissingResolution,
-            .global => vm.active_environment.value,
+        return switch (vm.exec.semantics.environment_resolutions.get(name.span.start) orelse .global) {
+            .local => |slot| if (slot < vm.exec.locals.len) vm.exec.locals[slot].value else error.MissingResolution,
+            .upvalue => |slot| if (slot < vm.exec.upvalues.len) vm.exec.upvalues[slot].value else error.MissingResolution,
+            .global => vm.exec.active_environment.value,
         };
     }
 
     fn eval(vm: *VM, expr: Ast.Expression) Error!Value {
-        vm.error_offset = expressionSpan(expr).start;
+        vm.exec.error_offset = expressionSpan(expr).start;
         try vm.tick();
         return switch (expr) {
             .nil => .nil,
@@ -645,7 +743,7 @@ pub const VM = struct {
             .table => |table| try vm.evalTableConstructor(table),
             .function => |function| .{ .function = try vm.makeFunction(&function.body) },
             .function_call => |call| try vm.evalCall(call),
-            .vararg => if (vm.varargs.len == 0) .nil else vm.varargs[0],
+            .vararg => if (vm.exec.varargs.len == 0) .nil else vm.exec.varargs[0],
         };
     }
 
@@ -671,21 +769,23 @@ pub const VM = struct {
     }
 
     fn makeFunction(vm: *VM, body: *const Ast.FunctionBody) Error!*@import("Value.zig").Function {
-        const definition = vm.semantics.definitions.get(body.span.start) orelse return error.MissingResolution;
-        const semantic_function = vm.semantics.functions[definition.function];
+        const definition = vm.exec.semantics.definitions.get(body.span.start) orelse return error.MissingResolution;
+        const semantic_function = vm.exec.semantics.functions[definition.function];
         const captures = vm.allocator.alloc(*@import("Value.zig").Cell, semantic_function.upvalues.len) catch return error.OutOfMemory;
         errdefer vm.allocator.free(captures);
         for (semantic_function.upvalues, 0..) |upvalue, i| captures[i] = switch (upvalue) {
-            .parent_local => |slot| if (slot < vm.locals.len) vm.locals[slot] else return error.MissingResolution,
-            .parent_upvalue => |slot| if (slot < vm.upvalues.len) vm.upvalues[slot] else return error.MissingResolution,
+            .parent_local => |slot| if (slot < vm.exec.locals.len) vm.exec.locals[slot] else return error.MissingResolution,
+            .parent_upvalue => |slot| if (slot < vm.exec.upvalues.len) vm.exec.upvalues[slot] else return error.MissingResolution,
         };
         const function = vm.tracker.alloc(@import("Value.zig").Function, .function) catch return error.OutOfMemory;
         errdefer vm.tracker.free(function);
-        function.semantics = vm.semantics;
+        function.semantics = vm.exec.semantics;
         function.body = body;
         function.function_index = definition.function;
         function.captures = captures;
-        function.environment = vm.active_environment;
+        function.environment = vm.exec.active_environment;
+        function.native = null;
+        function.bound = .nil;
         vm.owned_functions.append(vm.allocator, function) catch return error.OutOfMemory;
         errdefer for (vm.owned_functions.items, 0..) |owned, i| if (owned == function) {
             _ = vm.owned_functions.swapRemove(i);
@@ -719,7 +819,7 @@ pub const VM = struct {
             const receiver = try vm.eval(call.expression);
             const key = Value{ .string = vm.interner.intern(method.name) catch return error.OutOfMemory };
             const method_value = try vm.getTableIndex(receiver, key);
-            vm.error_offset = call.span.start;
+            vm.exec.error_offset = call.span.start;
             if (!try vm.isCallable(method_value)) {
                 var description_buffer: [192]u8 = undefined;
                 const description = std.fmt.bufPrint(&description_buffer, " (method '{s}')", .{method.name}) catch "";
@@ -732,7 +832,7 @@ pub const VM = struct {
             break :blk try vm.invokeCallableValues(method_value, arguments);
         } else blk: {
             const function = try vm.eval(call.expression);
-            vm.error_offset = call.span.start;
+            vm.exec.error_offset = call.span.start;
             if (!try vm.isCallable(function)) {
                 var description_buffer: [192]u8 = undefined;
                 return vm.callFailure(function, vm.operandDescription(call.expression, &description_buffer));
@@ -751,7 +851,7 @@ pub const VM = struct {
         const results = if (call.method) |method| blk: {
             const receiver = try vm.eval(call.expression);
             const method_value = try vm.getTableIndex(receiver, .{ .string = vm.interner.intern(method.name) catch return error.OutOfMemory });
-            vm.error_offset = call.span.start;
+            vm.exec.error_offset = call.span.start;
             if (!try vm.isCallable(method_value)) {
                 var description_buffer: [192]u8 = undefined;
                 const description = std.fmt.bufPrint(&description_buffer, " (method '{s}')", .{method.name}) catch "";
@@ -760,7 +860,7 @@ pub const VM = struct {
             break :blk try vm.invokeCallableValues(method_value, &.{ receiver, argument });
         } else blk: {
             const function = try vm.eval(call.expression);
-            vm.error_offset = call.span.start;
+            vm.exec.error_offset = call.span.start;
             if (!try vm.isCallable(function)) {
                 var description_buffer: [192]u8 = undefined;
                 return vm.callFailure(function, vm.operandDescription(call.expression, &description_buffer));
@@ -776,28 +876,35 @@ pub const VM = struct {
         const function = args[0];
         const handler = if (has_handler) args[1] else .nil;
         const call_args = args[if (has_handler) 2 else 1..];
-        const saved_error = vm.thrown_error;
-        vm.thrown_error = null;
+        const saved_error = vm.exec.thrown_error;
+        vm.exec.thrown_error = null;
         const results = vm.invokeCallableValues(function, call_args) catch |err| {
-            const thrown = vm.thrown_error orelse Value{ .string = vm.interner.intern("runtime error") catch return error.OutOfMemory };
-            vm.thrown_error = saved_error;
+            // A pending close is not catchable: `pcall` and `xpcall` pass it
+            // through, the way `lua_closethread`'s status passes through the
+            // reference's protected calls.
+            if (err == error.CoroutineClose) {
+                vm.exec.thrown_error = saved_error;
+                return err;
+            }
+            const thrown = vm.exec.thrown_error orelse Value{ .string = vm.interner.intern("runtime error") catch return error.OutOfMemory };
+            vm.exec.thrown_error = saved_error;
             if (err != error.RuntimeError) return err;
             var handled = thrown;
             if (has_handler) {
-                vm.thrown_error = null;
+                vm.exec.thrown_error = null;
                 const message = vm.invokeCallableValues(handler, &.{thrown}) catch {
-                    vm.thrown_error = saved_error;
+                    vm.exec.thrown_error = saved_error;
                     const fallback = Value{ .string = vm.interner.intern("error in error handling") catch return error.OutOfMemory };
                     return vm.allocator.dupe(Value, &.{ .{ .boolean = false }, fallback }) catch return error.OutOfMemory;
                 };
                 handled = if (message.len == 0) .nil else message[0];
                 vm.allocator.free(message);
-                vm.thrown_error = saved_error;
+                vm.exec.thrown_error = saved_error;
             }
             return vm.allocator.dupe(Value, &.{ .{ .boolean = false }, handled }) catch return error.OutOfMemory;
         };
         defer vm.allocator.free(results);
-        vm.thrown_error = saved_error;
+        vm.exec.thrown_error = saved_error;
         const values = vm.allocator.alloc(Value, results.len + 1) catch return error.OutOfMemory;
         values[0] = .{ .boolean = true };
         @memcpy(values[1..], results);
@@ -811,7 +918,18 @@ pub const VM = struct {
     fn invokeCallableDepth(vm: *VM, callable: Value, args: []const Value, depth: usize) Error![]Value {
         if (depth >= 200) return error.RuntimeError;
         return switch (callable) {
-            .function => |function| vm.invokeValues(function, args),
+            .function => |function| blk: {
+                // `coroutine.wrap`'s value runs its native with the thread
+                // bound in front of the call's own arguments.
+                if (function.native) |native| {
+                    const arguments = vm.allocator.alloc(Value, args.len + 1) catch return error.OutOfMemory;
+                    defer vm.allocator.free(arguments);
+                    arguments[0] = function.bound;
+                    @memcpy(arguments[1..], args);
+                    break :blk try vm.invokeNativeValues(native, arguments);
+                }
+                break :blk try vm.invokeValues(function, args);
+            },
             .native_function => |function| vm.invokeNativeValues(function, args),
             .table => |table| blk: {
                 const method = try vm.metamethod(table, "__call");
@@ -830,8 +948,8 @@ pub const VM = struct {
         // Natives get a position-less frame so that `error` levels count them,
         // the way the reference counts C calls: asking for a level that lands
         // on a native yields no position rather than the Lua frame below it.
-        vm.error_frames.append(vm.allocator, .{ .program = null, .call_offset = vm.error_offset }) catch return error.OutOfMemory;
-        defer _ = vm.error_frames.pop();
+        vm.exec.error_frames.append(vm.allocator, .{ .program = null, .call_offset = vm.exec.error_offset }) catch return error.OutOfMemory;
+        defer _ = vm.exec.error_frames.pop();
         switch (function) {
             .base_print => return vm.basePrint(args),
             .base_type => return vm.baseType(args),
@@ -962,7 +1080,298 @@ pub const VM = struct {
             .file_seek => return vm.fileSeek(args),
             .file_lines => return vm.fileLines(args),
             .file_lines_iterator => return vm.fileLinesIterator(args),
+            .coroutine_create => return vm.coroutineCreate(args),
+            .coroutine_resume => return vm.coroutineResume(args),
+            .coroutine_yield => return vm.coroutineYield(args),
+            .coroutine_status => return vm.coroutineStatus(args),
+            .coroutine_running => return vm.coroutineRunning(args),
+            .coroutine_isyieldable => return vm.coroutineIsYieldable(args),
+            .coroutine_close => return vm.coroutineClose(args),
+            .coroutine_wrap => return vm.coroutineWrap(args),
+            // reached only through the function value `wrap` builds, which
+            // feeds the bound thread in front of the arguments
+            .coroutine_wrap_call => return vm.coroutineWrapCall(args),
         }
+    }
+
+    /// The shared checking behind `create` and `wrap`.
+    fn createThread(vm: *VM, args: []const Value, short: []const u8, long: []const u8) Error!*Coroutine {
+        if (args.len < 1) return vm.raiseArgument(1, short, long, "function expected, got no value", .{});
+        const body = args[0];
+        if (body != .function and body != .native_function)
+            return vm.raiseArgument(1, short, long, "function expected, got {s}", .{body.typeName()});
+        const object = vm.tracker.alloc(ValueModule.Thread, .thread) catch return error.OutOfMemory;
+        errdefer vm.tracker.free(object);
+        const coroutine = vm.allocator.create(Coroutine) catch return error.OutOfMemory;
+        errdefer vm.allocator.destroy(coroutine);
+        coroutine.* = .{
+            .vm = vm,
+            .object = object,
+            .thread_value = .{ .thread = object },
+            .status = .suspended,
+            .body = body,
+        };
+        object.coroutine = coroutine;
+        vm.coroutines.append(vm.allocator, coroutine) catch return error.OutOfMemory;
+        return coroutine;
+    }
+
+    fn coroutineCreate(vm: *VM, args: []const Value) Error![]Value {
+        const coroutine = try vm.createThread(args, "create", "coroutine.create");
+        return vm.allocator.dupe(Value, &.{coroutine.thread_value}) catch return error.OutOfMemory;
+    }
+
+    fn coroutineArgument(vm: *VM, args: []const Value, short: []const u8, long: []const u8) Error!*Coroutine {
+        if (args.len < 1) return vm.raiseArgument(1, short, long, "thread expected, got no value", .{});
+        if (args[0] != .thread) return vm.raiseArgument(1, short, long, "thread expected, got {s}", .{args[0].typeName()});
+        const object = args[0].thread;
+        const coroutine: *Coroutine = @ptrCast(@alignCast(object.coroutine orelse return error.RuntimeError));
+        return coroutine;
+    }
+
+    /// `refuse to resume` cases: the reference returns `false` and a message
+    /// rather than raising, so `pcall(coroutine.resume, ...)` reports success.
+    fn resumeFailure(vm: *VM, message: []const u8) Error![]Value {
+        const text: Value = .{ .string = vm.interner.intern(message) catch return error.OutOfMemory };
+        return vm.allocator.dupe(Value, &.{ .{ .boolean = false }, text }) catch return error.OutOfMemory;
+    }
+
+    fn coroutineResume(vm: *VM, args: []const Value) Error![]Value {
+        const coroutine = try vm.coroutineArgument(args, "resume", "coroutine.resume");
+        return vm.resumeThread(coroutine, args[1..]);
+    }
+
+    /// What `resume` and the `wrap` callable share: run the coroutine, then
+    /// report `true` with the yielded values or `false` with the error.
+    fn resumeThread(vm: *VM, coroutine: *Coroutine, args: []const Value) Error![]Value {
+        switch (coroutine.status) {
+            .dead => return vm.resumeFailure("cannot resume dead coroutine"),
+            .running, .normal => return vm.resumeFailure("cannot resume non-suspended coroutine"),
+            .suspended => {},
+        }
+        try vm.resumeCoroutine(coroutine, args);
+        if (coroutine.error_value) |value| {
+            return vm.allocator.dupe(Value, &.{ .{ .boolean = false }, value }) catch return error.OutOfMemory;
+        }
+        const values = vm.allocator.alloc(Value, coroutine.transfer.len + 1) catch return error.OutOfMemory;
+        values[0] = .{ .boolean = true };
+        @memcpy(values[1..], coroutine.transfer);
+        return values;
+    }
+
+    fn coroutineWrap(vm: *VM, args: []const Value) Error![]Value {
+        const coroutine = try vm.createThread(args, "wrap", "coroutine.wrap");
+        const function = vm.tracker.alloc(ValueModule.Function, .function) catch return error.OutOfMemory;
+        errdefer vm.tracker.free(function);
+        function.semantics = vm.exec.semantics;
+        function.body = &vm.wrapper_body;
+        function.function_index = 0;
+        function.captures = &.{};
+        function.environment = vm.exec.active_environment;
+        function.native = .coroutine_wrap_call;
+        function.bound = coroutine.thread_value;
+        vm.owned_functions.append(vm.allocator, function) catch return error.OutOfMemory;
+        return vm.allocator.dupe(Value, &.{.{ .function = function }}) catch return error.OutOfMemory;
+    }
+
+    /// The callable `wrap` returns; the dispatcher put the thread first.
+    fn coroutineWrapCall(vm: *VM, args: []const Value) Error![]Value {
+        const object = args[0].thread;
+        const coroutine: *Coroutine = @ptrCast(@alignCast(object.coroutine orelse return error.RuntimeError));
+        const results = try vm.resumeThread(coroutine, args[1..]);
+        defer vm.allocator.free(results);
+        if (!results[0].boolean) {
+            const value = results[1];
+            // The reference closes the errored thread here, which leaves it
+            // dead and empty rather than dead with the error still in hand.
+            coroutine.error_value = null;
+            if (value == .string) {
+                var position_buffer: [192]u8 = undefined;
+                if (try vm.nativeRaisePosition(&position_buffer)) |position| {
+                    const message = std.fmt.allocPrint(vm.allocator, "{s}{s}", .{ position, value.string.slice() }) catch return error.OutOfMemory;
+                    defer vm.allocator.free(message);
+                    vm.exec.thrown_error = .{ .string = vm.interner.intern(message) catch return error.OutOfMemory };
+                    return error.RuntimeError;
+                }
+            }
+            vm.exec.thrown_error = value;
+            return error.RuntimeError;
+        }
+        return vm.allocator.dupe(Value, results[1..]) catch return error.OutOfMemory;
+    }
+
+    fn coroutineYield(vm: *VM, args: []const Value) Error![]Value {
+        const coroutine = vm.exec.coroutine orelse return vm.raisePlain("attempt to yield from outside a coroutine", .{});
+        if (coroutine.main) return vm.raisePlain("attempt to yield from outside a coroutine", .{});
+        try vm.replaceTransfer(coroutine, args);
+        vm.leaveCoroutine(coroutine, .suspended);
+        if (coroutine.close_requested) return error.CoroutineClose;
+        return vm.allocator.dupe(Value, coroutine.transfer) catch return error.OutOfMemory;
+    }
+
+    fn coroutineStatus(vm: *VM, args: []const Value) Error![]Value {
+        const coroutine = try vm.coroutineArgument(args, "status", "coroutine.status");
+        const name: []const u8 = if (coroutine == vm.exec.coroutine)
+            "running"
+        else switch (coroutine.status) {
+            .running, .normal => "normal",
+            .suspended => "suspended",
+            .dead => "dead",
+        };
+        const text: Value = .{ .string = vm.interner.intern(name) catch return error.OutOfMemory };
+        return vm.allocator.dupe(Value, &.{text}) catch return error.OutOfMemory;
+    }
+
+    fn coroutineRunning(vm: *VM, args: []const Value) Error![]Value {
+        _ = args;
+        const coroutine = vm.exec.coroutine orelse return error.RuntimeError;
+        return vm.allocator.dupe(Value, &.{ coroutine.thread_value, .{ .boolean = coroutine.main } }) catch return error.OutOfMemory;
+    }
+
+    fn coroutineIsYieldable(vm: *VM, args: []const Value) Error![]Value {
+        const coroutine = if (args.len == 0)
+            vm.exec.coroutine.?
+        else
+            try vm.coroutineArgument(args, "isyieldable", "coroutine.isyieldable");
+        // In the reference only the main coroutine reports false; a suspended
+        // coroutine is yieldable again the moment it is resumed.
+        return vm.allocator.dupe(Value, &.{.{ .boolean = !coroutine.main }}) catch return error.OutOfMemory;
+    }
+
+    fn coroutineClose(vm: *VM, args: []const Value) Error![]Value {
+        const coroutine = try vm.coroutineArgument(args, "close", "coroutine.close");
+        const alive: [1]Value = .{.{ .boolean = true }};
+        switch (coroutine.status) {
+            .running => return vm.raise("cannot close a running coroutine", .{}),
+            .normal => return vm.raise("cannot close a normal coroutine", .{}),
+            .dead => {
+                if (coroutine.error_value) |value| {
+                    return vm.allocator.dupe(Value, &.{ .{ .boolean = false }, value }) catch return error.OutOfMemory;
+                }
+                return vm.allocator.dupe(Value, &alive) catch return error.OutOfMemory;
+            },
+            .suspended => {
+                if (!coroutine.started) {
+                    coroutine.status = .dead;
+                    return vm.allocator.dupe(Value, &alive) catch return error.OutOfMemory;
+                }
+                // Resuming makes every suspension point unwind instead of
+                // continuing, which is what runs the pending close handlers.
+                coroutine.close_requested = true;
+                vm.enterCoroutine(coroutine);
+                switchInto(coroutine);
+                if (coroutine.error_value) |value| {
+                    return vm.allocator.dupe(Value, &.{ .{ .boolean = false }, value }) catch return error.OutOfMemory;
+                }
+                return vm.allocator.dupe(Value, &alive) catch return error.OutOfMemory;
+            },
+        }
+    }
+
+    fn replaceTransfer(vm: *VM, coroutine: *Coroutine, args: []const Value) Error!void {
+        const copy = vm.allocator.dupe(Value, args) catch return error.OutOfMemory;
+        if (coroutine.transfer.len != 0) vm.allocator.free(coroutine.transfer);
+        coroutine.transfer = copy;
+    }
+
+    /// Hands the interpreter over to `coroutine`, stashing the current state
+    /// in its `caller_state` for when it comes back.
+    fn enterCoroutine(vm: *VM, coroutine: *Coroutine) void {
+        coroutine.caller_state = vm.exec;
+        coroutine.caller = vm.exec.coroutine;
+        if (coroutine.caller) |caller| {
+            if (!caller.main) caller.status = .normal;
+        }
+        const state = coroutine.state;
+        coroutine.state = .{};
+        vm.exec = state;
+        vm.exec.coroutine = coroutine;
+        coroutine.status = .running;
+        coroutine.started = true;
+    }
+
+    /// Parks the coroutine's state and switches back to its resumer; returns
+    /// inside the coroutine once something resumes it again.
+    fn leaveCoroutine(vm: *VM, coroutine: *Coroutine, status: Coroutine.Status) void {
+        coroutine.status = status;
+        coroutine.state = vm.exec;
+        vm.exec = coroutine.caller_state;
+        coroutine.caller_state = .{};
+        if (coroutine.caller) |caller| {
+            if (!caller.main) caller.status = .running;
+        }
+        var switching: std.Io.fiber.Switch = .{ .old = &coroutine.context, .new = coroutine.caller_context.? };
+        _ = std.Io.fiber.contextSwitch(&switching);
+    }
+
+    fn resumeCoroutine(vm: *VM, coroutine: *Coroutine, args: []const Value) Error!void {
+        if (!coroutine.started) {
+            try vm.allocateCoroutineStack(coroutine);
+            starting_coroutine = coroutine;
+        }
+        try vm.replaceTransfer(coroutine, args);
+        vm.enterCoroutine(coroutine);
+        switchInto(coroutine);
+    }
+
+    fn allocateCoroutineStack(vm: *VM, coroutine: *Coroutine) Error!void {
+        const stack = vm.allocator.alignedAlloc(u8, .fromByteUnits(16), coroutine_stack_size) catch return error.OutOfMemory;
+        coroutine.stack = stack;
+        const top = @intFromPtr(stack.ptr) + coroutine_stack_size;
+        // A frame with a zero return address, so that anything that walks the
+        // stack (the debug allocator does, for its traces) stops here rather
+        // than reading its way off the fiber.
+        const frame: *[2]usize = @ptrFromInt(top - @sizeOf([2]usize));
+        frame.* = .{ 0, 0 };
+        coroutine.context = switch (builtin.cpu.arch) {
+            .aarch64 => .{ .sp = top - 16, .fp = top - 16, .pc = @intFromPtr(&fiberNakedEntry) },
+            .x86_64 => .{ .rsp = top - 8, .rbp = top - 8, .rip = @intFromPtr(&fiberNakedEntry) },
+            else => unreachable,
+        };
+    }
+
+    /// Runs the body of a fresh coroutine, on its own host stack. Errors are
+    /// parked on the coroutine; `coroutine.close`'s request is not an error.
+    fn runCoroutineBody(vm: *VM, coroutine: *Coroutine) void {
+        const arguments = coroutine.transfer;
+        coroutine.transfer = &.{};
+        const results = vm.invokeCallableValues(coroutine.body, arguments) catch |err| {
+            if (arguments.len != 0) vm.allocator.free(arguments);
+            // whatever a resume handed the yield that was running is dead now
+            if (coroutine.transfer.len != 0) {
+                vm.allocator.free(coroutine.transfer);
+                coroutine.transfer = &.{};
+            }
+            if (err != error.CoroutineClose) {
+                coroutine.error_value = vm.exec.thrown_error orelse vm.runtimeErrorValue();
+            }
+            return;
+        };
+        if (arguments.len != 0) vm.allocator.free(arguments);
+        if (coroutine.transfer.len != 0) vm.allocator.free(coroutine.transfer);
+        coroutine.transfer = results;
+    }
+
+    fn runtimeErrorValue(vm: *VM) Value {
+        return .{ .string = vm.interner.intern("runtime error") catch return .nil };
+    }
+
+    fn destroyCoroutine(vm: *VM, coroutine: *Coroutine) void {
+        if (coroutine.stack) |stack| vm.allocator.free(stack);
+        if (coroutine.transfer.len != 0) vm.allocator.free(coroutine.transfer);
+        vm.tracker.free(coroutine.object);
+        // The running state's lists are the VM's own (see `deinit`); only a
+        // parked coroutine owns a separate set.
+        if (coroutine != vm.exec.coroutine) {
+            coroutine.state.error_frames.deinit(vm.allocator);
+            coroutine.state.active_functions.deinit(vm.allocator);
+            coroutine.state.suspended_locals.deinit(vm.allocator);
+            coroutine.state.suspended_varargs.deinit(vm.allocator);
+            coroutine.state.suspended_results.deinit(vm.allocator);
+            coroutine.state.results.deinit(vm.allocator);
+            coroutine.state.close_values.deinit(vm.allocator);
+        }
+        vm.allocator.destroy(coroutine);
     }
 
     fn stringLen(vm: *VM, args: []const Value) Error![]Value {
@@ -2878,7 +3287,7 @@ pub const VM = struct {
         const distance = std.math.sub(i64, last, first) catch return error.RuntimeError;
         const count = std.math.add(i64, distance, 1) catch return error.RuntimeError;
         const size = std.math.cast(usize, count) orelse return error.RuntimeError;
-        if (size > vm.steps_left) return error.StepLimit;
+        if (size > vm.exec.steps_left) return error.StepLimit;
         const values = vm.allocator.alloc(Value, size) catch return error.OutOfMemory;
         for (values, 0..) |*value, offset| {
             value.* = table.get(intKey(first + @as(i64, @intCast(offset))));
@@ -2983,67 +3392,67 @@ pub const VM = struct {
 
     fn invokeValues(vm: *VM, function: *@import("Value.zig").Function, argument_values: []const Value) Error![]Value {
         if (function.semantics.functions.len <= function.function_index) return error.RuntimeError;
-        const old_locals = vm.locals;
-        const old_function_index = vm.function_index;
-        const old_returned = vm.returned;
-        const old_goto_name = vm.goto_name;
-        const old_upvalues = vm.upvalues;
-        const old_varargs = vm.varargs;
-        const old_environment = vm.active_environment;
-        const old_semantics = vm.semantics;
-        const saved_results = vm.results;
-        const locals_root_start = vm.suspended_locals.items.len;
-        const varargs_root_start = vm.suspended_varargs.items.len;
-        const results_root_start = vm.suspended_results.items.len;
-        const functions_root_start = vm.active_functions.items.len;
+        const old_locals = vm.exec.locals;
+        const old_function_index = vm.exec.function_index;
+        const old_returned = vm.exec.returned;
+        const old_goto_name = vm.exec.goto_name;
+        const old_upvalues = vm.exec.upvalues;
+        const old_varargs = vm.exec.varargs;
+        const old_environment = vm.exec.active_environment;
+        const old_semantics = vm.exec.semantics;
+        const saved_results = vm.exec.results;
+        const locals_root_start = vm.exec.suspended_locals.items.len;
+        const varargs_root_start = vm.exec.suspended_varargs.items.len;
+        const results_root_start = vm.exec.suspended_results.items.len;
+        const functions_root_start = vm.exec.active_functions.items.len;
         errdefer {
-            vm.suspended_locals.shrinkRetainingCapacity(locals_root_start);
-            vm.suspended_varargs.shrinkRetainingCapacity(varargs_root_start);
-            vm.suspended_results.shrinkRetainingCapacity(results_root_start);
-            vm.active_functions.shrinkRetainingCapacity(functions_root_start);
+            vm.exec.suspended_locals.shrinkRetainingCapacity(locals_root_start);
+            vm.exec.suspended_varargs.shrinkRetainingCapacity(varargs_root_start);
+            vm.exec.suspended_results.shrinkRetainingCapacity(results_root_start);
+            vm.exec.active_functions.shrinkRetainingCapacity(functions_root_start);
         }
-        vm.suspended_locals.append(vm.allocator, old_locals) catch return error.OutOfMemory;
-        vm.suspended_varargs.append(vm.allocator, old_varargs) catch return error.OutOfMemory;
-        vm.suspended_results.append(vm.allocator, saved_results.items) catch return error.OutOfMemory;
-        vm.active_functions.append(vm.allocator, function) catch return error.OutOfMemory;
-        vm.error_frames.append(vm.allocator, .{ .program = function.semantics, .call_offset = vm.error_offset }) catch return error.OutOfMemory;
-        defer _ = vm.error_frames.pop();
+        vm.exec.suspended_locals.append(vm.allocator, old_locals) catch return error.OutOfMemory;
+        vm.exec.suspended_varargs.append(vm.allocator, old_varargs) catch return error.OutOfMemory;
+        vm.exec.suspended_results.append(vm.allocator, saved_results.items) catch return error.OutOfMemory;
+        vm.exec.active_functions.append(vm.allocator, function) catch return error.OutOfMemory;
+        vm.exec.error_frames.append(vm.allocator, .{ .program = function.semantics, .call_offset = vm.exec.error_offset }) catch return error.OutOfMemory;
+        defer _ = vm.exec.error_frames.pop();
         const called_semantics = function.semantics;
         const frame_size = called_semantics.functions[function.function_index].frame_size;
         const new_locals = try vm.allocFrame(frame_size);
         const parameter_count = called_semantics.functions[function.function_index].parameters.len;
-        vm.semantics = called_semantics;
-        vm.results = .empty;
-        vm.returned = false;
-        vm.goto_name = null;
-        vm.function_index = function.function_index;
-        vm.locals = new_locals;
-        vm.upvalues = function.captures;
-        vm.active_environment = function.environment;
-        vm.varargs = if (vm.semantics.functions[function.function_index].is_vararg and argument_values.len > parameter_count) argument_values[parameter_count..] else &.{};
+        vm.exec.semantics = called_semantics;
+        vm.exec.results = .empty;
+        vm.exec.returned = false;
+        vm.exec.goto_name = null;
+        vm.exec.function_index = function.function_index;
+        vm.exec.locals = new_locals;
+        vm.exec.upvalues = function.captures;
+        vm.exec.active_environment = function.environment;
+        vm.exec.varargs = if (vm.exec.semantics.functions[function.function_index].is_vararg and argument_values.len > parameter_count) argument_values[parameter_count..] else &.{};
         defer {
-            vm.results.deinit(vm.allocator);
-            vm.results = saved_results;
-            vm.locals = old_locals;
-            vm.function_index = old_function_index;
-            vm.returned = old_returned;
-            vm.goto_name = old_goto_name;
-            vm.upvalues = old_upvalues;
-            vm.varargs = old_varargs;
-            vm.active_environment = old_environment;
-            vm.semantics = old_semantics;
-            vm.suspended_locals.shrinkRetainingCapacity(locals_root_start);
-            vm.suspended_varargs.shrinkRetainingCapacity(varargs_root_start);
-            vm.suspended_results.shrinkRetainingCapacity(results_root_start);
-            vm.active_functions.shrinkRetainingCapacity(functions_root_start);
+            vm.exec.results.deinit(vm.allocator);
+            vm.exec.results = saved_results;
+            vm.exec.locals = old_locals;
+            vm.exec.function_index = old_function_index;
+            vm.exec.returned = old_returned;
+            vm.exec.goto_name = old_goto_name;
+            vm.exec.upvalues = old_upvalues;
+            vm.exec.varargs = old_varargs;
+            vm.exec.active_environment = old_environment;
+            vm.exec.semantics = old_semantics;
+            vm.exec.suspended_locals.shrinkRetainingCapacity(locals_root_start);
+            vm.exec.suspended_varargs.shrinkRetainingCapacity(varargs_root_start);
+            vm.exec.suspended_results.shrinkRetainingCapacity(results_root_start);
+            vm.exec.active_functions.shrinkRetainingCapacity(functions_root_start);
         }
         for (0..parameter_count) |i| {
-            vm.locals[i].value = if (i < argument_values.len) argument_values[i] else .nil;
+            vm.exec.locals[i].value = if (i < argument_values.len) argument_values[i] else .nil;
         }
         vm.gc_deferral_depth += 1;
         defer vm.gc_deferral_depth -= 1;
         try vm.execBlock(&function.body.block);
-        return vm.allocator.dupe(Value, vm.results.items) catch return error.OutOfMemory;
+        return vm.allocator.dupe(Value, vm.exec.results.items) catch return error.OutOfMemory;
     }
 
     fn allocFrame(vm: *VM, count: usize) Error![]*@import("Value.zig").Cell {
@@ -3088,6 +3497,33 @@ pub const VM = struct {
         inline for (names) |entry| try vm.putNative(vm.globals, entry.@"0", entry.@"1");
         vm.globals.set(.{ .string = vm.interner.intern("_G") catch return error.OutOfMemory }, .{ .table = vm.globals }) catch return error.OutOfMemory;
         vm.globals.set(.{ .string = vm.interner.intern("_VERSION") catch return error.OutOfMemory }, .{ .string = vm.interner.intern("Lua 5.4") catch return error.OutOfMemory }) catch return error.OutOfMemory;
+    }
+
+    fn installCoroutineLibrary(vm: *VM) Error!void {
+        const library = try vm.newTable();
+        try vm.putNative(library, "create", .coroutine_create);
+        try vm.putNative(library, "resume", .coroutine_resume);
+        try vm.putNative(library, "yield", .coroutine_yield);
+        try vm.putNative(library, "status", .coroutine_status);
+        try vm.putNative(library, "running", .coroutine_running);
+        try vm.putNative(library, "isyieldable", .coroutine_isyieldable);
+        try vm.putNative(library, "close", .coroutine_close);
+        try vm.putNative(library, "wrap", .coroutine_wrap);
+        vm.globals.set(.{ .string = vm.interner.intern("coroutine") catch return error.OutOfMemory }, .{ .table = library }) catch return error.OutOfMemory;
+        // The main coroutine exists from the start so that `running` and
+        // `status` have the thread object the reference calls `mainthread`.
+        const object = vm.tracker.alloc(ValueModule.Thread, .thread) catch return error.OutOfMemory;
+        const coroutine = vm.allocator.create(Coroutine) catch return error.OutOfMemory;
+        coroutine.* = .{
+            .vm = vm,
+            .object = object,
+            .thread_value = .{ .thread = object },
+            .status = .running,
+            .main = true,
+        };
+        object.coroutine = coroutine;
+        vm.exec.coroutine = coroutine;
+        vm.coroutines.append(vm.allocator, coroutine) catch return error.OutOfMemory;
     }
 
     fn basePrint(vm: *VM, args: []const Value) Error![]Value {
@@ -3163,24 +3599,36 @@ pub const VM = struct {
         // callers still hold values only in Zig locals. Defer sweeping until the
         // outermost script statement has finished evaluating those temporaries.
         if (!vm.gc_pending or vm.gc_deferral_depth != 0) return;
+        // A suspended coroutine keeps values alive that only exist in the Zig
+        // frames parked on its host stack, which tracing cannot see. While one
+        // is parked, no sweep is safe.
+        for (vm.coroutines.items) |coroutine| {
+            if (coroutine.started and coroutine.status == .suspended) return;
+        }
         var roots: std.ArrayList(Value) = .empty;
         defer roots.deinit(vm.allocator);
         try roots.append(vm.allocator, .{ .table = vm.globals });
         try roots.append(vm.allocator, vm.global_environment.value);
-        try roots.append(vm.allocator, vm.active_environment.value);
+        try roots.append(vm.allocator, vm.exec.active_environment.value);
+        for (vm.coroutines.items) |coroutine| {
+            try roots.append(vm.allocator, coroutine.thread_value);
+            try roots.append(vm.allocator, coroutine.body);
+            if (coroutine.error_value) |value| try roots.append(vm.allocator, value);
+            for (coroutine.transfer) |value| try roots.append(vm.allocator, value);
+        }
         if (vm.string_metatable) |metatable| try roots.append(vm.allocator, .{ .table = metatable });
         if (vm.default_input) |table| try roots.append(vm.allocator, .{ .table = table });
         if (vm.default_output) |table| try roots.append(vm.allocator, .{ .table = table });
-        for (vm.locals) |cell| try roots.append(vm.allocator, cell.value);
-        for (vm.suspended_locals.items) |frame| for (frame) |cell| try roots.append(vm.allocator, cell.value);
-        for (vm.upvalues) |cell| try roots.append(vm.allocator, cell.value);
-        for (vm.varargs) |value| try roots.append(vm.allocator, value);
-        for (vm.suspended_varargs.items) |values| for (values) |value| try roots.append(vm.allocator, value);
-        for (vm.results.items) |value| try roots.append(vm.allocator, value);
-        for (vm.suspended_results.items) |values| for (values) |value| try roots.append(vm.allocator, value);
-        for (vm.close_values.items) |value| try roots.append(vm.allocator, value);
-        if (vm.thrown_error) |value| try roots.append(vm.allocator, value);
-        for (vm.active_functions.items) |function| try roots.append(vm.allocator, .{ .function = function });
+        for (vm.exec.locals) |cell| try roots.append(vm.allocator, cell.value);
+        for (vm.exec.suspended_locals.items) |frame| for (frame) |cell| try roots.append(vm.allocator, cell.value);
+        for (vm.exec.upvalues) |cell| try roots.append(vm.allocator, cell.value);
+        for (vm.exec.varargs) |value| try roots.append(vm.allocator, value);
+        for (vm.exec.suspended_varargs.items) |values| for (values) |value| try roots.append(vm.allocator, value);
+        for (vm.exec.results.items) |value| try roots.append(vm.allocator, value);
+        for (vm.exec.suspended_results.items) |values| for (values) |value| try roots.append(vm.allocator, value);
+        for (vm.exec.close_values.items) |value| try roots.append(vm.allocator, value);
+        if (vm.exec.thrown_error) |value| try roots.append(vm.allocator, value);
+        for (vm.exec.active_functions.items) |function| try roots.append(vm.allocator, .{ .function = function });
         const result = try vm.collector.collectWith(vm.tracker, roots.items, vm, forgetOwnedObject);
         vm.gc_threshold = @max(1024, std.math.mul(usize, result.live, 2) catch std.math.maxInt(usize));
         vm.gc_pending = false;
@@ -3224,6 +3672,9 @@ pub const VM = struct {
                     _ = vm.owned_functions.swapRemove(i);
                     break;
                 };
+                // `coroutine.wrap`'s wrappers are functions too, but they own
+                // no captures slice.
+                if (function.native != null) return;
                 for (vm.owned_captures.items, 0..) |captures, i| if (captures.ptr == function.captures.ptr) {
                     vm.allocator.free(captures);
                     _ = vm.owned_captures.swapRemove(i);
@@ -3318,6 +3769,8 @@ pub const VM = struct {
         function.function_index = 0;
         function.captures = &.{};
         function.environment = closure_env;
+        function.native = null;
+        function.bound = .nil;
         vm.owned_functions.append(vm.allocator, function) catch {
             vm.tracker.free(function);
             return error.OutOfMemory;
@@ -3360,7 +3813,7 @@ pub const VM = struct {
         const loaded = try vm.baseLoadFile(args);
         defer vm.allocator.free(loaded);
         if (loaded.len == 0 or loaded[0] == .nil) {
-            vm.thrown_error = if (loaded.len > 1) loaded[1] else .{ .string = vm.interner.intern("cannot load file") catch return error.OutOfMemory };
+            vm.exec.thrown_error = if (loaded.len > 1) loaded[1] else .{ .string = vm.interner.intern("cannot load file") catch return error.OutOfMemory };
             return error.RuntimeError;
         }
         return vm.invokeCallableValues(loaded[0], &.{});
@@ -3419,7 +3872,7 @@ pub const VM = struct {
 
     fn baseAssert(vm: *VM, args: []const Value) Error![]Value {
         if (args.len == 0 or !args[0].truthy()) {
-            vm.thrown_error = if (args.len > 1) args[1] else .{ .string = vm.interner.intern("assertion failed!") catch return error.OutOfMemory };
+            vm.exec.thrown_error = if (args.len > 1) args[1] else .{ .string = vm.interner.intern("assertion failed!") catch return error.OutOfMemory };
             return error.RuntimeError;
         }
         return vm.allocator.dupe(Value, args) catch return error.OutOfMemory;
@@ -3433,7 +3886,7 @@ pub const VM = struct {
         var detail_buffer: [256]u8 = undefined;
         const detail = std.fmt.bufPrint(&detail_buffer, fmt, args) catch fmt;
         var position_buffer: [192]u8 = undefined;
-        const raised_by_native = vm.error_frames.items.len != 0 and vm.error_frames.items[vm.error_frames.items.len - 1].program == null;
+        const raised_by_native = vm.exec.error_frames.items.len != 0 and vm.exec.error_frames.items[vm.exec.error_frames.items.len - 1].program == null;
         const position = if (raised_by_native)
             vm.nativeRaisePosition(&position_buffer) catch null
         else
@@ -3443,7 +3896,7 @@ pub const VM = struct {
         else
             vm.allocator.dupe(u8, detail) catch return error.OutOfMemory;
         defer vm.allocator.free(message);
-        vm.thrown_error = .{ .string = vm.interner.intern(message) catch return error.OutOfMemory };
+        vm.exec.thrown_error = .{ .string = vm.interner.intern(message) catch return error.OutOfMemory };
         return error.RuntimeError;
     }
 
@@ -3472,13 +3925,32 @@ pub const VM = struct {
     fn raisePlain(vm: *VM, comptime fmt: []const u8, args: anytype) Error {
         var detail_buffer: [256]u8 = undefined;
         const detail = std.fmt.bufPrint(&detail_buffer, fmt, args) catch fmt;
-        vm.thrown_error = .{ .string = vm.interner.intern(detail) catch return error.OutOfMemory };
+        vm.exec.thrown_error = .{ .string = vm.interner.intern(detail) catch return error.OutOfMemory };
+        return error.RuntimeError;
+    }
+
+    /// `luaL_argerror`: the short name when the caller is a Lua function,
+    /// which is when the reference reads it off the calling instruction, and
+    /// the qualified name when the caller is another native, which is when
+    /// `pushglobalfuncname` looks the function up in the loaded libraries.
+    fn raiseArgument(vm: *VM, argument: usize, short: []const u8, long: []const u8, comptime fmt: []const u8, args: anytype) Error {
+        var detail_buffer: [128]u8 = undefined;
+        const detail = std.fmt.bufPrint(&detail_buffer, fmt, args) catch fmt;
+        var position_buffer: [192]u8 = undefined;
+        const position = vm.nativeRaisePosition(&position_buffer) catch null;
+        const name = if (position == null) long else short;
+        const message = if (position) |p|
+            std.fmt.allocPrint(vm.allocator, "{s}bad argument #{d} to '{s}' ({s})", .{ p, argument, name, detail }) catch return error.OutOfMemory
+        else
+            std.fmt.allocPrint(vm.allocator, "bad argument #{d} to '{s}' ({s})", .{ argument, name, detail }) catch return error.OutOfMemory;
+        defer vm.allocator.free(message);
+        vm.exec.thrown_error = .{ .string = vm.interner.intern(message) catch return error.OutOfMemory };
         return error.RuntimeError;
     }
 
     fn baseError(vm: *VM, args: []const Value) Error![]Value {
         if (args.len == 0) {
-            vm.thrown_error = .nil;
+            vm.exec.thrown_error = .nil;
             return error.RuntimeError;
         }
         var message = args[0];
@@ -3494,7 +3966,7 @@ pub const VM = struct {
                 message = .{ .string = vm.interner.intern(bytes) catch return error.OutOfMemory };
             }
         }
-        vm.thrown_error = message;
+        vm.exec.thrown_error = message;
         return error.RuntimeError;
     }
 
@@ -3504,14 +3976,14 @@ pub const VM = struct {
     fn errorPosition(vm: *VM, level: i64, buffer: *[192]u8) Error!?[]const u8 {
         if (level < 1) return null;
         const depth = std.math.cast(usize, level) orelse return null;
-        const count = vm.error_frames.items.len;
+        const count = vm.exec.error_frames.items.len;
         if (count == 0 or depth >= count) return null;
         // level counts activations above the one raising the error, and the
         // activation above frame `index` is what holds its call site
         const index = count - 1 - depth;
-        const frame = vm.error_frames.items[index];
+        const frame = vm.exec.error_frames.items[index];
         const program = frame.program orelse return null;
-        const offset = vm.error_frames.items[index + 1].call_offset;
+        const offset = vm.exec.error_frames.items[index + 1].call_offset;
         if (offset == null or program.source.len == 0) return null;
         const line = lineAt(program.source, offset.?);
         var name_buffer: [64]u8 = undefined;
@@ -3526,7 +3998,7 @@ pub const VM = struct {
     /// function that called it, and nothing when that caller is another
     /// native, the way a C caller leaves `luaL_where` empty.
     fn nativeRaisePosition(vm: *VM, buffer: *[192]u8) Error!?[]const u8 {
-        const frames = vm.error_frames.items;
+        const frames = vm.exec.error_frames.items;
         if (frames.len < 2) return null;
         const program = frames[frames.len - 2].program orelse return null;
         const offset = frames[frames.len - 1].call_offset orelse return null;
@@ -3538,12 +4010,12 @@ pub const VM = struct {
     }
 
     fn currentLuaPosition(vm: *VM, buffer: *[192]u8) Error!?[]const u8 {
-        var index: usize = vm.error_frames.items.len;
+        var index: usize = vm.exec.error_frames.items.len;
         while (index > 0) {
             index -= 1;
-            const program = vm.error_frames.items[index].program orelse continue;
-            if (vm.error_offset == null or program.source.len == 0) return null;
-            const line = lineAt(program.source, vm.error_offset.?);
+            const program = vm.exec.error_frames.items[index].program orelse continue;
+            if (vm.exec.error_offset == null or program.source.len == 0) return null;
+            const line = lineAt(program.source, vm.exec.error_offset.?);
             var name_buffer: [64]u8 = undefined;
             const name = shortSource(&name_buffer, program.chunk_name);
             return std.fmt.bufPrint(buffer, "{s}:{d}: ", .{ name, line }) catch return error.RuntimeError;
@@ -3858,7 +4330,7 @@ pub const VM = struct {
                 const is_last = field_index + 1 == constructor.fields.len;
                 if (is_last) switch (item.expression) {
                     .vararg => {
-                        for (vm.varargs) |value| {
+                        for (vm.exec.varargs) |value| {
                             list_values.append(vm.allocator, value) catch return error.OutOfMemory;
                         }
                         continue;
@@ -3952,7 +4424,7 @@ pub const VM = struct {
             .string => |node| return std.fmt.bufPrint(buffer, " (constant '{s}')", .{node.value}) catch "",
             .variable => |variable| switch (variable.*) {
                 .name => |name| {
-                    const kind: []const u8 = switch (vm.semantics.resolutions.get(name.span.start) orelse .global) {
+                    const kind: []const u8 = switch (vm.exec.semantics.resolutions.get(name.span.start) orelse .global) {
                         .local => "local",
                         .upvalue => "upvalue",
                         .global => "global",

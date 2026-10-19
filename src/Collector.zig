@@ -59,6 +59,7 @@ pub const Collector = struct {
                 },
                 .function => |function| {
                     try collector.pushValue(&stack, function.environment.value);
+                    try collector.pushValue(&stack, function.bound);
                     for (function.captures) |cell| try collector.pushValue(&stack, cell.value);
                 },
                 else => {},
