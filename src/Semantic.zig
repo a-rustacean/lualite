@@ -35,8 +35,15 @@ pub const Program = struct {
     // where each name resolved to, keyed by the offset the name starts at. Every
     // name in a chunk has a span of its own, so the offset says which one
     resolutions: Resolutions,
+    // The lexical `_ENV` binding used when each free name is read or written.
+    environment_resolutions: Resolutions,
     // one per function body in the chunk, keyed the same way
     definitions: std.AutoHashMapUnmanaged(u32, Definition) = .empty,
+    // The text the spans point into and the name the chunk was loaded under,
+    // filled in by whoever compiled it. The parser walks the source but does
+    // not keep it, and the runtime needs both to say where an error() call is.
+    source: []const u8 = &.{},
+    chunk_name: []const u8 = &.{},
 
     pub const Resolutions = std.AutoHashMapUnmanaged(u32, Resolution);
 
@@ -61,7 +68,7 @@ pub const Resolution = union(enum) {
     global,
 };
 
-// the frame a nested function needs, given to the compiler once it is written
+// the frame a nested function needs, given to the runtime when it is created
 pub const Definition = struct {
     // the index of the function this body makes
     function: u32,
@@ -81,6 +88,10 @@ pub const Function = struct {
     body: *BlockScope,
     // how many slots the frame needs live at once
     frame_size: u32,
+    // which slots are read by a nested function. Those are the ones the
+    // runtime gives a fresh cell on every (re)declaration, which is what makes
+    // each turn of a loop capture its own variables.
+    captured_slots: []const bool,
 };
 
 pub const Parameter = struct {
@@ -113,8 +124,8 @@ pub const BlockScope = struct {
     locals: []const Local = &.{},
     labels: []const Label = &.{},
 
-    // the blocks opened inside this one, in source order, which is how the
-    // compiler walks the shape of a function rather than re-deriving it
+    // the blocks opened inside this one, in source order, which preserves the
+    // function's lexical structure for runtime and diagnostics
     children: []const *BlockScope = &.{},
 
     child_items: std.ArrayList(*BlockScope) = .empty,
@@ -130,8 +141,8 @@ pub const Local = struct {
     // `<const>`, which nothing may be assigned to
     is_const: bool,
     // a nested function reads this local, so its slot may not be reused while a
-    // closure can still see it. The compiler is what makes that true, by closing
-    // the upvalue at the end of the block that declared the local.
+    // closure can still see it. The runtime retains its cell while closures hold
+    // references to it.
     is_captured: bool,
 };
 
@@ -176,6 +187,9 @@ const FuncState = struct {
     max_actvar: u32 = 0,
 
     upvalues: std.ArrayList(Upvalue) = .empty,
+    // slots of this function that some nested function captured, for the
+    // frame-sized flag array handed to the runtime
+    captured: std.ArrayList(u32) = .empty,
     // every goto written so far that no label has claimed
     pending: std.ArrayList(*Goto) = .empty,
 
@@ -189,6 +203,7 @@ arena: std.mem.Allocator,
 reporter: *Diagnostic.Reporter,
 functions: std.ArrayList(Function) = .empty,
 resolutions: std.AutoHashMapUnmanaged(u32, Resolution) = .empty,
+environment_resolutions: std.AutoHashMapUnmanaged(u32, Resolution) = .empty,
 definitions: std.AutoHashMapUnmanaged(u32, Definition) = .empty,
 // the scope being walked, and the function it is in. Both are set by
 // enterFunction and restored by leaveFunction, and are only ever read while a
@@ -222,6 +237,7 @@ pub fn analyze(
         .functions = try semantic.functions.toOwnedSlice(arena),
         .body = body,
         .resolutions = semantic.resolutions,
+        .environment_resolutions = semantic.environment_resolutions,
         .definitions = semantic.definitions,
     };
 }
@@ -261,6 +277,7 @@ fn enterFunction(
         .upvalues = &.{},
         .body = root,
         .frame_size = 0,
+        .captured_slots = &.{},
     });
 
     semantic.function = state;
@@ -284,6 +301,11 @@ fn leaveFunction(semantic: *Semantic, outer: ?*FuncState, outer_scope: ?*BlockSc
     // `functions` is filled in at the index a function was given, which is its
     // own depth in the source, so the result is ordered by position however
     // deeply the walk nests
+    const captured_slots = try semantic.arena.alloc(bool, state.max_actvar);
+    @memset(captured_slots, false);
+    for (state.captured.items) |slot| {
+        if (slot < captured_slots.len) captured_slots[slot] = true;
+    }
     semantic.functions.items[state.index] = .{
         .parent = if (outer) |parent| parent.index else null,
         .parameters = try state.parameters.toOwnedSlice(semantic.arena),
@@ -291,6 +313,7 @@ fn leaveFunction(semantic: *Semantic, outer: ?*FuncState, outer_scope: ?*BlockSc
         .upvalues = try state.upvalues.toOwnedSlice(semantic.arena),
         .body = state.root,
         .frame_size = state.max_actvar,
+        .captured_slots = captured_slots,
     };
 
     // the chunk has nothing around it to go back to, which is where the walk
@@ -490,7 +513,34 @@ pub fn resolve(semantic: *Semantic, name: Ast.Identifier) Error!Resolution {
         return .{ .upvalue = index };
     }
 
+    // `_ENV` is the current environment cell even when the source has no
+    // explicit local with that name. Other free names are fields in that cell.
+    if (std.mem.eql(u8, name.name, "_ENV")) {
+        try semantic.record(name, .global);
+        return .global;
+    }
+
+    const environment = try semantic.resolveEnvironment(name);
+    try semantic.environment_resolutions.put(semantic.arena, name.span.start, environment);
     try semantic.record(name, .global);
+    return .global;
+}
+
+// Resolve the `_ENV` cell for a free name and capture it through intermediate
+// functions just like any other upvalue.
+fn resolveEnvironment(semantic: *Semantic, name: Ast.Identifier) Error!Resolution {
+    const state = semantic.function;
+    if (findLocal(state, "_ENV")) |slot| return .{ .local = slot };
+
+    var owner = state.parent;
+    while (owner) |outer| {
+        const slot = findLocal(outer, "_ENV") orelse {
+            owner = outer.parent;
+            continue;
+        };
+        const index = try semantic.capture(state, outer, slot, name);
+        return .{ .upvalue = index };
+    }
     return .global;
 }
 
@@ -526,6 +576,7 @@ fn capture(
     // A closure keeps the local alive, so its slot may not be handed to anything
     // else while the closure may still be running.
     outer.active.items[slot].is_captured = true;
+    try outer.captured.append(outer.arena, slot);
 
     // Where the value comes from. The function that owns the local holds it in a
     // frame slot, so its closure reads that slot; anything further in reads it out

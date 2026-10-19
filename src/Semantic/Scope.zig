@@ -320,7 +320,7 @@ test "a dotted function name reads the first name only" {
 
     // `b`, `c` and `d` are field names rather than names of their own, so the only
     // two names resolved are the declaration and the one the definition reads
-    try std.testing.expectEqual(@as(usize, 2), program.resolutions.count());
+    try std.testing.expectEqual(@as(usize, 3), program.resolutions.count());
 }
 
 test "a plain function name is assigned rather than read" {
@@ -484,7 +484,7 @@ test "a table constructor resolves the names in every kind of field" {
     try t.expectClean();
 }
 
-// The frame is as wide as the most locals live at once, and the compiler sizes it
+// The frame is as wide as the most locals live at once, and the runtime sizes it
 // from this rather than counting the declarations.
 test "a function's frame holds its parameters, its locals and its temporaries" {
     var t = Test.init();

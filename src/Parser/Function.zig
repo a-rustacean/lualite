@@ -10,7 +10,13 @@ const Block = @import("Block.zig");
 // enclosing scope
 pub fn parseFunctionDefinition(parser: *Parser, function_span: Token.Span) Parser.Error!*Ast.FunctionDefinition {
     const name = try parseFunctionName(parser);
-    const body = try parseFunctionBody(parser, .function, function_span);
+    var body = try parseFunctionBody(parser, .function, function_span);
+    if (name.method) |method| {
+        const parameters = parser.allocator().alloc(Ast.Parameter, body.parameters.len + 1) catch return error.OutOfMemory;
+        parameters[0] = .{ .span = method.span, .name = .{ .span = method.span, .name = "self" } };
+        @memcpy(parameters[1..], body.parameters);
+        body.parameters = parameters;
+    }
 
     return parser.box(Ast.FunctionDefinition, .{
         .span = Token.merge(function_span, body.span),

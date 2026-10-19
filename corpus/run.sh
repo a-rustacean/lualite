@@ -188,7 +188,7 @@ while IFS= read -r -d '' record; do
   path=${record#*$'\t'}
 
   start=$EPOCHREALTIME
-  lite=$("$LUALITE" "$path" 2>&1 | sed $'s/\033\\[[0-9;]*m//g')
+  lite=$("$LUALITE" --check "$path" 2>&1 | sed $'s/\033\\[[0-9;]*m//g')
   status=${PIPESTATUS[0]}
   elapsed=$(perl -e "printf '%.3f', $EPOCHREALTIME - $start")
 

@@ -490,7 +490,8 @@ test "a function definition names what it binds" {
     try std.testing.expectEqualStrings("d", definition.name.method.?.name);
     try std.testing.expectEqual(@as(u32, 14), definition.name.colon_span.?.start);
     // the method is a hidden parameter of the body
-    try std.testing.expectEqual(@as(usize, 0), definition.body.parameters.len);
+    try std.testing.expectEqual(@as(usize, 1), definition.body.parameters.len);
+    try std.testing.expectEqualStrings("self", definition.body.parameters[0].name.name);
 }
 
 test "a function definition without a method" {

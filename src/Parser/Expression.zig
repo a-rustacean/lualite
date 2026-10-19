@@ -652,8 +652,8 @@ fn appendUtf8(allocator: std.mem.Allocator, value: *std.ArrayList(u8), code: u32
     try value.appendSlice(allocator, bytes[bytes.len - n ..]);
 }
 
-// a long string taken whole, no escapes at all. A newline straight after the
-// opening bracket is dropped.
+// a long string taken whole, no escapes at all. Lua normalizes every line
+// ending to LF and drops one initial line ending after the opening bracket.
 fn parseLongString(parser: *Parser, token: Token) Parser.Error!Ast.StringLiteral {
     const text = parser.slice(token.span);
 
@@ -664,17 +664,32 @@ fn parseLongString(parser: *Parser, token: Token) Parser.Error!Ast.StringLiteral
     delimiter += 1;
 
     const raw = text[delimiter .. text.len - delimiter];
-    const value = if (raw.len != 0 and raw[0] == '\r' and raw.len != 1 and raw[1] == '\n')
-        raw[2..]
-    else if (raw.len != 0 and raw[0] == '\n')
-        raw[1..]
-    else
-        raw;
+    var start: usize = 0;
+    if (raw.len != 0 and (raw[0] == '\r' or raw[0] == '\n')) {
+        start = 1;
+        if (raw[0] == '\r' and start < raw.len and raw[start] == '\n') start += 1;
+    }
+
+    const value_buf = try parser.allocator().alloc(u8, raw.len - start);
+    var len: usize = 0;
+    var i = start;
+    while (i < raw.len) {
+        if (raw[i] == '\r') {
+            value_buf[len] = '\n';
+            len += 1;
+            i += 1;
+            if (i < raw.len and raw[i] == '\n') i += 1;
+        } else {
+            value_buf[len] = raw[i];
+            len += 1;
+            i += 1;
+        }
+    }
 
     return .{
         .span = token.span,
         .raw = raw,
-        .value = value,
+        .value = value_buf[0..len],
     };
 }
 
@@ -1234,6 +1249,23 @@ test "a long string has no escapes and drops its first newline" {
         else => return error.NotAString,
     };
     try std.testing.expectEqualStrings("x", crlf.value);
+}
+
+test "long strings normalize CR, LF, and CRLF everywhere" {
+    var t = Parser.Test.init();
+    defer t.deinit();
+
+    const normalized = switch (try t.parseExpression("[=[a\r\nb\rc\nd]=]")) {
+        .string => |node| node,
+        else => return error.NotAString,
+    };
+    try std.testing.expectEqualStrings("a\nb\nc\nd", normalized.value);
+
+    const initial_cr = switch (try t.parseExpression("[=[\rfirst]=]")) {
+        .string => |node| node,
+        else => return error.NotAString,
+    };
+    try std.testing.expectEqualStrings("first", initial_cr.value);
 }
 
 test "a suffixed expression chains every suffix" {

@@ -8,8 +8,8 @@ const Semantic = @import("../Semantic.zig");
 const Error = Semantic.Error;
 
 // The walk only has to visit the names an expression writes and say whether
-// `...` has anywhere to come from. Everything else in a node is a shape the
-// compiler will read later, and there is nothing here to check about it.
+// `...` has anywhere to come from. Everything else in a node is evaluated by
+// the AST runtime, and there is nothing else for this resolver to check.
 pub fn walk(semantic: *Semantic, expression: Ast.Expression) Error!void {
     switch (expression) {
         // no names to look up

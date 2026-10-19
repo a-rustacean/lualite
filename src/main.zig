@@ -13,10 +13,13 @@ const token_words = blk: {
     @setEvalBranchQuota(100_000);
     const Words = struct { expected: []const u8, found: []const u8 };
 
-    var words: [std.meta.fields(Token.Kind).len]Words = undefined;
+    const info = @typeInfo(Token.Kind).@"enum";
+    var words: [info.fields.len]Words = undefined;
 
-    for (std.meta.fields(Token.Kind), 0..) |field, i| {
-        const kind = @field(Token.Kind, field.name);
+    for (info.fields, 0..) |field, i| {
+        const name = field.name;
+        const kind: Token.Kind = @enumFromInt(i);
+        _ = name;
 
         words[i] = switch (kind) {
             .eof => .{
@@ -339,11 +342,19 @@ fn sourceRange(
 }
 
 pub fn main(init: std.process.Init) !void {
+    var requested_exit_status: ?u8 = null;
+    defer if (requested_exit_status) |status| std.process.exit(status);
     const allocator = init.gpa;
     const arena = init.arena.allocator();
 
     const argv = try std.process.Args.toSlice(init.minimal.args, arena);
-    const file_arg = if (argv.len > 1) argv[1] else null;
+    const check_only = argv.len > 1 and std.mem.eql(u8, argv[1], "--check");
+    const file_arg = if (check_only)
+        (if (argv.len > 2) argv[2] else null)
+    else if (argv.len > 1)
+        argv[1]
+    else
+        null;
 
     const sample =
         \\local greet = function(name)
@@ -400,11 +411,50 @@ pub fn main(init: std.process.Init) !void {
     // still runs on whatever came out. A name the walk cannot resolve is
     // reported and walked past, which is why a file with syntax errors picks up
     // checks for the parts that did parse.
-    _ = lualite.Semantic.analyze(parse_arena.allocator(), &diagnostics, &chunk) catch |err| switch (err) {
+    var semantics = lualite.Semantic.analyze(parse_arena.allocator(), &diagnostics, &chunk) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         // whatever went wrong is already in the reporter
-        error.ReportFailed => {},
+        error.ReportFailed => return,
     };
+    // where `error` points when the chunk is running, the way luaL_loadfile
+    // registers a file: the name is the file with an `@` in front of it
+    semantics.source = source;
+    semantics.chunk_name = std.fmt.allocPrint(parse_arena.allocator(), "@{s}", .{filename}) catch return error.OutOfMemory;
+
+    if (diagnostics.errors.items.len == 0 and !check_only) {
+        var tracker: lualite.Object.Tracker = .init(allocator);
+        defer tracker.deinit();
+        var interner = try lualite.Str.Interner.init(allocator, &tracker);
+        defer interner.deinit();
+        var environment = try lualite.VM.Environment.init(allocator, &tracker);
+        defer environment.deinit();
+        var vm = try lualite.VM.VM.init(allocator, &interner, &semantics, &tracker, environment.table);
+        defer vm.deinit();
+        vm.io = init.io;
+        vm.environ_map = init.environ_map;
+
+        var stdout_buffer: [4096]u8 = undefined;
+        var stdout = std.Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
+        vm.writer = &stdout.interface;
+        var stderr_buffer: [4096]u8 = undefined;
+        var stderr = std.Io.File.stderr().writerStreaming(init.io, &stderr_buffer);
+        vm.stderr = &stderr.interface;
+        _ = vm.run(&chunk) catch |err| switch (err) {
+            error.ExitRequested => requested_exit_status = vm.exit_status orelse 0,
+            else => {
+                if (vm.error_offset) |offset| {
+                    const location = lines.lineCol(source, offset);
+                    std.debug.print("{s}:{d}:{d}: runtime error: {s}\n", .{ filename, location.line, location.col, @errorName(err) });
+                } else {
+                    std.debug.print("lualite: runtime error: {s}\n", .{@errorName(err)});
+                }
+                stderr.flush() catch {};
+                requested_exit_status = 1;
+            },
+        };
+        stdout.flush() catch return error.OutputFailed;
+        stderr.flush() catch return error.OutputFailed;
+    }
 
     reportAll(&reporter, &diagnostics, lines, filename, source);
 }

@@ -12,10 +12,9 @@ const Number = num.Number;
 // `Number` and compares, which is what makes the number rules Lua's rather than a
 // reading of `lobject.c`.
 //
-// The evaluator below knows literals and operators and nothing else, which is
-// enough because the golden file is written to stay inside that. It is thrown
-// away once there is a VM to run the real thing; the compiler in Phase 4 is a
-// different program that happens to start from the same tree.
+// The small evaluator below is intentionally isolated from the production VM.
+// The golden file stays inside literals and operators so it can check Number
+// semantics without depending on parsing or runtime behavior.
 
 const golden_source = @embedFile("Number.golden.lua");
 const golden_output = @embedFile("Number.golden.txt");
@@ -375,6 +374,8 @@ fn runCase(allocator: std.mem.Allocator, case: Case) ![]const u8 {
         return err;
     };
 
+    // this file's own Value says integer or float for a number, since the
+    // golden file records what math.type says rather than `type`
     if (!std.mem.eql(u8, value.typeName(), case.expected)) {
         std.debug.print("{s} is a {s}, not a {s}\n", .{ case.source, value.typeName(), case.expected });
         return error.WrongType;

@@ -37,6 +37,10 @@ pub const Kind = enum(u8) {
     thread,
 };
 
+/// Placeholder payload for the userdata kind until the standard library adds
+/// userdata semantics. It still has a concrete allocation type for the sweep.
+pub const Userdata = struct { common: Common };
+
 /// White is "not reached", which is what a sweep frees. Black is "reached by the
 /// marker", which is still here.
 pub const Mark = enum(u8) {
@@ -54,6 +58,9 @@ pub const Tracker = struct {
     /// how many objects are live, which is what a sweep compares against how many
     /// the marker reached
     count: usize = 0,
+    /// Bytes in individually tracked objects, used by collectgarbage("count").
+    /// Auxiliary table storage and VM frames are not included in this estimate.
+    memory_bytes: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) Tracker {
         return .{ .allocator = allocator };
@@ -78,6 +85,7 @@ pub const Tracker = struct {
         tracker.last = common;
         if (tracker.first == null) tracker.first = common;
         tracker.count += 1;
+        tracker.memory_bytes = std.math.add(usize, tracker.memory_bytes, @sizeOf(T)) catch std.math.maxInt(usize);
 
         return memory;
     }
@@ -85,6 +93,7 @@ pub const Tracker = struct {
     /// Frees one object and takes it off the list. The memory has to be what `alloc`
     /// handed out, since that is where the list pointer came from.
     pub fn free(tracker: *Tracker, memory: anytype) void {
+        tracker.memory_bytes -|= @sizeOf(@TypeOf(memory.*));
         tracker.unlink(&memory.common);
         tracker.allocator.destroy(memory);
     }
@@ -199,7 +208,7 @@ test "every object the tracker made is freed" {
         slot.* = thing;
     }
 
-    const all_tables = [_]Kind{.table} ** 8;
+    const all_tables = @as([8]Kind, @splat(.table));
     var walked: Walked = .{ .wanted = &all_tables };
     tracker.walk(&walked);
     try testing.expectEqual(@as(usize, 8), walked.seen);

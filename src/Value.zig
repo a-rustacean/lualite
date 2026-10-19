@@ -4,6 +4,7 @@ const num = @import("Number.zig");
 const Number = num.Number;
 const Object = @import("Object.zig");
 const Str = @import("Str.zig");
+const Ast = @import("Ast.zig");
 
 /// What the runtime holds. The header every heap object carries is in Object.zig,
 /// and the reason it is there now rather than when the collector is written is
@@ -18,17 +19,19 @@ pub const Value = union(enum) {
     string: *Str.Str,
     table: *Table,
     function: *Function,
+    native_function: NativeFunction,
     thread: *Thread,
 
-    /// `type` as the base library spells it.
+    /// `type` as the base library spells it, which says `number` for both halves
+    /// of the split. `math.type` is the one that tells them apart.
     pub fn typeName(v: Value) []const u8 {
         return switch (v) {
             .nil => "nil",
             .boolean => "boolean",
-            .number => |n| if (n.isInt()) "integer" else "float",
+            .number => "number",
             .string => "string",
             .table => "table",
-            .function => "function",
+            .function, .native_function => "function",
             .thread => "thread",
         };
     }
@@ -39,7 +42,7 @@ pub const Value = union(enum) {
     pub fn mathType(v: Value) ?[]const u8 {
         return switch (v) {
             .number => |n| if (n.isInt()) "integer" else "float",
-            .nil, .boolean, .string, .table, .function, .thread => null,
+            .nil, .boolean, .string, .table, .function, .native_function, .thread => null,
         };
     }
 
@@ -74,6 +77,10 @@ pub const Value = union(enum) {
                 .function => |y| x == y,
                 else => false,
             },
+            .native_function => |x| switch (b) {
+                .native_function => |y| x == y,
+                else => false,
+            },
             .thread => |x| switch (b) {
                 .thread => |y| x == y,
                 else => false,
@@ -92,19 +99,129 @@ pub const Value = union(enum) {
     }
 };
 
-/// A table. Only the shape is here so far: the array and hash parts that make
-/// `#`, `next` and `ipairs` behave arrive with the collector, which needs them to
-/// have somewhere to mark from.
-pub const Table = struct {
-    common: Object.Common,
+pub const NativeFunction = enum {
+    base_print,
+    base_type,
+    base_tostring,
+    base_tonumber,
+    base_assert,
+    base_error,
+    base_pcall,
+    base_xpcall,
+    base_select,
+    base_rawequal,
+    base_rawget,
+    base_rawset,
+    base_rawlen,
+    base_setmetatable,
+    base_getmetatable,
+    base_load,
+    base_loadfile,
+    base_dofile,
+    base_warn,
+    base_collectgarbage,
+    next,
+    ipairs_iterator,
+    pairs,
+    ipairs,
+    table_insert,
+    table_remove,
+    table_concat,
+    table_unpack,
+    table_pack,
+    table_move,
+    table_sort,
+    string_len,
+    string_sub,
+    string_rep,
+    string_reverse,
+    string_upper,
+    string_lower,
+    string_byte,
+    string_char,
+    string_find,
+    string_match,
+    string_gmatch,
+    string_gmatch_iterator,
+    string_gsub,
+    string_format,
+    string_pack,
+    string_packsize,
+    string_unpack,
+    utf8_char,
+    utf8_len,
+    utf8_codepoint,
+    utf8_offset,
+    utf8_codes,
+    utf8_codes_iterator,
+    math_abs,
+    math_floor,
+    math_ceil,
+    math_sqrt,
+    math_fmod,
+    math_max,
+    math_min,
+    math_tointeger,
+    math_type,
+    math_sin,
+    math_cos,
+    math_tan,
+    math_asin,
+    math_acos,
+    math_atan,
+    math_exp,
+    math_log,
+    math_deg,
+    math_rad,
+    math_modf,
+    math_ult,
+    math_random,
+    math_randomseed,
+    os_clock,
+    os_time,
+    os_difftime,
+    os_getenv,
+    os_date,
+    os_execute,
+    os_remove,
+    os_rename,
+    os_exit,
+    io_open,
+    io_write,
+    io_flush,
+    io_type,
+    io_close,
+    io_lines,
+    io_input,
+    io_output,
+    io_read,
+    io_tmpfile,
+    file_read,
+    file_write,
+    file_flush,
+    file_close,
+    file_seek,
+    file_lines,
+    file_lines_iterator,
 };
 
-/// A closure. The upvalues are shared between closures over the same locals,
-/// which is what makes a counter count rather than each closure keeping its own
-/// copy, and they arrive with the collector for the same reason tables' parts do.
+/// A table. Its mechanics live in Table.zig, which is where the array and hash
+/// parts that make `#`, `next` and `ipairs` behave are written. This file keeps
+/// the tag that points at one.
+pub const Table = @import("Table.zig").Table;
+
+/// A closure over an AST function body. Captured cells are shared between
+/// closures over the same locals, so assignments remain visible after return.
 pub const Function = struct {
     common: Object.Common,
+    semantics: *const @import("Semantic.zig").Program,
+    body: *const Ast.FunctionBody,
+    function_index: u32,
+    captures: []*Cell,
+    environment: *Cell,
 };
+
+pub const Cell = struct { value: Value };
 
 /// A coroutine. The frame stack and the status go here rather than being a bare
 /// pointer, so that a thread is one object for the collector to reach.
@@ -115,8 +232,9 @@ pub const Thread = struct {
 const testing = std.testing;
 
 test "a number is one value or the other, and says which" {
-    try testing.expectEqualStrings("integer", (Value{ .number = Number.fromInt(1) }).typeName());
-    try testing.expectEqualStrings("float", (Value{ .number = Number.fromFloat(1) }).typeName());
+    // `type` says number for both halves, which is the point of `math.type`
+    try testing.expectEqualStrings("number", (Value{ .number = Number.fromInt(1) }).typeName());
+    try testing.expectEqualStrings("number", (Value{ .number = Number.fromFloat(1) }).typeName());
 
     try testing.expectEqualStrings("integer", (Value{ .number = Number.fromInt(1) }).mathType().?);
     try testing.expectEqualStrings("float", (Value{ .number = Number.fromFloat(1) }).mathType().?);

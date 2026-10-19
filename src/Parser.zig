@@ -335,6 +335,19 @@ pub fn toVariable(parser: *Parser, expr: Ast.Expression) Error!Ast.Variable {
     return Expression.toVariable(parser, expr);
 }
 
+// Build a string of `n` copies of `s` at comptime, since the tests that probe the
+// nesting limit need a few hundred repeats and Zig 0.17 no longer ships a
+// repeat helper in `std.mem`. Comptime is the right home for it: the count is
+// always known ahead, and the result is a static slice the test can build
+// larger literals from.
+fn repeat(comptime s: []const u8, comptime n: usize) [s.len * n]u8 {
+    comptime var out: [s.len * n]u8 = undefined;
+    @setEvalBranchQuota(100_000);
+    comptime var i: usize = 0;
+    inline while (i < n) : (i += 1) @memcpy(out[i * s.len ..][0..s.len], s);
+    return out;
+}
+
 // a parser with an arena and a reporter of its own, for the tests in this
 // directory to share. The arena is not the one inside the parser, since the
 // nodes in a chunk point into it and it has to outlive the call that made them.
@@ -549,7 +562,7 @@ test "nesting past the depth limit is refused, and the rest of the file is not" 
     var t = Test.init();
     defer t.deinit();
 
-    const parens = "(" ** 300 ++ "x" ++ ")" ** 300;
+    const parens = &@as([300]u8, @splat('(')) ++ "x" ++ &@as([300]u8, @splat(')'));
     const tail_at = parens.len + 1;
 
     // the tail is the point: recovery unwinds the levels the refusal gave up,
@@ -580,8 +593,10 @@ test "nested calls are held to the depth limit too" {
 
     // a call never enters a block, so this only gets caught if the argument list
     // counts towards the nesting as well
-    const calls = "f(" ** 300;
-    _ = t.parse("return " ++ calls ++ "x" ++ ")" ** 300) catch {};
+    const calls_buf = repeat("f(", 300);
+    const calls = calls_buf[0..];
+    const close_buf = repeat(")", 300);
+    _ = t.parse("return " ++ calls ++ "x" ++ close_buf[0..]) catch {};
 
     try t.expectKind(0, .nesting_too_deep);
 }
@@ -592,7 +607,8 @@ test "a chain of prefix operators is held to the depth limit too" {
 
     // likewise for a unary operand, which is a whole expression and not a simple
     // one
-    _ = t.parse("return " ++ "not " ** 300 ++ "x") catch {};
+    const not_buf = repeat("not ", 300);
+    _ = t.parse("return " ++ not_buf[0..] ++ "x") catch {};
 
     try t.expectKind(0, .nesting_too_deep);
 }
@@ -605,9 +621,13 @@ test "nesting just under the depth limit still parses" {
     const depth: usize = 100;
 
     // all three of the ways a parse can recurse are open at this depth
-    _ = try t.parse("return " ++ ("(" ** depth ++ "x" ++ ")" ** depth));
-    _ = try t.parse("return " ++ "not " ** depth ++ "x");
-    _ = try t.parse("return f" ++ ("(x)" ** depth));
+    const open_buf = repeat("(", depth);
+    const close_buf = repeat(")", depth);
+    const not_buf = repeat("not ", depth);
+    const call_buf = repeat("(x)", depth);
+    _ = try t.parse("return " ++ (open_buf[0..] ++ "x" ++ close_buf[0..]));
+    _ = try t.parse("return " ++ not_buf[0..] ++ "x");
+    _ = try t.parse("return f" ++ call_buf[0..]);
     try t.expectClean();
 }
 
@@ -621,7 +641,9 @@ test "nested blocks are held to the depth limit too" {
     // limit.
     const depth: usize = 90;
 
-    _ = try t.parse("if function() " ** depth ++ "x()" ++ " end then end" ** depth);
+    const open_buf = repeat("if function() ", depth);
+    const close_buf = repeat(" end then end", depth);
+    _ = try t.parse(open_buf[0..] ++ "x()" ++ close_buf[0..]);
     try t.expectClean();
 }
 
@@ -633,7 +655,11 @@ test "nesting blocks past the depth limit is refused" {
     // by the limit and not by running the stack of blocks out
     const depth: usize = 250;
 
-    _ = t.parse("if function() " ** depth ++ "x" ++ " end then end" ** depth) catch {};
+    // the whole token run has to repeat, not a run of spaces, or the parse never
+    // opens the blocks the limit is meant to refuse
+    const open_buf = repeat("if function() ", depth);
+    const close_buf = repeat(" end then end", depth);
+    _ = t.parse(open_buf[0..] ++ "x" ++ close_buf[0..]) catch {};
 
     try t.expectKind(0, .nesting_too_deep);
 }

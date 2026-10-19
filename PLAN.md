@@ -19,18 +19,43 @@ The front-end is complete for its scope and has no stubs:
 - `src/Semantic.zig` + `src/Semantic/*.zig` — the resolver, its scope tree and
   the checks Lua performs. See Phase 1 below.
 
-229 tests pass (`zig build test`), 68 differential cases against a reference Lua
-5.4 agree (`differential/run.sh`), and 2393 corpus files agree (`corpus/run.sh`).
+261 tests pass (`zig build test`), 68 differential cases against a reference Lua
+5.4 agree (`differential/run.sh`), 2393 corpus files agree (`corpus/run.sh`), and
+8 runtime cases compare stdout, stderr and exit status against the reference
+(`runtime/run.sh`).
 `grep` for `TODO`, `unimplemented`, `@panic` across `src/` finds nothing.
 
-**Absent:** every layer between the resolved AST and executing code. No bytecode,
-no call frames, no closures, no standard library. The value model below has
-landed, but nothing produces a `Value` yet and nothing consumes one.
+**In progress:** a simple tree-walking VM evaluates the resolved AST directly.
+It currently handles literals, number and string operations, locals, globals,
+table construction/indexing/assignment, recursive functions and closures,
+dotted and method definitions, table/string call sugar, and `<close>` locals
+with `__close` handlers. Varargs and
+multiple-result expansion work in
+calls, returns, local and assigned expression lists, and the final table field.
+Resolved `goto` statements support forward and backward jumps and unwind nested
+blocks or loops to their target label.
+Base functions are first-class values in `_G`, with `_VERSION` set to `Lua 5.4`.
+Parenthesized calls adjust to one value; `assert`, `select`, and `next` preserve
+their multiple results, and `print` expands its final argument. Generic `for`
+also supports first-class `pairs`, `ipairs`, and `next` iterators, including
+storing and calling their returned iterator functions. `pcall` catches runtime
+errors, preserves the value passed to `error`, and returns all successful call
+results. The CLI provides `print`, `type`, `tostring`, `tonumber`, `assert`,
+`rawequal`, `rawget`, `rawset`, `select`, `next`, `pairs`, `ipairs`, `pcall`,
+`xpcall`, and `error`. The `table` library provides `insert`, `remove`, `concat`,
+`sort`, `unpack`, `pack`, and `move`; `rawlen` supports strings and tables. The
+`string` library provides byte-oriented `len`, `sub`, `rep`, `byte`, `char`,
+`format`, pattern-aware `find`, `match`, `gmatch`, `gsub`, `upper`, `lower`, and
+`reverse`; string methods such as
+`("text"):upper()` work. Runtime errors follow the reference's wording and
+positions, and `string.format` delegates its numeric conversions to the C
+library as the reference does. Most of the standard library and some less
+common result-adjustment contexts remain open.
 
 ## Gaps to close in the front-end first
 
-These are on the list before codegen rather than after, because bytecode and
-value representations would otherwise bake the mistakes in. Items 2 to 5 are
+These are on the list before runtime work rather than after, because the value
+model would otherwise bake the mistakes in. Items 2 to 5 are
 closed; the corpus run and the differential harness in `corpus/` and
 `differential/` are what found them.
 
@@ -52,8 +77,8 @@ closed; the corpus run and the differential harness in `corpus/` and
    decodes to UTF-8 with `luaO_utf8esc`. A bad escape is reported and the decoder
    carries on, so it costs the rest of its string rather than the rest of the
    chunk.
-   - **Still open:** long strings do not normalize line endings. Lua 5.4 converts
-     every EOL sequence in a long string to `\n` and this does not.
+   - Long strings normalize CR, LF, and CRLF to `\n`, and drop the first
+     newline sequence after the opening delimiter, matching Lua 5.4.
 3. ~~**No shebang handling.**~~ **Closed.** `scan` skips a first line beginning
    with `#`, not just `#!` — `skipcomment` in `lauxlib.c` checks for the `#`
    alone, which is a detail worth having read off the source rather than guessed.
@@ -141,84 +166,141 @@ Independent of Phase 1, so the two can proceed in parallel.
   from the reference (`src/Number.golden.*`).
 - `src/Object.zig` — the header every heap object starts with (`kind`, `mark`,
   and the list links) plus the tracker that owns them. Stop-the-world
-  mark-sweep, so a value can be overwritten with no bookkeeping and no write
-  barrier; only the shape is here, and the sweep arrives with tables, which are
-  the first thing that can make a cycle.
+  mark-sweep means a value can be overwritten with no bookkeeping and no write
+  barrier; the collector implementation is in `src/Collector.zig`.
 - `src/Str.zig` — short strings interned behind a content-keyed table at Lua's
   40-byte split, laid out in a bump arena so a pointer stays a key; long
   strings are not interned and compare by content, the same trade Lua makes.
-  Hashed with `luaS_hash` so a table keyed by strings comes out in the order
-  the reference would give it.
+  Hashed with `luaS_hash` at a zero seed. The reference seeds that hash per
+  state from time and ASLR, so `pairs` over string keys comes out in a different
+  order on every run and there is no order to match. Integer and float keys do
+  not go through it and their order is reproducible.
 - `src/Value.zig` — the union, `type`/`math.type`, `==` across the two number
-  types, and truthiness. Tables, closures and threads are placeholders holding
-  only the header, since their contents arrive with the collector.
+  types, truthiness, AST function closures, and shared captured cells. Collector
+  tracing follows values held by closure captures.
 
-**Still open in Phase 2:** the array/hash table parts, the mark and sweep
-itself, and `--dump-literals` so the corpus can be re-run against tagged
-numbers rather than just the ones the golden file names.
+The table array/hash parts, Lua-compatible key normalization, `#`, iteration,
+and rehashing are implemented in `src/Table.zig`. `src/Collector.zig` provides
+stop-the-world mark-and-sweep with roots supplied explicitly at a safepoint.
+Short interned strings remain arena-owned for the interner lifetime. Still open
+is `--dump-literals`, so the corpus can be re-run against tagged numbers rather
+than just the ones the golden file names.
 
-## Phase 3 — bytecode format
+## Phase 3 — AST runtime (in progress)
 
-Register-based, one 32-bit instruction word, following `lopcodes.h` closely:
-`MOVE`, `LOADK`, `LOADNIL`, `LOADBOOL`, `LOADINT`, arithmetic and comparison,
-`GETTABLE`/`SETTABLE`, `GETFIELD`/`SETFIELD`, `GETUPVAL`/`SETUPVAL`,
-`NEWTABLE`, `CLOSURE`, `VARARG`, `CALL`/`TAILCALL`/`RETURN`, `JMP`, `EQ`,
-`LT`, `LE`.
+The runtime starts as a tree-walker over the existing AST and semantic
+resolution data. This keeps the execution model direct and easy to inspect. Add
+an IR only when it has a concrete use, such as simplifying control flow or
+supporting a second backend.
 
-Constants and nested prototypes live in a per-function array. Shaped like Lua's
-so `lvm.c` and `lopcodes.c` can be read alongside while implementing.
+`src/VM.zig` evaluates the resolved AST directly with a step limit, including
+closures with shared upvalue cells, dotted and method definitions, and
+method-call and table/string call sugar. Captured locals get a fresh cell per
+declaration, so closures made in a loop body capture each iteration separately.
+Varargs and multiple-result expansion work in common list contexts. Runtime
+behavior includes table metatables, arithmetic metamethods, generic iteration,
+protected calls, and the libraries described in Phase 5. Free names resolve
+through lexical `_ENV` bindings, and closures preserve their environment when it
+is inherited through nested functions. Runtime errors follow the reference
+wording and blame the right operand, carrying the `getobjname` suffixes of
+`ldebug.c` such as `(constant 'x')` and `(field 'missing')` when a name is
+traceable; native errors add a position only when a Lua function called them
+directly, the way `luaL_where` sees it. Some Lua runtime semantics, less common multiple-result
+contexts, and broad standard library coverage remain open.
 
-**Done when:** a hand-assembled prototype round-trips through the decoder and
-disassembles legibly.
+Dynamic text chunks are now supported through `load`, `loadfile`, and `dofile`.
+Each compiled chunk keeps its parse arena and semantic program alive for
+returned closures, and `load` can bind an explicit environment.
 
-## Phase 4 — compiler pass
+**Done when:** the CLI executes the language subset consistently and reports
+runtime errors with source locations.
 
-AST to bytecode, taking the slot assignments from Phase 1 as input.
-
-- Register allocation over the active locals, with the temporaries Lua reserves
-  for binary-operator intermediates.
-- An expression compiler honouring the precedence table, which is already
-  correct and tested at `src/Parser/Expression.zig:23-48` — including the
-  counter-intuitive ordering where `<<` binds looser than `==`.
-- A statement compiler for every form: `repeat` closes at its condition,
-  multiple-return adjustment on a last expression, method-call argument
-  shifting for `object:name(...)`.
-- Short-jump optimisation with the deferred-jump pattern `lopcodes.c` uses.
-
-Depends on Phase 1 for slot assignment. Starting before Phase 1 finishes means
-retrofitting a resolver onto emitted bytecode, which is worse than writing it
-once.
-
-## Phase 5 — VM core
-
-A dispatch loop over the instruction stream.
-
-- Frame stack: registers, varargs, open upvalues shared across closures.
-- Call, return, and tail calls.
-- Closures with upvalue capture, and upvalue closing as scopes exit.
-- `pcall`/`xpcall`/`error` over a protected-frame mechanism.
-- A call-depth limit to replace the parser's `max_depth` at runtime.
-
-**Done when:** a Lua program with functions, closures, recursion, varargs and
-multiple returns prints the same output as the reference implementation.
-
-## Phase 6 — minimal standard library
+## Phase 5 — minimal standard library
 
 Enough to run real scripts:
 
 - base: `print`, `type`, `tostring`, `tonumber`, `pairs`, `ipairs`, `next`,
-  `select`, `error`, `pcall`, `assert`, `rawget`, `rawset`, `rawequal`,
-  `setmetatable`, `getmetatable`
+  `select`, `error`, `pcall`, `xpcall`, `assert`, `rawget`, `rawset`, `rawequal`,
+  `rawlen`, `setmetatable`, `getmetatable`, `warn`, `load`, `loadfile`, `dofile`,
+  `collectgarbage`
 - `string`: `format`, `len`, `sub`, `rep`, `byte`, `char`, `upper`, `lower`,
   `find`, `gmatch`, `match`, `reverse`, `gsub`
-- `table`: `insert`, `remove`, `concat`, `sort`, `unpack`
-- `math`
+- `table`: `insert`, `remove`, `concat`, `sort`, `pack`, `move`, `unpack`
+- `math`: numeric constants and common scalar functions
+- `utf8`: `char`, `len`, `codepoint`, `offset`, `codes`, and `charpattern`
 
-## Phase 7 — widen
+Implemented so far: all seven listed `table` functions; string `len`, `sub`, `rep`,
+`byte`, `char`, common printf-style `format`, pattern-aware `find`, `match`,
+`gmatch`, `gsub`, `upper`, `lower`, `reverse`, and binary `pack`, `unpack`, and
+`packsize`; and math
+`abs`, `floor`, `ceil`, `sqrt`, `fmod`, `max`, `min`, `tointeger`, `type`,
+`sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `exp`, `log`, `deg`, `rad`,
+`modf`, unsigned `ult`, `random`, and `randomseed`,
+with `pi`, `huge`, `maxinteger`, and `mininteger`. The random functions use
+Lua 5.4's xoshiro256** state initialization and unbiased integer projection;
+`random(0)` returns a full signed integer. Base `setmetatable` and
+`getmetatable` are implemented with protected metatables and table `__index` /
+`__newindex`, `__len`, arithmetic, concatenation, comparison, equality, and
+unary metamethod behavior, plus callable tables (`__call`), `__tostring`, and
+the table iteration hook `__pairs`. Strings share the standard string-library
+metatable, so ordinary string indexing, assignment hooks, and `getmetatable`
+use Lua's type-level metatable behavior.
+The `os` library provides `clock`, `time`, `date`, `difftime`, `getenv`,
+`execute` (through the host shell), `remove`, `rename`, and `exit`.
+`date` supports UTC conversion, date tables, and common `strftime` directives;
+`time(table)` normalizes and updates calendar fields using UTC. Host-local
+timezone conversion, locale, and process-control functions remain open. File
+operation errors use Zig's portable error names and a best-effort errno mapping.
+`clock` uses the host process CPU clock, `time` uses Unix epoch seconds, and
+`getenv` reads the environment passed by the CLI.
+The first `io` slice provides `io.open` in read, update, truncating write, and
+append modes; file `read` (`*n`, `*l`, `*L`, `*a`, and byte counts, including
+multiple formats); `write`, `flush`, `close`, `seek`, and `io.type`; plus
+`io.input`, `io.output`, `io.read`, `io.write`, and `io.flush`. File handles
+close when explicitly closed, when their Lua table is collected, or when the VM
+shuts down. `io.tmpfile()` creates a temporary read/write file that is removed
+when closed or collected. `io.lines()` over standard input and other `io`
+functions remain open. `io.lines(filename)` and `file:lines(...)` provide
+generic-for iterators, support read formats, and close owned files at EOF.
+The UTF-8 library provides Lua's one-to-six-byte encoding, strict and lax
+decoding, byte-indexed length and codepoint access, offsets, iterator triples,
+and the standard byte-pattern constant. The formatter covers
+Lua's conversions, flags, width and precision, `%q` over every literal type,
+and `%p`; the numeric conversions call the C library's `snprintf` exactly as
+`l_sprintf` in lstrlib.c does, so rounding, `%a`, and the flag corners are the
+platform's own, and the reference's conversion checks (`invalid conversion`,
+flag and precision restrictions) are reproduced. The pattern matcher
+covers byte classes, sets, anchors, quantifiers,
+captures, balanced items (`%b`), frontiers (`%f`), and capture references.
+Binary string formats support integer and floating-point values, endian and
+alignment controls, fixed and terminated strings, length-prefixed strings, and
+packsize rejection for variable-length formats.
+The base warning function honors `@on` and `@off` and writes to stderr. The
+base `load`, `loadfile`, and `dofile` functions compile and execute text chunks;
+binary chunks are not supported, and no-argument `loadfile`/`dofile` read
+stdin. `collectgarbage` supports collect, step, stop, restart, count, and
+isrunning. Automatic and requested sweeps run at interpreter statement
+boundaries to keep temporary AST evaluation values safe. Sweeps are postponed
+through nested interpreted calls because caller expression temporaries are held
+in the host stack; they resume after the outer statement. The count currently
+covers tracked object allocations, not every auxiliary buffer. Incremental and
+generational collector modes are still open.
 
-Metatables and the full metamethod set, coroutines, `io`, `os`, `utf8`, and the
-string pattern library in full — Lua's matcher is ~300 lines and the fiddliest
-part of the stdlib.
+The CLI's `--check` mode runs only the lexer, parser, and semantic pass. The
+differential and corpus harnesses use it so accepted scripts are not executed
+as a side effect of front-end checks. A first runtime smoke comparison against
+the reference also caught and fixed table-constructor list fields being stored
+too early when a keyed field uses the same numeric index. Numeric strings now
+coerce for arithmetic and unary minus, while bitwise operations and comparisons
+keep their stricter Lua behavior; failed numeric coercion still falls through to
+the other operand's metamethod.
+
+## Phase 6 — widen
+
+The core metatable hooks and string pattern matcher are implemented. The largest
+runtime gaps are coroutines, `io`, most of `os`, the remaining standard-library
+functions and edge-case compatibility across Lua's runtime semantics. Dynamic
+binary chunks and incremental/generational collector modes are also unsupported.
 
 ## Verification
 
@@ -232,22 +314,28 @@ Three harnesses, at three scales, and they are not interchangeable.
   hand. It compares the verdict only, which is the trade for finding divergences
   nobody thought to look for. It found the false rejection on a reused label name
   and the crash on an oversized file. See `corpus/RUN-REPORT.md`.
-- **Unit tests**, colocated, 229 of them.
+- **Unit tests**, colocated, 261 of them.
 
-What the harnesses cannot see is everything about what the code computes, since
-the reference never runs anything and there is no runtime yet. That is also why
-two bugs in this pass were found by hand rather than by either: the `u16` slot
-overflow needs a generated file with 65536 locals, and the `\` before a CRLF needs
-a string literal nobody writes by accident.
+What the parser harnesses cannot see is what a program computes. That is what
+`runtime/run.sh` is for: it runs each `runtime/cases/*.lua` under both
+interpreters and diffs stdout, stderr and the exit status, after normalising
+`0x…` object addresses (reference Lua seeds its string hash per process —
+`luai_makeseed` in `lstate.c` — so `pairs` over string keys also differs run to
+run; cases avoid depending on that order). Its eight cases cover the number and
+string models, tables, functions and closures, control flow, metatables, error
+messages and `string.format`. Two front-end bugs were found by hand rather than
+by the harnesses: the `u16` slot overflow needs a generated file with 65536
+locals, and the `\` before a CRLF needs a string literal nobody writes by
+accident.
 
 Going forward:
-- **Output comparison** once there is a runtime: run a corpus through both and
-  diff what they print. That is what will catch codegen bugs.
+- **Wider output comparison**: grow `runtime/cases/` and, later, run a corpus of
+  whole scripts under both interpreters, diffing what they print.
 - **`--dump-literals`** on lualite against `lua -e print` over literal-only
   files, which is what would have caught the escape work rather than leaving it to
   unit tests. The decoder is the one place where "accepted" and "right" are
   different questions, and verdicts cannot tell them apart.
-- **Lua's own test suite** as the Phase 7 target. Most of it is version-agnostic
+- **Lua's own test suite** as the Phase 6 target. Most of it is version-agnostic
   Lua source, and it would exercise every phase rather than only the last.
 - Fuzzing the lexer and parser with random and mutated inputs; the existing
   invariants (the cursor never moving backwards, error recovery always making
@@ -255,26 +343,21 @@ Going forward:
 
 ## Dependency order
 
-Phase 2 is independent of Phase 1, which is done, so they can run in parallel.
-Phase 3 gates Phases 4 and 5. Phase 4 needs the slot assignments from Phase 1.
-Phase 5 depends on Phases 2 and 3. Phase 6 follows 5. Phase 7 follows 6.
+Phase 2 was independent of Phase 1. The AST runtime depends on Phases 1 and 2.
+Phase 4 fills runtime gaps and expands output comparison; Phase 5 adds the
+standard library; Phase 6 widens language coverage.
 
 ```
-front-end gaps ─┬─> Phase 1 (semantics) DONE ─┐
-                └─> Phase 2 (values) ─────────┼─> Phase 4 (compiler) ─┐
-                       Phase 3 (bytecode) ────┴───────────────────────┴─> Phase 5 (VM) ─> Phase 6 (stdlib) ─> Phase 7 (widen)
+front-end gaps ──> Phase 1 (semantics) ─┐
+Phase 2 (values/tables/collector) ─────┴─> Phase 3 (AST runtime) ─> validation ─> stdlib ─> widen
 ```
 
 ## Where to pick up
 
-Phase 1 is done, and so is Phase 2 increment 1 (numbers, strings, object
-headers). Increment 1a is the obvious next piece of Phase 2: the table's array
-and hash parts, and the mark-sweep that needs them. That closes the loop the
-headers were laid down for — right now `Tracker` has the list a sweep walks but
-nothing walking it, and `Table` has nothing inside it.
-
-Phase 3, the bytecode format, is the other candidate: it constrains the compiler
-and the VM, and it is easier to change before there is code emitting it.
-
-`zig build test && differential/run.sh` before committing anything that touches
-either.
+Continue `src/VM.zig` as a direct AST evaluator. Improve Lua error behavior,
+multiple returns, varargs and generic iterators, then broaden the standard
+library. Keep execution tests close to the runtime and add an IR only when a
+specific need appears. The collector needs tracing updates as runtime objects
+become long-lived. The short-string
+interner currently retains its arena until teardown; revisit that policy if
+long-running workloads need short-string collection.
