@@ -195,7 +195,13 @@ pub const Table = struct {
 
     pub fn get(table: *Table, key: Value.Value) Value.Value {
         return switch (key) {
-            .number => |n| if (n.isInt()) getInt(table, n.int) else getGeneric(table, key),
+            .number => |n| if (n.isInt()) getInt(table, n.int) else blk: {
+                // `luaH_get` normalises an integral float key before looking,
+                // the same way `set` does before inserting, so `t[1.0]` is
+                // the slot `t[1]` wrote
+                if (normalizeFloatKey(n.float)) |as_int| break :blk getInt(table, as_int);
+                break :blk getGeneric(table, key);
+            },
             else => getGeneric(table, key),
         };
     }

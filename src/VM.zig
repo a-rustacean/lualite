@@ -535,7 +535,7 @@ pub const VM = struct {
                     if (name.attribute) |attribute| if (std.mem.eql(u8, attribute.name.name, "close")) {
                         if (value != .nil and value != .boolean) {
                             const method = if (value == .table) try vm.metamethod(value.table, "__close") else .nil;
-                            if (method == .nil) return error.RuntimeError;
+                            if (method == .nil) return vm.raise("variable '{s}' got a non-closable value", .{name.name.name});
                         }
                         vm.exec.close_values.append(vm.allocator, value) catch return error.OutOfMemory;
                     };
@@ -612,6 +612,11 @@ pub const VM = struct {
                 const initial = try vm.numberValue(node.initial);
                 const limit = try vm.numberValue(node.limit);
                 const step = if (node.step) |expr| try vm.numberValue(expr) else Number.Number.fromInt(1);
+                // `luaV_forprep` refuses a zero step the first time around:
+                // a literal zero cannot reach here because the front end
+                // refuses it, but a variable holding one arrives at runtime
+                const zero_step = if (step.isInt()) step.int == 0 else step.float == 0;
+                if (zero_step) return vm.raise("'for' step is zero", .{});
                 const slot = try vm.localSlot(node.name);
                 var current = initial;
                 while (if (Number.less(step, Number.Number.fromInt(0))) !Number.less(current, limit) else !Number.less(limit, current)) {
@@ -5391,6 +5396,7 @@ pub const VM = struct {
         const table = try vm.checkTable(args, 1, "rawset", "rawset");
         try vm.checkAny(args, 2, "rawset", "rawset");
         try vm.checkAny(args, 3, "rawset", "rawset");
+        try vm.checkStorableKey(if (args.len > 1) args[1] else .nil, true);
         table.set(if (args.len > 1) args[1] else .nil, if (args.len > 2) args[2] else .nil) catch return error.OutOfMemory;
         return vm.allocator.dupe(Value, &.{args[0]}) catch return error.OutOfMemory;
     }
@@ -5658,6 +5664,21 @@ pub const VM = struct {
         return vm.setTableIndexDepth(receiver, key, value, 0);
     }
 
+    /// `luaH_newkey` refuses the keys nothing can be stored under. The
+    /// assignment site and the constructor report the refusal with the
+    /// running chunk's position; an API call like `rawset` has no Lua frame
+    /// to point at, so its message comes through bare.
+    fn checkStorableKey(vm: *VM, key: Value, plain: bool) Error!void {
+        if (key == .nil) {
+            if (plain) return vm.raisePlain("table index is nil", .{});
+            return vm.raise("table index is nil", .{});
+        }
+        if (key == .number and key.number == .float and std.math.isNan(key.number.float)) {
+            if (plain) return vm.raisePlain("table index is NaN", .{});
+            return vm.raise("table index is NaN", .{});
+        }
+    }
+
     fn setTableIndexDepth(vm: *VM, receiver: Value, key: Value, value: Value, depth: usize) Error!void {
         if (depth >= 200) return error.RuntimeError;
         if (receiver == .table) {
@@ -5669,6 +5690,7 @@ pub const VM = struct {
         const newindex = try vm.valueMetamethod(receiver, "__newindex");
         if (newindex == .nil) {
             if (receiver != .table) return error.RuntimeError;
+            try vm.checkStorableKey(key, false);
             receiver.table.set(key, value) catch return error.OutOfMemory;
         } else {
             switch (newindex) {
@@ -5712,7 +5734,12 @@ pub const VM = struct {
                 const key = Value{ .string = vm.interner.intern(item.name.name) catch return error.OutOfMemory };
                 table.set(key, try vm.eval(item.value)) catch return error.OutOfMemory;
             },
-            .indexed => |item| table.set(try vm.eval(item.key), try vm.eval(item.value)) catch return error.OutOfMemory,
+            .indexed => |item| {
+                const key = try vm.eval(item.key);
+                const value = try vm.eval(item.value);
+                try vm.checkStorableKey(key, false);
+                table.set(key, value) catch return error.OutOfMemory;
+            },
         };
         for (list_values.items) |value| {
             table.set(.{ .number = .{ .int = next } }, value) catch return error.OutOfMemory;
@@ -5845,11 +5872,14 @@ pub const VM = struct {
 
     fn equalWithMetamethod(vm: *VM, left: Value, right: Value) Error!bool {
         if (left.equal(right)) return true;
+        // `__eq` runs between two tables only, and is looked up on the first
+        // operand then the second: the reference no longer requires both
+        // sides to resolve to the same method
         if (left != .table or right != .table) return false;
-        const left_method = try vm.metamethod(left.table, "__eq");
-        const right_method = try vm.metamethod(right.table, "__eq");
-        if (left_method == .nil or !left_method.equal(right_method)) return false;
-        const results = try vm.invokeCallableValues(left_method, &.{ left, right });
+        var method = try vm.metamethod(left.table, "__eq");
+        if (method == .nil) method = try vm.metamethod(right.table, "__eq");
+        if (method == .nil) return false;
+        const results = try vm.invokeCallableValues(method, &.{ left, right });
         defer vm.allocator.free(results);
         return results.len != 0 and results[0].truthy();
     }
@@ -5906,7 +5936,13 @@ pub const VM = struct {
         const results = try vm.invokeCallableValues(method, &.{ first, second });
         defer vm.allocator.free(results);
         const result = if (results.len == 0) .nil else results[0];
-        return if (negate_result) .{ .boolean = !result.truthy() } else result;
+        // order comparisons answer a boolean, the way `luaT_callorderTM`
+        // takes the truthiness of the metamethod's result; arithmetic and
+        // the rest hand back whatever the metamethod returned
+        return switch (op) {
+            .less_than, .less_equal, .greater_than, .greater_equal => .{ .boolean = if (negate_result) !result.truthy() else result.truthy() },
+            else => result,
+        };
     }
 
     fn evalBinary(vm: *VM, node: *const Ast.BinaryExpression) Error!Value {
