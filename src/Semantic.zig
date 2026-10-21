@@ -402,7 +402,9 @@ pub fn blockBodyUntil(
     block: *const Ast.Block,
     terminators: []const Token.Kind,
 ) Error!void {
-    const is_last_block = !untilFollows(terminators);
+    // A trailing return follows every statement in the block, so nothing —
+    // a label included — is last when one is present
+    const is_last_block = !untilFollows(terminators) and block.ret_statement == null;
 
     for (block.statements, 0..) |statement, i| {
         // Lua skips a label's trailing `;` and `::other::` when deciding this,

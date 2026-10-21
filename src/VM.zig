@@ -339,6 +339,12 @@ pub const VM = struct {
     rng_state: [4]u64 = seedRandomState(0x6c75616c697465, 0x72616e646f6d),
     gc_stopped: bool = false,
     gc_pending: bool = false,
+    // Where the deferred sweep stands in the cycle the reference's collector
+    // reports through `collectgarbage("step")`: a cycle that has not started
+    // yet is "at pause", and each step either begins one (false) or finishes
+    // the outstanding one (true), the way a basic step answers after a full
+    // collect. An approximation of the boundary state, not of the work done.
+    gc_at_pause: bool = true,
     gc_deferral_depth: usize = 0,
     gc_threshold: usize = 1024,
     exit_status: ?u8 = null,
@@ -1585,7 +1591,12 @@ pub const VM = struct {
         const plain = args.len > 3 and args[3] != .nil and (args[3] != .boolean or args[3].boolean);
         const start: usize = @intCast(@min(@max(start_index, 1) - 1, source_len));
         if (start_index <= source_len + 1) {
-            const found = if (plain) blk: {
+            // `str_find_aux`: a pattern without specials is searched for
+            // plainly whether or not the plain argument was given, which is
+            // why `find("abc", ")")` finds nothing rather than reaching the
+            // matcher and refusing the unopened capture
+            const special = std.mem.indexOfAny(u8, pattern, "^$*+?.([%-") != null;
+            const found = if (plain or !special) blk: {
                 if (std.mem.indexOfPos(u8, source, start, pattern)) |position| break :blk Pattern.Result{
                     .start = position,
                     .end = position + pattern.len,
@@ -1593,8 +1604,15 @@ pub const VM = struct {
                     .capture_count = 0,
                 };
                 break :blk null;
-            } else Pattern.find(source, pattern, start) catch return error.RuntimeError;
+            } else switch (Pattern.find(source, pattern, start)) {
+                .found => |result| result,
+                .absent => null,
+                .failed => |failure| return vm.patternError(failure),
+            };
             if (found) |result| {
+                // captures are pushed all at once, so the first unfinished
+                // one among them is refused before any value comes back
+                if (hasUnfinishedCapture(result.captures[0..result.capture_count])) return vm.patternError(.{ .kind = .unfinished_capture });
                 const extra = if (result.capture_count == 0) 0 else result.capture_count;
                 const values = vm.allocator.alloc(Value, 2 + extra) catch return error.OutOfMemory;
                 values[0] = .{ .number = Number.Number.fromInt(@intCast(result.start + 1)) };
@@ -1618,8 +1636,12 @@ pub const VM = struct {
         const start_index = if (raw_init < 0) @max(1, @addWithOverflow(raw_init, len + 1)[0]) else raw_init;
         if (start_index > len + 1) return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
         const start: usize = @intCast(@min(@max(start_index, 1) - 1, len));
-        const result = Pattern.find(source, pattern, start) catch return error.RuntimeError;
-        const found = result orelse return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
+        const found = switch (Pattern.find(source, pattern, start)) {
+            .found => |result| result,
+            .absent => return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory,
+            .failed => |failure| return vm.patternError(failure),
+        };
+        if (hasUnfinishedCapture(found.captures[0..found.capture_count])) return vm.patternError(.{ .kind = .unfinished_capture });
         if (found.capture_count == 0) {
             const matched = vm.interner.intern(source[found.start..found.end]) catch return error.OutOfMemory;
             return vm.allocator.dupe(Value, &.{.{ .string = matched }}) catch return error.OutOfMemory;
@@ -1666,8 +1688,12 @@ pub const VM = struct {
         const source = source_value.string.slice();
         const position = try intArgument(position_value);
         if (position < 0 or position > source.len) return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
-        const found = Pattern.find(source, pattern_value.string.slice(), @intCast(position)) catch return error.RuntimeError;
-        const result = found orelse return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
+        const result = switch (Pattern.find(source, pattern_value.string.slice(), @intCast(position))) {
+            .found => |found| found,
+            .absent => return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory,
+            .failed => |failure| return vm.patternError(failure),
+        };
+        if (hasUnfinishedCapture(result.captures[0..result.capture_count])) return vm.patternError(.{ .kind = .unfinished_capture });
         const next_position = if (result.end == result.start) result.end + 1 else result.end;
         try vm.setStringField(state, "position", .{ .number = Number.Number.fromInt(@intCast(next_position)) });
         if (result.capture_count == 0) {
@@ -1701,8 +1727,11 @@ pub const VM = struct {
         var replacements: i64 = 0;
         while (search <= source.len and replacements < max_replacements) {
             try vm.tick();
-            const found = Pattern.find(source, pattern, search) catch return error.RuntimeError;
-            const result = found orelse break;
+            const result = switch (Pattern.find(source, pattern, search)) {
+                .found => |found| found,
+                .absent => break,
+                .failed => |failure| return vm.patternError(failure),
+            };
             output.appendSlice(vm.allocator, source[copied..result.start]) catch return error.OutOfMemory;
             try vm.appendGsubReplacement(&output, source, result, replacement);
             replacements += 1;
@@ -1734,9 +1763,14 @@ pub const VM = struct {
 
         var value: Value = .nil;
         if (replacement == .table) {
+            // `push_onecapture(ms, 0, ...)`: with no captures the whole match
+            // is the index, and the first capture is refused if still open
+            if (captures.len != 0 and captures[0].unfinished) return vm.patternError(.{ .kind = .unfinished_capture });
             const key = if (captures.len != 0) try vm.patternCapture(source, captures[0]) else Value{ .string = vm.interner.intern(whole) catch return error.OutOfMemory };
             value = try vm.getTableIndex(replacement, key);
         } else if (replacement == .function or replacement == .native_function) {
+            // `push_captures` pushes them all, so any still open is refused
+            if (hasUnfinishedCapture(captures)) return vm.patternError(.{ .kind = .unfinished_capture });
             const call_args = if (captures.len == 0) blk: {
                 const matched = vm.interner.intern(whole) catch return error.OutOfMemory;
                 break :blk &[_]Value{.{ .string = matched }};
@@ -1764,7 +1798,10 @@ pub const VM = struct {
                 i += 1;
                 continue;
             }
-            if (i + 1 >= template.len) return error.RuntimeError;
+            // a '%' the reference cannot read — at the end or before
+            // something that is neither '%' nor a digit — is refused as an
+            // invalid use of it in the replacement string
+            if (i + 1 >= template.len) return vm.raise("invalid use of '%' in replacement string", .{});
             const replacement = template[i + 1];
             if (replacement == '%') {
                 output.append(vm.allocator, '%') catch return error.OutOfMemory;
@@ -1772,10 +1809,18 @@ pub const VM = struct {
                 output.appendSlice(vm.allocator, source[result.start..result.end]) catch return error.OutOfMemory;
             } else if (replacement >= '1' and replacement <= '9') {
                 const capture_index: usize = replacement - '1';
-                if (capture_index >= result.capture_count) return error.RuntimeError;
-                const value = try vm.patternCapture(source, result.captures[capture_index]);
-                try vm.appendReplacementValue(output, value);
-            } else return error.RuntimeError;
+                if (capture_index >= result.capture_count) {
+                    // `get_onecapture` answers with the whole match for
+                    // index zero and refuses any other index past the captures
+                    if (capture_index != 0) return vm.patternError(.{ .kind = .invalid_capture_index, .index = @intCast(capture_index + 1) });
+                    output.appendSlice(vm.allocator, source[result.start..result.end]) catch return error.OutOfMemory;
+                } else {
+                    const capture = result.captures[capture_index];
+                    if (capture.unfinished) return vm.patternError(.{ .kind = .unfinished_capture });
+                    const value = try vm.patternCapture(source, capture);
+                    try vm.appendReplacementValue(output, value);
+                }
+            } else return vm.raise("invalid use of '%' in replacement string", .{});
             i += 2;
         }
     }
@@ -2458,6 +2503,30 @@ pub const VM = struct {
         if (capture.position) return .{ .number = Number.Number.fromInt(std.math.cast(i64, capture.start + 1) orelse return error.RuntimeError) };
         const string = vm.interner.intern(source[capture.start..capture.end]) catch return error.OutOfMemory;
         return .{ .string = string };
+    }
+
+    /// Turns a refused pattern into the message `lstrlib.c` raises, positioned
+    /// the way `luaL_error` positions it.
+    fn patternError(vm: *VM, failure: Pattern.Failure) Error {
+        return switch (failure.kind) {
+            .too_many_captures => vm.raise("too many captures", .{}),
+            .invalid_pattern_capture => vm.raise("invalid pattern capture", .{}),
+            .malformed_missing_percentb => vm.raise("malformed pattern (missing arguments to '%b')", .{}),
+            .missing_bracket_after_percentf => vm.raise("missing '[' after '%f' in pattern", .{}),
+            .invalid_capture_index => vm.raise("invalid capture index %{d}", .{failure.index}),
+            .ends_with_percent => vm.raise("malformed pattern (ends with '%')", .{}),
+            .missing_bracket => vm.raise("malformed pattern (missing ']')", .{}),
+            .pattern_too_complex => vm.raise("pattern too complex", .{}),
+            .unfinished_capture => vm.raise("unfinished capture", .{}),
+        };
+    }
+
+    /// `get_onecapture` refuses an unfinished capture the moment it is pushed,
+    /// so the entry points that push them all — `find`, `match` and the
+    /// `gmatch` iterator — check before any value comes back.
+    fn hasUnfinishedCapture(captures: []const Pattern.Capture) bool {
+        for (captures) |capture| if (capture.unfinished) return true;
+        return false;
     }
 
     fn singleNumber(vm: *VM, number: Number.Number) Error![]Value {
@@ -3713,8 +3782,20 @@ pub const VM = struct {
         // errno rather than as an argument error
         if (target < 0 or target > std.math.maxInt(u64)) return vm.osFileFailure(error.InvalidArgument, null);
         const position: u64 = @intCast(target);
-        if (handle.writer) |*writer| writer.seekTo(position) catch return vm.osFileFailure(error.InvalidArgument, null);
-        if (handle.reader) |*reader| reader.seekTo(position) catch return vm.osFileFailure(error.InvalidArgument, null);
+        if (handle.writer) |*writer| writer.seekTo(position) catch |err| return vm.osFileFailure(err, null);
+        if (handle.reader) |*reader| reader.seekTo(position) catch |err| return vm.osFileFailure(err, null);
+        if (handle.writer == null and handle.reader == null) {
+            // A stream handle like `io.stdout` buffers nothing of its own, so
+            // the seek has to reach the OS the way `fseek` reaches it: a pipe
+            // refuses and answers nil, the strerror text and the errno through
+            // `luaL_fileresult` rather than as an argument error
+            if (handle.writer_interface) |writer| writer.flush() catch return error.RuntimeError;
+            const io = handle.io;
+            switch (whence) {
+                1 => io.vtable.fileSeekBy(io.userdata, handle.file, offset) catch |err| return vm.osFileFailure(err, null),
+                else => io.vtable.fileSeekTo(io.userdata, handle.file, position) catch |err| return vm.osFileFailure(err, null),
+            }
+        }
         handle.last_side = .read;
         return vm.singleNumber(.{ .int = @intCast(position) });
     }
@@ -4433,7 +4514,9 @@ pub const VM = struct {
         if (!valid) return vm.raiseArgument(1, short, long, "invalid option '{s}'", .{option});
         if (std.mem.eql(u8, option, "collect")) {
             vm.gc_pending = true;
-            return vm.allocator.alloc(Value, 0) catch return error.OutOfMemory;
+            // the reference hands back 0 after a full collection
+            vm.gc_at_pause = true;
+            return vm.singleNumber(Number.Number.fromInt(0));
         }
         if (std.mem.eql(u8, option, "stop")) {
             vm.gc_stopped = true;
@@ -4453,8 +4536,15 @@ pub const VM = struct {
         }
         if (std.mem.eql(u8, option, "step")) {
             if (args.len > 1 and args[1] != .nil) _ = try vm.checkInteger(args, 2, short, long);
+            // a stopped collector does not step, so it never finishes a cycle
+            if (vm.gc_stopped) return vm.allocator.dupe(Value, &.{.{ .boolean = false }}) catch return error.OutOfMemory;
             vm.gc_pending = true;
-            return vm.allocator.dupe(Value, &.{.{ .boolean = true }}) catch return error.OutOfMemory;
+            // one basic step from pause begins a cycle and does not finish one,
+            // which is what the reference answers straight after a collect; the
+            // next finishes the outstanding cycle and answers true
+            const finished = !vm.gc_at_pause;
+            vm.gc_at_pause = !vm.gc_at_pause;
+            return vm.allocator.dupe(Value, &.{.{ .boolean = finished }}) catch return error.OutOfMemory;
         }
         // `setpause`, `setstepmul`, `generational`, `incremental`: nothing to
         // adjust here, but the reference accepts them and answers something

@@ -301,7 +301,10 @@ fn parseInt(text: []const u8) ?i64 {
 
     if (s.len >= 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X')) {
         // hex accumulates without checking, so an overlarge one wraps rather than
-        // falling through to a float. `0xffffffffffffffff` is -1.
+        // falling through to a float. `0xffffffffffffffff` is -1. A bare "0x"
+        // reads no digits and is refused outright, like the reference's first
+        // `lisxdixel` check in `l_str2int`.
+        if (s.len == 2) return null;
         for (s[2..]) |c| {
             if (!std.ascii.isHex(c)) return null;
             value = value *% 16 + hexValue(c);
