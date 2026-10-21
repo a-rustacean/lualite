@@ -84,43 +84,7 @@ fn token_words_of(kind: Token.Kind) @TypeOf(token_words[0]) {
 
 // the source text of a punctuator
 fn punctuation_text(kind: Token.Kind) []const u8 {
-    return switch (kind) {
-        .plus => "+",
-        .minus => "-",
-        .star => "*",
-        .slash => "/",
-        .slash2 => "//",
-        .percent => "%",
-        .caret => "^",
-        .amp => "&",
-        .tilde => "~",
-        .tilde_eq => "~=",
-        .pipe => "|",
-        .shift_left => "<<",
-        .shift_right => ">>",
-        .eq => "=",
-        .eq2 => "==",
-        .lte => "<=",
-        .gte => ">=",
-        .hash => "#",
-        .dot => ".",
-        .dot2 => "..",
-        .dot3 => "...",
-        .langle => "<",
-        .lbrack => "[",
-        .lcurly => "{",
-        .lparen => "(",
-        .rangle => ">",
-        .rbrack => "]",
-        .rcurly => "}",
-        .rparen => ")",
-        .colon => ":",
-        .colon2 => "::",
-        .semicolon => ";",
-        .comma => ",",
-        .eof, .ident, .decimal, .float, .str, .long_str => unreachable,
-        else => @tagName(kind),
-    };
+    return Token.punctuationText(kind);
 }
 
 // what the parser wanted. A token is named as itself, the rest are the classes
@@ -442,7 +406,12 @@ pub fn main(init: std.process.Init) !void {
         _ = vm.run(&chunk) catch |err| switch (err) {
             error.ExitRequested => requested_exit_status = vm.exit_status orelse 0,
             else => {
-                if (vm.exec.error_offset) |offset| {
+                // `lua.c`'s `report`: the value an error raised carries its own
+                // position, and one that is not a string says so instead
+                if (vm.exec.thrown_error) |thrown| {
+                    const message = if (thrown == .string) thrown.string.slice() else "(error object is not a string)";
+                    std.debug.print("lualite: {s}\n", .{message});
+                } else if (vm.exec.error_offset) |offset| {
                     const location = lines.lineCol(source, offset);
                     std.debug.print("{s}:{d}:{d}: runtime error: {s}\n", .{ filename, location.line, location.col, @errorName(err) });
                 } else {

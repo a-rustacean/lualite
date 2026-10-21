@@ -17,7 +17,7 @@ pub fn walk(semantic: *Semantic, statement: Ast.Statement, is_last: bool) Error!
         .assignment => |node| try assignment(semantic, node),
         .function_call => |node| try Semantic.walkExpression(semantic, .{ .function_call = node }),
 
-        .label => |node| try Semantic.declareLabel(semantic, node.name, is_last),
+        .label => |node| try Semantic.declareLabel(semantic, node.name, is_last, node.after_span),
         .@"break" => |node| try Semantic.declareBreak(semantic, node),
         .goto => |node| try Semantic.declareGoto(semantic, node),
 

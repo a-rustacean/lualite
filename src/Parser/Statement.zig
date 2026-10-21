@@ -133,7 +133,10 @@ fn parseIf(parser: *Parser, if_token: Token) Parser.Error!Ast.Statement {
 
     const condition = try parser.parseExpression();
     const then_token = try parser.expect(.then);
-    const block = try Block.parseBlock(parser, &.{ .end, .@"else", .elseif });
+    // every closer ends the run of statements, the way `block_follow(ls, 1)`
+    // stops the reference's `statlist` on all of them; the construct's own
+    // `expect` is the one that words a mismatch as its missing closer
+    const block = try Block.parseBlock(parser, &Block.block_ends);
 
     var elseif_clauses: std.ArrayList(Ast.ElseIfClause) = .empty;
     errdefer elseif_clauses.deinit(allocator);
@@ -142,7 +145,7 @@ fn parseIf(parser: *Parser, if_token: Token) Parser.Error!Ast.Statement {
         const elseif_token = try parser.next();
         const clause_condition = try parser.parseExpression();
         const clause_then = try parser.expect(.then);
-        const clause_block = try Block.parseBlock(parser, &.{ .end, .@"else", .elseif });
+        const clause_block = try Block.parseBlock(parser, &Block.block_ends);
 
         try elseif_clauses.append(allocator, .{
             .span = Token.merge(elseif_token.span, clause_block.span),
@@ -156,7 +159,7 @@ fn parseIf(parser: *Parser, if_token: Token) Parser.Error!Ast.Statement {
     var else_clause: ?Ast.ElseClause = null;
     if ((try parser.peek()).kind == .@"else") {
         const else_token = try parser.next();
-        const else_block = try Block.parseBlock(parser, &.{.end});
+        const else_block = try Block.parseBlock(parser, &Block.block_ends);
 
         else_clause = .{
             .span = Token.merge(else_token.span, else_block.span),
@@ -206,7 +209,9 @@ fn parseRepeat(parser: *Parser, repeat_token: Token) Parser.Error!Ast.Statement 
     parser.pushBlock(.repeat, repeat_token.span);
     errdefer parser.unwindBlocks(blocks);
 
-    const block = try Block.parseBlock(parser, &.{.until});
+    // every closer ends the run of statements; the `until` below is the one
+    // that words a mismatch
+    const block = try Block.parseBlock(parser, &Block.block_ends);
     const until_token = try parser.expect(.until);
     const condition = try parser.parseExpression();
 
@@ -326,11 +331,18 @@ fn parseLabel(parser: *Parser, open: Token) Parser.Error!Ast.Statement {
     const name = try parser.expectIdent();
     const close = try parser.expect(.colon2);
 
+    // `labelstat` in lparser.c stops on the token after the closing `::` —
+    // skipping any `;` or `::` statements behind it — and its refusals name
+    // that line. One peek is the same token wherever a run of no-ops is not
+    // in the way, which is nearly always
+    const after = try parser.peek();
+
     return .{ .label = try parser.box(Ast.Label, .{
         .span = Token.merge(open.span, close.span),
         .open_span = open.span,
         .name = name,
         .close_span = close.span,
+        .after_span = after.span,
     }) };
 }
 
@@ -379,7 +391,18 @@ fn expectCall(parser: *Parser, expr: Ast.Expression) Parser.Error!*Ast.FunctionC
 
     return switch (expr) {
         .function_call => |call| call,
-        else => parser.failSpan(.unexpected_token, span),
+        else => {
+            // `exprstat` in lparser.c insists on a VCALL, and the `near` a
+            // message carries is the token the parser stopped on rather than
+            // any part of the expression
+            const stopped = try parser.peek();
+            parser.report(.{
+                .kind = .unexpected_token,
+                .span = span,
+                .stopped = stopped,
+            }) catch return error.ReportFailed;
+            return error.ParserFailed;
+        },
     };
 }
 fn expectStatement(source: []const u8, expected: std.meta.Tag(Ast.Statement)) !void {

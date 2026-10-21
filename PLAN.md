@@ -49,8 +49,9 @@ results. The CLI provides `print`, `type`, `tostring`, `tonumber`, `assert`,
 `reverse`; string methods such as
 `("text"):upper()` work. Runtime errors follow the reference's wording and
 positions, and `string.format` delegates its numeric conversions to the C
-library as the reference does. Most of the standard library and some less
-common result-adjustment contexts remain open.
+library as the reference does. The `io` library covers files and the standard
+streams, and `os` covers time, environment, and simple file operations. What
+remains open is mostly edge-case compatibility, listed under Phase 6.
 
 ## Gaps to close in the front-end first
 
@@ -260,15 +261,32 @@ timezone conversion, locale, and process-control functions remain open. File
 operation errors use Zig's portable error names and a best-effort errno mapping.
 `clock` uses the host process CPU clock, `time` uses Unix epoch seconds, and
 `getenv` reads the environment passed by the CLI.
-The first `io` slice provides `io.open` in read, update, truncating write, and
-append modes; file `read` (`*n`, `*l`, `*L`, `*a`, and byte counts, including
-multiple formats); `write`, `flush`, `close`, `seek`, and `io.type`; plus
-`io.input`, `io.output`, `io.read`, `io.write`, and `io.flush`. File handles
-close when explicitly closed, when their Lua table is collected, or when the VM
-shuts down. `io.tmpfile()` creates a temporary read/write file that is removed
-when closed or collected. `io.lines()` over standard input and other `io`
-functions remain open. `io.lines(filename)` and `file:lines(...)` provide
-generic-for iterators, support read formats, and close owned files at EOF.
+The first `io` slice grew into the whole library: `io.open` in read, update,
+truncating-write, and append modes; file `read` (`*n`, `*l`, `*L`, `*a`, byte
+counts, and several formats at once), `write`, `flush`, `close`, `seek`,
+`lines`, and `setvbuf`; `io.open`, `io.tmpfile`, `io.write`, `io.flush`,
+`io.close`, `io.type`, `io.read`, `io.input`, `io.output`, and `io.lines`.
+File handles are tables over an internal `FileHandle` with a protected
+metatable whose `__index` carries the methods, whose `__close` closes, and
+whose `__name` is `FILE*` so error messages name the type the way the
+reference names its userdata. `io.stdin`, `io.stdout`, and `io.stderr` are the
+default files until `io.input`/`io.output` move the defaults, and the two
+caches are kept apart so `io.stdout` still means the stream after
+`io.output(f)`. Errors follow `liolib.c` closely: `tofile` reports `FILE*
+expected, got X` or `attempt to use a closed file`, closing a standard file
+answers `nil, "cannot close standard file"`, a failing `opencheck` (what
+`io.input(name)`, `io.output(name)`, and `io.lines(name)` use) raises
+`cannot open file '%s' (%s)` while plain `io.open` returns `nil, path:
+strerror, errno`, and a negative read count tries for a buffer it cannot have
+and fails with `not enough memory`. Update files (`w+`, `r+`, `a+`) share one
+position between their sides the way a C `FILE*` does: a read flushes a
+pending write and starts where it ended, a write jumps to where the reads left
+off, and `seek()` reports whichever side last moved. Line iterators are bound
+functions over the handle, end without a value at EOF, raise `file is already
+closed` when reused after a close, and `io.lines(name)` hands the file back
+as its fourth result so a generic for can close it. File handles close when
+explicitly closed, when their Lua table is collected, or when the VM shuts
+down, and `io.tmpfile()` makes a temporary read/write file removed on close.
 The UTF-8 library provides Lua's one-to-six-byte encoding, strict and lax
 decoding, byte-indexed length and codepoint access, offsets, iterator triples,
 and the standard byte-pattern constant. The formatter covers
@@ -304,10 +322,16 @@ the other operand's metamethod.
 
 ## Phase 6 — widen
 
-The core metatable hooks and string pattern matcher are implemented. The largest
-runtime gaps are `io`, most of `os`, the remaining standard-library
-functions and edge-case compatibility across Lua's runtime semantics. Dynamic
-binary chunks and incremental/generational collector modes are also unsupported.
+The core metatable hooks and string pattern matcher are implemented, and the
+`io` library now covers the file and default-stream surface. The largest
+runtime gaps are the rest of `os` (`setlocale`, `tmpname`, host-local time),
+edge-case compatibility across Lua's runtime semantics, and a few
+representation differences: file handles are tables rather than userdata (so
+`type(io.stdout)` says `table` where the reference says `userdata`), uncaught
+errors print no stack traceback, and rare OS-level `io` failures surface as
+the host's `RuntimeError` instead of `nil` plus a message plus an errno.
+Dynamic binary chunks and incremental/generational collector modes are also
+unsupported.
 
 ## Verification
 

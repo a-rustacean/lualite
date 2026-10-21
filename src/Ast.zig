@@ -61,6 +61,9 @@ pub const Label = struct {
     open_span: Span,
     name: Identifier,
     close_span: Span,
+    // the token after the closing `::`, which is where the reference's checks
+    // on a label stop, so a refusal about it names that line
+    after_span: Span,
 };
 
 pub const BreakStatement = struct {

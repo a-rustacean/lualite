@@ -3,3 +3,4 @@ zig-out
 .wakatime-project
 zig-pkg
 corpus/out
+.lualite-tmp-*

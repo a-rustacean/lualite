@@ -21,6 +21,9 @@ const FileHandle = struct {
     owns_file: bool = true,
     closed: bool = false,
     auto_close: bool = false,
+    /// Which side of an update file last moved the shared position; a `w+`
+    /// stream reports where the writes left off, not the reader's stale copy
+    last_side: enum { read, write } = .read,
     reader: ?std.Io.File.Reader = null,
     writer: ?std.Io.File.Writer = null,
     writer_interface: ?*std.Io.Writer = null,
@@ -37,7 +40,17 @@ extern "c" fn snprintf(buffer: [*]u8, size: usize, format: [*:0]const u8, ...) c
 
 pub const Error = error{ OutOfMemory, MissingResolution, UnsupportedExpression, UnsupportedStatement, RuntimeError, StepLimit, ExitRequested, CoroutineClose };
 const Frame = struct { cells: []@import("Value.zig").Cell, pointers: []*@import("Value.zig").Cell };
-const ErrorFrame = struct { program: ?*const Semantic.Program, call_offset: ?u32 };
+const ErrorFrame = struct {
+    program: ?*const Semantic.Program,
+    call_offset: ?u32,
+    /// On a native frame: whether the Lua code at `call_offset` wrote the call
+    /// syntactically, and the method name when it used `:`. `luaL_argerror`
+    /// reads both off the calling instruction through `lua_getinfo("n")`, and
+    /// they are what decide which of the two names a message carries and
+    /// whether the argument index counts `self`.
+    from_call_site: bool = false,
+    method: ?[]const u8 = null,
+};
 const DateParts = struct { year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64, weekday: i64, yearday: i64 };
 
 fn floorDiv128(numerator: i128, denominator: i128) i128 {
@@ -112,36 +125,50 @@ fn lineAt(source: []const u8, offset: u32) usize {
 
 /// `luaO_chunkid`, near enough: the name is written into the buffer shortened
 /// the way the reference shortens it for a message.
-fn shortSource(buffer: *[64]u8, name: []const u8) []const u8 {
-    const limit = buffer.len - 1;
+fn shortSource(buffer: *[61]u8, name: []const u8) []const u8 {
+    // `luaO_chunkid` with a `LUA_IDSIZE` (60) buffer: long names keep their
+    // tail behind an `...` and everything stays under sixty visible bytes
+    const bufflen: usize = 60;
     if (name.len == 0) return "?";
     if (name[0] == '=') {
         const literal = name[1..];
-        if (literal.len <= limit) {
+        if (literal.len < bufflen) {
             @memcpy(buffer[0..literal.len], literal);
             return buffer[0..literal.len];
         }
-        @memcpy(buffer[0..limit], literal[0..limit]);
-        return buffer[0..limit];
+        @memcpy(buffer[0 .. bufflen - 1], literal[0 .. bufflen - 1]);
+        return buffer[0 .. bufflen - 1];
     }
     if (name[0] == '@') {
         const file = name[1..];
-        if (file.len <= limit) {
+        if (name.len <= bufflen) {
             @memcpy(buffer[0..file.len], file);
             return buffer[0..file.len];
         }
+        // The reference copies one byte past the name, which is its final
+        // NUL, so the visible tail behind the dots is `bufflen - 4` bytes
+        const tail = bufflen - 4;
         buffer[0] = '.';
         buffer[1] = '.';
         buffer[2] = '.';
-        @memcpy(buffer[3..], file[file.len - (limit - 3) ..]);
-        return buffer[0..limit];
+        @memcpy(buffer[3 .. 3 + tail], file[file.len - tail ..]);
+        return buffer[0 .. 3 + tail];
     }
-    // a string chunk, which reads as [string "..."]
+    // a string chunk, which reads as [string "..."]. The reference shortens
+    // one to the bytes before its first newline — or the first `room` of them
+    // where the line itself is longer — and puts `...` behind either sort of
+    // cut, so a source with a newline in it reads `[string "abc..."]` even
+    // when the head is short.
     var text = name;
-    if (std.mem.indexOfScalar(u8, text, '\n')) |at| text = text[0..at];
-    const room = limit - ("[string \"\"]".len + 3);
+    var cut = false;
+    if (std.mem.indexOfScalar(u8, text, '\n')) |at| {
+        text = text[0..at];
+        cut = true;
+    }
+    const room = bufflen - ("[string \"".len + "...".len + "\"]".len + 1);
+    if (text.len >= room) cut = true;
     const piece = text[0..@min(text.len, room)];
-    const suffix: []const u8 = if (piece.len == text.len) "\"]" else "...\"]";
+    const suffix: []const u8 = if (cut) "...\"]" else "\"]";
     const prefix = "[string \"";
     @memcpy(buffer[0..prefix.len], prefix);
     @memcpy(buffer[prefix.len .. prefix.len + piece.len], piece);
@@ -178,6 +205,14 @@ const ExecState = struct {
     thrown_error: ?Value = null,
     steps_left: usize = 1_000_000,
     error_offset: ?u32 = null,
+    /// Set by the two places that turn a syntactic call into a native call and
+    /// read by `invokeNativeValues`, which folds them into the frame it pushes.
+    /// Anything else that reaches a native — `pcall`'s argument, a metamethod,
+    /// a generic `for` iterator — leaves them false, which is when the
+    /// reference's `lua_getinfo` finds no name and `pushglobalfuncname` supplies
+    /// the qualified one instead.
+    pending_from_call_site: bool = false,
+    pending_method: ?[]const u8 = null,
     /// The coroutine this state belongs to, once `create` or `init` links it.
     coroutine: ?*Coroutine = null,
 };
@@ -282,8 +317,15 @@ pub const VM = struct {
     owned_tables: std.ArrayList(*Table) = .empty,
     owned_files: std.ArrayList(*FileHandle) = .empty,
     file_metatable: ?*Table = null,
+    /// `io.stdin`/`io.stdout`/`io.stderr` and the current default files are
+    /// the same objects at the start, but `io.input`/`io.output` move only
+    /// the defaults, so the two are cached apart
     default_input: ?*Table = null,
     default_output: ?*Table = null,
+    default_error: ?*Table = null,
+    stdin_cache: ?*Table = null,
+    stdout_cache: ?*Table = null,
+    stderr_cache: ?*Table = null,
     owned_functions: std.ArrayList(*@import("Value.zig").Function) = .empty,
     owned_frames: std.ArrayList(Frame) = .empty,
     owned_captures: std.ArrayList([]*@import("Value.zig").Cell) = .empty,
@@ -292,6 +334,8 @@ pub const VM = struct {
     /// dispatches on `native` and never looks at this.
     wrapper_body: Ast.FunctionBody = undefined,
     number_buffer: [64]u8 = undefined,
+    text_scratch: [8][64]u8 = undefined,
+    text_scratch_slot: u3 = 0,
     rng_state: [4]u64 = seedRandomState(0x6c75616c697465, 0x72616e646f6d),
     gc_stopped: bool = false,
     gc_pending: bool = false,
@@ -829,6 +873,8 @@ pub const VM = struct {
             defer vm.allocator.free(arguments);
             arguments[0] = receiver;
             @memcpy(arguments[1..], explicit_values);
+            vm.exec.pending_from_call_site = true;
+            vm.exec.pending_method = method.name;
             break :blk try vm.invokeCallableValues(method_value, arguments);
         } else blk: {
             const function = try vm.eval(call.expression);
@@ -837,6 +883,8 @@ pub const VM = struct {
                 var description_buffer: [192]u8 = undefined;
                 return vm.callFailure(function, vm.operandDescription(call.expression, &description_buffer));
             }
+            vm.exec.pending_from_call_site = true;
+            vm.exec.pending_method = null;
             break :blk try vm.invokeCallableValues(function, explicit_values);
         };
         return callable;
@@ -857,6 +905,8 @@ pub const VM = struct {
                 const description = std.fmt.bufPrint(&description_buffer, " (method '{s}')", .{method.name}) catch "";
                 return vm.callFailure(method_value, description);
             }
+            vm.exec.pending_from_call_site = true;
+            vm.exec.pending_method = method.name;
             break :blk try vm.invokeCallableValues(method_value, &.{ receiver, argument });
         } else blk: {
             const function = try vm.eval(call.expression);
@@ -865,6 +915,8 @@ pub const VM = struct {
                 var description_buffer: [192]u8 = undefined;
                 return vm.callFailure(function, vm.operandDescription(call.expression, &description_buffer));
             }
+            vm.exec.pending_from_call_site = true;
+            vm.exec.pending_method = null;
             break :blk try vm.invokeCallableValues(function, &.{argument});
         };
         defer vm.allocator.free(results);
@@ -872,7 +924,14 @@ pub const VM = struct {
     }
 
     fn protectedCall(vm: *VM, args: []const Value, has_handler: bool) Error![]Value {
-        if (args.len < (if (has_handler) @as(usize, 2) else 1)) return error.RuntimeError;
+        const short: []const u8 = if (has_handler) "xpcall" else "pcall";
+        if (has_handler) {
+            // `luaB_xpcall` reads the handler before it looks at the function
+            _ = try vm.checkFunction(args, 2, short, short);
+        } else {
+            // `luaB_pcall` refuses a call with nothing at all to call
+            try vm.checkAny(args, 1, short, short);
+        }
         const function = args[0];
         const handler = if (has_handler) args[1] else .nil;
         const call_args = args[if (has_handler) 2 else 1..];
@@ -911,12 +970,32 @@ pub const VM = struct {
         return values;
     }
 
+    /// How the call reached the native: carried from the syntactic call site,
+    /// if there was one, to the frame the native pushes. `luaL_argerror` reads
+    /// the same two facts off the calling instruction.
+    const CallSite = struct {
+        from_call_site: bool = false,
+        method: ?[]const u8 = null,
+    };
+
     fn invokeCallableValues(vm: *VM, callable: Value, args: []const Value) Error![]Value {
         return vm.invokeCallableDepth(callable, args, 0);
     }
 
     fn invokeCallableDepth(vm: *VM, callable: Value, args: []const Value, depth: usize) Error![]Value {
         if (depth >= 200) return error.RuntimeError;
+        // Whatever wrote `pending_*` intended it for this call and nothing
+        // deeper, so it is taken here and handed down explicitly.
+        const site: CallSite = .{
+            .from_call_site = vm.exec.pending_from_call_site,
+            .method = vm.exec.pending_method,
+        };
+        vm.exec.pending_from_call_site = false;
+        vm.exec.pending_method = null;
+        return vm.invokeCallableInfo(callable, args, depth, site);
+    }
+
+    fn invokeCallableInfo(vm: *VM, callable: Value, args: []const Value, depth: usize, site: CallSite) Error![]Value {
         return switch (callable) {
             .function => |function| blk: {
                 // `coroutine.wrap`'s value runs its native with the thread
@@ -926,11 +1005,11 @@ pub const VM = struct {
                     defer vm.allocator.free(arguments);
                     arguments[0] = function.bound;
                     @memcpy(arguments[1..], args);
-                    break :blk try vm.invokeNativeValues(native, arguments);
+                    break :blk try vm.invokeNativeValues(native, arguments, site);
                 }
                 break :blk try vm.invokeValues(function, args);
             },
-            .native_function => |function| vm.invokeNativeValues(function, args),
+            .native_function => |function| vm.invokeNativeValues(function, args, site),
             .table => |table| blk: {
                 const method = try vm.metamethod(table, "__call");
                 if (method == .nil) return vm.raisePlain("attempt to call a {s} value", .{callable.typeName()});
@@ -938,17 +1017,22 @@ pub const VM = struct {
                 defer vm.allocator.free(arguments);
                 arguments[0] = callable;
                 @memcpy(arguments[1..], args);
-                break :blk try vm.invokeCallableDepth(method, arguments, depth + 1);
+                break :blk try vm.invokeCallableInfo(method, arguments, depth + 1, site);
             },
             else => return vm.raisePlain("attempt to call a {s} value", .{callable.typeName()}),
         };
     }
 
-    fn invokeNativeValues(vm: *VM, function: ValueModule.NativeFunction, args: []const Value) Error![]Value {
+    fn invokeNativeValues(vm: *VM, function: ValueModule.NativeFunction, args: []const Value, site: CallSite) Error![]Value {
         // Natives get a position-less frame so that `error` levels count them,
         // the way the reference counts C calls: asking for a level that lands
         // on a native yields no position rather than the Lua frame below it.
-        vm.exec.error_frames.append(vm.allocator, .{ .program = null, .call_offset = vm.exec.error_offset }) catch return error.OutOfMemory;
+        vm.exec.error_frames.append(vm.allocator, .{
+            .program = null,
+            .call_offset = vm.exec.error_offset,
+            .from_call_site = site.from_call_site,
+            .method = site.method,
+        }) catch return error.OutOfMemory;
         defer _ = vm.exec.error_frames.pop();
         switch (function) {
             .base_print => return vm.basePrint(args),
@@ -972,32 +1056,33 @@ pub const VM = struct {
             .base_warn => return vm.baseWarn(args),
             .base_collectgarbage => return vm.baseCollectGarbage(args),
             .pairs, .ipairs => {
-                if (args.len < 1) return error.RuntimeError;
-                if (args[0] != .table) return error.RuntimeError;
+                // `luaL_checkany` only: a number or a string is handed to the
+                // iterator, which is where it gets refused
+                try vm.checkAny(args, 1, if (function == .pairs) "pairs" else "ipairs", if (function == .pairs) "pairs" else "ipairs");
                 if (function == .pairs) {
-                    const method = try vm.metamethod(args[0].table, "__pairs");
+                    const method = if (args[0] == .table) try vm.metamethod(args[0].table, "__pairs") else try vm.valueMetamethod(args[0], "__pairs");
                     if (method != .nil) return vm.invokeCallableValues(method, &.{args[0]});
                 }
                 const iterator: Value = .{ .native_function = if (function == .pairs) .next else .ipairs_iterator };
-                return vm.allocator.dupe(Value, &.{ iterator, args[0], .nil }) catch return error.OutOfMemory;
+                // `ipairs` starts its control at integer zero, `pairs` at nil
+                const control: Value = if (function == .ipairs) .{ .number = Number.Number.fromInt(0) } else .nil;
+                return vm.allocator.dupe(Value, &.{ iterator, args[0], control }) catch return error.OutOfMemory;
             },
             .next => {
-                if (args.len == 0 or args[0] != .table) return error.RuntimeError;
+                const table = try vm.checkTable(args, 1, "next", "next");
                 const key = if (args.len == 1 or args[1] == .nil) null else args[1];
-                const pair = args[0].table.next(key);
+                const pair = table.next(key);
                 if (pair) |entry| return vm.allocator.dupe(Value, &.{ entry.key, entry.value }) catch return error.OutOfMemory;
                 return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
             },
             .ipairs_iterator => {
-                if (args.len < 2 or args[0] != .table) return error.RuntimeError;
-                const previous = switch (args[1]) {
-                    .nil => @as(i64, 0),
-                    .number => |number| number.toIntExact() orelse return error.RuntimeError,
-                    else => return error.RuntimeError,
-                };
+                // `ipairsaux`: the index is taken from argument two and the
+                // subject is whatever `lua_geti` was given
+                if (args.len < 1) return error.RuntimeError;
+                const previous: i64 = if (args.len > 1) try intArgument(args[1]) else 0;
                 const index = std.math.add(i64, previous, 1) catch return error.RuntimeError;
                 const key: Value = .{ .number = Number.Number.fromInt(index) };
-                const value = args[0].table.get(key);
+                const value = if (args[0] == .table) args[0].table.get(key) else try vm.getTableIndex(args[0], key);
                 if (value == .nil) return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
                 return vm.allocator.dupe(Value, &.{ key, value }) catch return error.OutOfMemory;
             },
@@ -1025,12 +1110,13 @@ pub const VM = struct {
             .string_pack => return vm.stringPack(args),
             .string_packsize => return vm.stringPackSize(args),
             .string_unpack => return vm.stringUnpack(args),
+            .string_dump => return vm.stringDump(args),
             .utf8_char => return vm.utf8Char(args),
             .utf8_len => return vm.utf8Len(args),
             .utf8_codepoint => return vm.utf8Codepoint(args),
             .utf8_offset => return vm.utf8Offset(args),
             .utf8_codes => return vm.utf8Codes(args),
-            .utf8_codes_iterator => return vm.utf8CodesIterator(args),
+            .utf8_codes_iterator, .utf8_codes_iterator_lax => return vm.utf8CodesIterator(args, function == .utf8_codes_iterator_lax),
             .math_abs => return vm.mathAbs(args),
             .math_floor => return vm.mathRound(args, true),
             .math_ceil => return vm.mathRound(args, false),
@@ -1073,13 +1159,16 @@ pub const VM = struct {
             .io_output => return vm.ioOutput(args),
             .io_read => return vm.ioRead(args),
             .io_tmpfile => return vm.ioTmpFile(args),
+            .io_index => return vm.ioIndex(args),
             .file_read => return vm.fileRead(args),
             .file_write => return vm.fileWrite(args),
             .file_flush => return vm.fileFlush(args),
-            .file_close => return vm.fileClose(args),
+            .file_close => return vm.fileClose(args, "?"),
             .file_seek => return vm.fileSeek(args),
             .file_lines => return vm.fileLines(args),
+            .file_setvbuf => return vm.fileSetvbuf(args),
             .file_lines_iterator => return vm.fileLinesIterator(args),
+            .file_tostring => return vm.fileToString(args),
             .coroutine_create => return vm.coroutineCreate(args),
             .coroutine_resume => return vm.coroutineResume(args),
             .coroutine_yield => return vm.coroutineYield(args),
@@ -1375,17 +1464,19 @@ pub const VM = struct {
     }
 
     fn stringLen(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 1 or args[0] != .string) return error.RuntimeError;
-        const len = std.math.cast(i64, args[0].string.slice().len) orelse return error.RuntimeError;
+        // `luaL_checklstring` reads a number as the string it writes out
+        const bytes = try vm.checkString(args, 1, "len", "string.len");
+        const len = std.math.cast(i64, bytes.len) orelse return error.RuntimeError;
         return vm.allocator.dupe(Value, &.{.{ .number = Number.Number.fromInt(len) }}) catch return error.OutOfMemory;
     }
 
     fn stringSub(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 2 or args[0] != .string) return error.RuntimeError;
-        const bytes = args[0].string.slice();
+        const short = "sub";
+        const long = "string.sub";
+        const bytes = try vm.checkString(args, 1, short, long);
         const len = std.math.cast(i64, bytes.len) orelse return error.RuntimeError;
-        const raw_first = try intArgument(args[1]);
-        const raw_last = if (args.len == 3) try intArgument(args[2]) else -1;
+        const raw_first = try vm.checkInteger(args, 2, short, long);
+        const raw_last = try vm.optInteger(args, 3, -1, short, long);
         const first = relativeStringIndex(raw_first, len);
         const last = relativeStringIndex(raw_last, len);
         if (first > last or first > len or last < 1) {
@@ -1405,16 +1496,17 @@ pub const VM = struct {
     }
 
     fn stringRep(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 2 or args[0] != .string) return error.RuntimeError;
-        const count = try intArgument(args[1]);
-        if (count < 0) return error.RuntimeError;
-        const separator = if (args.len == 3) switch (args[2]) {
-            .string => |string| string.slice(),
-            else => return error.RuntimeError,
-        } else "";
+        const short = "rep";
+        const long = "string.rep";
+        const bytes = try vm.checkString(args, 1, short, long);
+        const count = try vm.checkInteger(args, 2, short, long);
+        const separator = try vm.optString(args, 3, "", short, long);
+        if (count <= 0) {
+            const empty = vm.interner.intern("") catch return error.OutOfMemory;
+            return vm.allocator.dupe(Value, &.{.{ .string = empty }}) catch return error.OutOfMemory;
+        }
         var output: std.ArrayList(u8) = .empty;
         defer output.deinit(vm.allocator);
-        const bytes = args[0].string.slice();
         var i: i64 = 0;
         while (i < count) : (i += 1) {
             try vm.tick();
@@ -1426,8 +1518,7 @@ pub const VM = struct {
     }
 
     fn stringReverse(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 1 or args[0] != .string) return error.RuntimeError;
-        const bytes = args[0].string.slice();
+        const bytes = try vm.checkString(args, 1, "reverse", "string.reverse");
         const reversed = vm.allocator.alloc(u8, bytes.len) catch return error.OutOfMemory;
         defer vm.allocator.free(reversed);
         for (bytes, 0..) |byte, i| reversed[bytes.len - i - 1] = byte;
@@ -1436,8 +1527,8 @@ pub const VM = struct {
     }
 
     fn stringCase(vm: *VM, args: []const Value, uppercase: bool) Error![]Value {
-        if (args.len < 1 or args[0] != .string) return error.RuntimeError;
-        const bytes = args[0].string.slice();
+        const name: []const u8 = if (uppercase) "upper" else "lower";
+        const bytes = try vm.checkString(args, 1, name, if (uppercase) "string.upper" else "string.lower");
         const changed = vm.allocator.dupe(u8, bytes) catch return error.OutOfMemory;
         defer vm.allocator.free(changed);
         for (changed) |*byte| byte.* = if (uppercase) std.ascii.toUpper(byte.*) else std.ascii.toLower(byte.*);
@@ -1446,11 +1537,12 @@ pub const VM = struct {
     }
 
     fn stringByte(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len == 0 or args[0] != .string) return error.RuntimeError;
-        const bytes = args[0].string.slice();
+        const short = "byte";
+        const long = "string.byte";
+        const bytes = try vm.checkString(args, 1, short, long);
         const len = std.math.cast(i64, bytes.len) orelse return error.RuntimeError;
-        const raw_first = if (args.len > 1) try intArgument(args[1]) else 1;
-        const raw_last = if (args.len > 2) try intArgument(args[2]) else raw_first;
+        const raw_first = try vm.optInteger(args, 2, 1, short, long);
+        const raw_last = try vm.optInteger(args, 3, raw_first, short, long);
         const first = relativeStringIndex(raw_first, len);
         const last = relativeStringIndex(raw_last, len);
         if (first > last or first > len or last < 1) return vm.allocator.alloc(Value, 0) catch return error.OutOfMemory;
@@ -1464,11 +1556,16 @@ pub const VM = struct {
     }
 
     fn stringChar(vm: *VM, args: []const Value) Error![]Value {
+        const short = "char";
+        const long = "string.char";
         const bytes = vm.allocator.alloc(u8, args.len) catch return error.OutOfMemory;
         defer vm.allocator.free(bytes);
-        for (args, 0..) |arg, i| {
-            const code = try intArgument(arg);
-            if (code < 0 or code > 255) return error.RuntimeError;
+        for (args, 0..) |_, i| {
+            const code = try vm.checkInteger(args, i + 1, short, long);
+            // `luaL_argcheck` after the cast to an unsigned, so a negative
+            // argument lands on the same refusal as one past 255
+            const unsigned: u64 = @bitCast(@as(i64, code));
+            if (unsigned > 255) return vm.raiseArgument(i + 1, short, long, "value out of range", .{});
             bytes[i] = @intCast(code);
         }
         const string = vm.interner.intern(bytes) catch return error.OutOfMemory;
@@ -1476,13 +1573,16 @@ pub const VM = struct {
     }
 
     fn stringFind(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 2 or args[0] != .string or args[1] != .string) return error.RuntimeError;
-        const source = args[0].string.slice();
-        const pattern = args[1].string.slice();
+        const short = "find";
+        const long = "string.find";
+        const source = try vm.checkString(args, 1, short, long);
+        const pattern = try vm.checkString(args, 2, short, long);
         const source_len = std.math.cast(i64, source.len) orelse return error.RuntimeError;
-        const raw_init = if (args.len > 2) try intArgument(args[2]) else 1;
+        const raw_init = try vm.optInteger(args, 3, 1, short, long);
         const start_index = if (raw_init < 0) @max(1, @addWithOverflow(raw_init, source_len + 1)[0]) else raw_init;
-        const plain = args.len > 3 and args[3] == .boolean and args[3].boolean;
+        // a fourth argument is taken as plain whatever it is, the way
+        // `lua_toboolean` reads it
+        const plain = args.len > 3 and args[3] != .nil and (args[3] != .boolean or args[3].boolean);
         const start: usize = @intCast(@min(@max(start_index, 1) - 1, source_len));
         if (start_index <= source_len + 1) {
             const found = if (plain) blk: {
@@ -1503,18 +1603,22 @@ pub const VM = struct {
                 return values;
             }
         }
-        return vm.allocator.dupe(Value, &.{.{ .boolean = false }}) catch return error.OutOfMemory;
+        // no match is a nil rather than a false, which is what `find` hands
+        // back — `match` is written the same way further down
+        return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
     }
 
     fn stringMatch(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 2 or args[0] != .string or args[1] != .string) return error.RuntimeError;
-        const source = args[0].string.slice();
+        const short = "match";
+        const long = "string.match";
+        const source = try vm.checkString(args, 1, short, long);
+        const pattern = try vm.checkString(args, 2, short, long);
         const len = std.math.cast(i64, source.len) orelse return error.RuntimeError;
-        const raw_init = if (args.len == 3) try intArgument(args[2]) else 1;
+        const raw_init = try vm.optInteger(args, 3, 1, short, long);
         const start_index = if (raw_init < 0) @max(1, @addWithOverflow(raw_init, len + 1)[0]) else raw_init;
         if (start_index > len + 1) return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
         const start: usize = @intCast(@min(@max(start_index, 1) - 1, len));
-        const result = Pattern.find(source, args[1].string.slice(), start) catch return error.RuntimeError;
+        const result = Pattern.find(source, pattern, start) catch return error.RuntimeError;
         const found = result orelse return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
         if (found.capture_count == 0) {
             const matched = vm.interner.intern(source[found.start..found.end]) catch return error.OutOfMemory;
@@ -1525,17 +1629,35 @@ pub const VM = struct {
         return values;
     }
 
+    /// `string.gmatch` hands back one stateful closure, not the three values a
+    /// generic for would rather have: the state rides in the closure's `bound`
+    /// the same way `coroutine.wrap` carries its thread, so `it()` with no
+    /// arguments works and the for-loop's own state and control values are
+    /// passed through and ignored.
     fn stringGmatch(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 2 or args[0] != .string or args[1] != .string) return error.RuntimeError;
+        const short = "gmatch";
+        const long = "string.gmatch";
+        const source = vm.interner.intern(try vm.checkString(args, 1, short, long)) catch return error.OutOfMemory;
+        const pattern = vm.interner.intern(try vm.checkString(args, 2, short, long)) catch return error.OutOfMemory;
         const state = try vm.newTable();
-        try vm.setStringField(state, "source", args[0]);
-        try vm.setStringField(state, "pattern", args[1]);
+        try vm.setStringField(state, "source", .{ .string = source });
+        try vm.setStringField(state, "pattern", .{ .string = pattern });
         try vm.setStringField(state, "position", .{ .number = Number.Number.fromInt(0) });
-        return vm.allocator.dupe(Value, &.{ .{ .native_function = .string_gmatch_iterator }, .{ .table = state }, .nil }) catch return error.OutOfMemory;
+        const function = vm.tracker.alloc(ValueModule.Function, .function) catch return error.OutOfMemory;
+        errdefer vm.tracker.free(function);
+        function.semantics = vm.exec.semantics;
+        function.body = &vm.wrapper_body;
+        function.function_index = 0;
+        function.captures = &.{};
+        function.environment = vm.exec.active_environment;
+        function.native = .string_gmatch_iterator;
+        function.bound = .{ .table = state };
+        vm.owned_functions.append(vm.allocator, function) catch return error.OutOfMemory;
+        return vm.allocator.dupe(Value, &.{.{ .function = function }}) catch return error.OutOfMemory;
     }
 
     fn stringGmatchIterator(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 2 or args[0] != .table) return error.RuntimeError;
+        if (args.len < 1 or args[0] != .table) return error.RuntimeError;
         const state = args[0].table;
         const source_value = try vm.getStringField(state, "source");
         const pattern_value = try vm.getStringField(state, "pattern");
@@ -1558,10 +1680,20 @@ pub const VM = struct {
     }
 
     fn stringGsub(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 3 or args[0] != .string or args[1] != .string) return error.RuntimeError;
-        const source = args[0].string.slice();
-        const pattern = args[1].string.slice();
-        const max_replacements = if (args.len == 4) @max(0, try intArgument(args[3])) else std.math.maxInt(i64);
+        const short = "gsub";
+        const long = "string.gsub";
+        // interned so that reading the replacement cannot disturb the bytes
+        const held_source = vm.interner.intern(try vm.checkString(args, 1, short, long)) catch return error.OutOfMemory;
+        const held_pattern = vm.interner.intern(try vm.checkString(args, 2, short, long)) catch return error.OutOfMemory;
+        const source = held_source.slice();
+        const pattern = held_pattern.slice();
+        // the replacement is checked up front, before any matching happens
+        const replacement = if (args.len >= 3) args[2] else return vm.typeError(3, short, long, "string/function/table", null);
+        switch (replacement) {
+            .string, .number, .function, .native_function, .table => {},
+            else => return vm.typeError(3, short, long, "string/function/table", replacement),
+        }
+        const max_replacements = try vm.optInteger(args, 4, @as(i64, std.math.cast(i64, source.len) orelse return error.RuntimeError) + 1, short, long);
         var output: std.ArrayList(u8) = .empty;
         defer output.deinit(vm.allocator);
         var search: usize = 0;
@@ -1572,7 +1704,7 @@ pub const VM = struct {
             const found = Pattern.find(source, pattern, search) catch return error.RuntimeError;
             const result = found orelse break;
             output.appendSlice(vm.allocator, source[copied..result.start]) catch return error.OutOfMemory;
-            try vm.appendGsubReplacement(&output, source, result, args[2]);
+            try vm.appendGsubReplacement(&output, source, result, replacement);
             replacements += 1;
             copied = result.end;
             if (result.end == result.start) {
@@ -1597,12 +1729,14 @@ pub const VM = struct {
         const whole = source[result.start..result.end];
         const captures = result.captures[0..result.capture_count];
         if (replacement == .string) return vm.appendGsubTemplate(output, source, result, replacement.string.slice());
+        // a number is written out the way `luaL_addvalue` writes it
+        if (replacement == .number) return vm.appendReplacementValue(output, replacement);
 
         var value: Value = .nil;
         if (replacement == .table) {
             const key = if (captures.len != 0) try vm.patternCapture(source, captures[0]) else Value{ .string = vm.interner.intern(whole) catch return error.OutOfMemory };
             value = try vm.getTableIndex(replacement, key);
-        } else if (replacement == .function or replacement == .native_function or replacement == .table) {
+        } else if (replacement == .function or replacement == .native_function) {
             const call_args = if (captures.len == 0) blk: {
                 const matched = vm.interner.intern(whole) catch return error.OutOfMemory;
                 break :blk &[_]Value{.{ .string = matched }};
@@ -1654,91 +1788,123 @@ pub const VM = struct {
 
     const PackKind = enum { signed, unsigned, float32, float64, fixed_string, zero_string, sized_string, padding, align_only };
     const PackSpec = struct { kind: PackKind, size: usize, alignment: usize, prefix_size: usize = 0 };
+    const PackOption = struct { kind: PackKind, size: usize, control: bool = false };
     const PackFormat = struct {
         source: []const u8,
+        short: []const u8,
+        long: []const u8,
         index: usize = 0,
         little_endian: bool = @import("builtin").cpu.arch.endian() == .little,
+        // `initheader` starts the alignment at one, so nothing is aligned
+        // before a '!' option says otherwise.
         max_alignment: usize = 1,
 
-        fn next(format: *PackFormat) Error!?PackSpec {
-            while (format.index < format.source.len) {
-                const option = format.source[format.index];
+        /// `getnum`: digits are accumulated only while the running value still
+        /// fits, so a longer run is left partly for the next option.
+        fn parseNumber(format: *PackFormat) ?i64 {
+            if (format.index >= format.source.len or !std.ascii.isDigit(format.source[format.index])) return null;
+            var value: i64 = format.source[format.index] - '0';
+            format.index += 1;
+            while (format.index < format.source.len and
+                std.ascii.isDigit(format.source[format.index]) and value <= 214748363)
+            {
+                value = value * 10 + (format.source[format.index] - '0');
                 format.index += 1;
-                switch (option) {
-                    ' ', '\t', '\n', '\r', '\x0b', '\x0c' => continue,
-                    '<' => {
-                        format.little_endian = true;
-                        continue;
-                    },
-                    '>' => {
-                        format.little_endian = false;
-                        continue;
-                    },
-                    '=' => {
-                        format.little_endian = @import("builtin").cpu.arch.endian() == .little;
-                        continue;
-                    },
-                    '!' => {
-                        const alignment = try format.optionalSize(1);
-                        if (alignment == 0 or alignment > 16 or !std.math.isPowerOfTwo(alignment)) return error.RuntimeError;
-                        format.max_alignment = alignment;
-                        continue;
-                    },
-                    'x' => return .{ .kind = .padding, .size = 1, .alignment = 1 },
-                    'X' => {
-                        const aligned = (try format.next()) orelse return error.RuntimeError;
-                        return .{ .kind = .align_only, .size = 0, .alignment = aligned.alignment };
-                    },
-                    'b' => return format.spec(.signed, 1),
-                    'B' => return format.spec(.unsigned, 1),
-                    'h' => return format.spec(.signed, @sizeOf(c_short)),
-                    'H' => return format.spec(.unsigned, @sizeOf(c_short)),
-                    'l' => return format.spec(.signed, @sizeOf(c_long)),
-                    'L' => return format.spec(.unsigned, @sizeOf(c_long)),
-                    'j' => return format.spec(.signed, @sizeOf(i64)),
-                    'J' => return format.spec(.unsigned, @sizeOf(u64)),
-                    'T' => return format.spec(.unsigned, @sizeOf(usize)),
-                    'i' => return format.spec(.signed, try format.optionalSize(@sizeOf(c_int))),
-                    'I' => return format.spec(.unsigned, try format.optionalSize(@sizeOf(c_int))),
-                    'f' => return format.spec(.float32, @sizeOf(f32)),
-                    'd', 'n' => return format.spec(.float64, @sizeOf(f64)),
-                    'c' => return .{ .kind = .fixed_string, .size = try format.requiredSize(), .alignment = 1 },
-                    'z' => return .{ .kind = .zero_string, .size = 0, .alignment = 1 },
-                    's' => {
-                        const prefix = try format.optionalSize(@sizeOf(usize));
-                        if (prefix == 0 or prefix > 16) return error.RuntimeError;
-                        return .{ .kind = .sized_string, .size = 0, .alignment = @min(prefix, format.max_alignment), .prefix_size = prefix };
-                    },
-                    else => return error.RuntimeError,
-                }
+            }
+            return value;
+        }
+
+        /// `getnumlimit`: a size that has to lie in [1, 16].
+        fn limit(format: *PackFormat, vm: *VM, default: i64) Error!usize {
+            const size = format.parseNumber() orelse default;
+            if (size > 16 or size <= 0) return vm.raise("integral size ({d}) out of limits [1,16]", .{size});
+            return @intCast(size);
+        }
+
+        /// `getoption`: exactly one option character, with the side effects a
+        /// header option has. `control` marks the ones that pack nothing.
+        fn option(format: *PackFormat, vm: *VM) Error!PackOption {
+            const option_character = format.source[format.index];
+            format.index += 1;
+            return switch (option_character) {
+                ' ', '\t', '\n', '\r', '\x0b', '\x0c' => .{ .kind = .padding, .size = 0, .control = true },
+                '<' => blk: {
+                    format.little_endian = true;
+                    break :blk .{ .kind = .padding, .size = 0, .control = true };
+                },
+                '>' => blk: {
+                    format.little_endian = false;
+                    break :blk .{ .kind = .padding, .size = 0, .control = true };
+                },
+                '=' => blk: {
+                    format.little_endian = @import("builtin").cpu.arch.endian() == .little;
+                    break :blk .{ .kind = .padding, .size = 0, .control = true };
+                },
+                '!' => blk: {
+                    // `offsetof(struct cD, u)` over `LUAI_MAXALIGN`, whose
+                    // members all ask for eight bytes on this target.
+                    format.max_alignment = try format.limit(vm, @alignOf(c_long));
+                    break :blk .{ .kind = .padding, .size = 0, .control = true };
+                },
+                'x' => .{ .kind = .padding, .size = 1 },
+                'X' => .{ .kind = .align_only, .size = 0 },
+                'b' => .{ .kind = .signed, .size = 1 },
+                'B' => .{ .kind = .unsigned, .size = 1 },
+                'h' => .{ .kind = .signed, .size = @sizeOf(c_short) },
+                'H' => .{ .kind = .unsigned, .size = @sizeOf(c_short) },
+                'l' => .{ .kind = .signed, .size = @sizeOf(c_long) },
+                'L' => .{ .kind = .unsigned, .size = @sizeOf(c_long) },
+                'j' => .{ .kind = .signed, .size = @sizeOf(i64) },
+                'J' => .{ .kind = .unsigned, .size = @sizeOf(u64) },
+                'T' => .{ .kind = .unsigned, .size = @sizeOf(usize) },
+                'i' => .{ .kind = .signed, .size = try format.limit(vm, @sizeOf(c_int)) },
+                'I' => .{ .kind = .unsigned, .size = try format.limit(vm, @sizeOf(c_int)) },
+                'f' => .{ .kind = .float32, .size = @sizeOf(f32) },
+                'd', 'n' => .{ .kind = .float64, .size = @sizeOf(f64) },
+                // the size of 's' is the length prefix, of 'c' the string length
+                'c' => .{
+                    .kind = .fixed_string,
+                    .size = @intCast(format.parseNumber() orelse return vm.raise("missing size for format option 'c'", .{})),
+                },
+                'z' => .{ .kind = .zero_string, .size = 0 },
+                's' => .{ .kind = .sized_string, .size = try format.limit(vm, @sizeOf(usize)) },
+                else => return vm.raise("invalid format option '{c}'", .{option_character}),
+            };
+        }
+
+        /// `getdetails`: one option plus the padding it asks for.
+        fn next(format: *PackFormat, vm: *VM) Error!?PackSpec {
+            while (format.index < format.source.len) {
+                const choice = try format.option(vm);
+                if (choice.control) continue;
+                const raw_alignment = if (choice.kind == .align_only) blk: {
+                    // 'X' takes its alignment from the option that follows it
+                    if (format.index >= format.source.len)
+                        return vm.raiseArgument(1, format.short, format.long, "invalid next option for option 'X'", .{});
+                    const followed = try format.option(vm);
+                    if (followed.control or followed.size == 0 or followed.kind == .fixed_string)
+                        return vm.raiseArgument(1, format.short, format.long, "invalid next option for option 'X'", .{});
+                    break :blk followed.size;
+                } else choice.size;
+                return .{
+                    .kind = choice.kind,
+                    .size = choice.size,
+                    .prefix_size = if (choice.kind == .sized_string) choice.size else 0,
+                    .alignment = try format.alignedSize(vm, choice.kind, raw_alignment),
+                };
             }
             return null;
         }
 
-        fn spec(format: *PackFormat, kind: PackKind, size: usize) Error!?PackSpec {
-            if (size == 0 or size > 16) return error.RuntimeError;
-            return .{ .kind = kind, .size = size, .alignment = @min(size, format.max_alignment) };
-        }
-
-        fn optionalSize(format: *PackFormat, default: usize) Error!usize {
-            if (format.index >= format.source.len or !std.ascii.isDigit(format.source[format.index])) return default;
-            return format.parseSize();
-        }
-
-        fn requiredSize(format: *PackFormat) Error!usize {
-            if (format.index >= format.source.len or !std.ascii.isDigit(format.source[format.index])) return error.RuntimeError;
-            return format.parseSize();
-        }
-
-        fn parseSize(format: *PackFormat) Error!usize {
-            var size: usize = 0;
-            while (format.index < format.source.len and std.ascii.isDigit(format.source[format.index])) : (format.index += 1) {
-                size = std.math.mul(usize, size, 10) catch return error.RuntimeError;
-                size = std.math.add(usize, size, format.source[format.index] - '0') catch return error.RuntimeError;
-                if (size > 16 * 1024 * 1024) return error.RuntimeError;
-            }
-            if (size == 0) return error.RuntimeError;
-            return size;
+        /// `getdetails`'s alignment rules: an option of size one or less, and a
+        /// fixed-size string, never align; anything else is clamped to the
+        /// header's maximum, which has to be a power of two.
+        fn alignedSize(format: *PackFormat, vm: *VM, kind: PackKind, size: usize) Error!usize {
+            if (size <= 1 or kind == .fixed_string) return 1;
+            const clamped = @min(size, format.max_alignment);
+            if (clamped & (clamped - 1) != 0)
+                return vm.raiseArgument(1, format.short, format.long, "format asks for alignment not power of 2", .{});
+            return clamped;
         }
     };
 
@@ -1754,82 +1920,116 @@ pub const VM = struct {
         }
     }
 
-    fn readPackedInteger(bytes: []const u8, position: usize, size: usize, little_endian: bool) u128 {
-        var result: u128 = 0;
+    /// `unpackint`: reads a little- or big-endian integer of `size` bytes,
+    /// sign-extending what it holds, and refusing the ones whose unread bytes
+    /// do not agree with its sign.
+    fn unpackInteger(vm: *VM, bytes: []const u8, position: usize, size: usize, little_endian: bool, signed: bool) Error!i64 {
+        const limit = @min(size, 8);
+        var result: u64 = 0;
+        var index = limit;
+        while (index > 0) {
+            index -= 1;
+            result = (result << 8) | bytes[position + (if (little_endian) index else size - 1 - index)];
+        }
+        if (size < 8) {
+            if (signed) {
+                const mask: u64 = @as(u64, 1) << @intCast(size * 8 - 1);
+                result = (result ^ mask) -% mask;
+            }
+        } else if (size > 8) {
+            const mask: u8 = if (!signed or @as(i64, @bitCast(result)) >= 0) 0 else 0xff;
+            for (limit..size) |i| {
+                if (bytes[position + (if (little_endian) i else size - 1 - i)] != mask)
+                    return vm.raise("{d}-byte integer does not fit into Lua Integer", .{size});
+            }
+        }
+        return @bitCast(result);
+    }
+
+    fn readPackedInteger(bytes: []const u8, position: usize, size: usize, little_endian: bool) u64 {
+        var result: u64 = 0;
         for (0..size) |i| {
             const source = if (little_endian) i else size - i - 1;
-            result |= @as(u128, bytes[position + source]) << @as(u7, @intCast(i * 8));
+            result |= @as(u64, bytes[position + source]) << @intCast(i * 8);
         }
         return result;
     }
 
     fn stringPack(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len == 0 or args[0] != .string) return error.RuntimeError;
-        var format: PackFormat = .{ .source = args[0].string.slice() };
+        const short = "pack";
+        const long = "string.pack";
+        const format_text = try vm.checkString(args, 1, short, long);
+        var format: PackFormat = .{ .source = format_text, .short = short, .long = long };
         var output: std.ArrayList(u8) = .empty;
         defer output.deinit(vm.allocator);
-        var argument_index: usize = 1;
-        while (try format.next()) |spec| {
+        // `str_pack` leaves a nil behind its values to separate them from the
+        // buffer, so a value that was never passed still reads as a nil there
+        const stack = vm.allocator.alloc(Value, args.len + 1) catch return error.OutOfMemory;
+        defer vm.allocator.free(stack);
+        @memcpy(stack[0..args.len], args);
+        stack[args.len] = .nil;
+        // the format is argument one, so the values start at two
+        var argument: usize = 2;
+        while (try format.next(vm)) |spec| {
             const padding = packPadding(output.items.len, spec.alignment);
             try output.appendNTimes(vm.allocator, 0, padding);
             switch (spec.kind) {
                 .padding => try output.appendNTimes(vm.allocator, 0, spec.size),
                 .align_only => {},
-                .signed, .unsigned => {
-                    if (argument_index >= args.len) return error.RuntimeError;
-                    const integer = try intArgument(args[argument_index]);
-                    argument_index += 1;
-                    if (spec.kind == .signed) {
-                        const signed: i128 = integer;
-                        if (spec.size < 16) {
-                            const bits: u7 = @intCast(spec.size * 8);
-                            const minimum = -(@as(i128, 1) << (bits - 1));
-                            const maximum = (@as(i128, 1) << (bits - 1)) - 1;
-                            if (signed < minimum or signed > maximum) return error.RuntimeError;
-                        }
-                        try vm.appendPackedInteger(&output, @bitCast(signed), spec.size, format.little_endian);
-                    } else {
-                        const unsigned: u64 = @bitCast(integer);
-                        if (spec.size < 8 and unsigned >= (@as(u64, 1) << @as(u6, @intCast(spec.size * 8)))) return error.RuntimeError;
-                        try vm.appendPackedInteger(&output, unsigned, spec.size, format.little_endian);
+                .signed => {
+                    const integer = try vm.checkInteger(stack, argument, short, long);
+                    if (spec.size < 8) {
+                        const limit: i128 = @as(i128, 1) << @intCast(spec.size * 8 - 1);
+                        if (integer < -limit or integer >= limit)
+                            return vm.raiseArgument(argument, short, long, "integer overflow", .{});
                     }
+                    try vm.appendPackedInteger(&output, @bitCast(@as(i128, integer)), spec.size, format.little_endian);
+                    argument += 1;
+                },
+                .unsigned => {
+                    const integer = try vm.checkInteger(stack, argument, short, long);
+                    const unsigned: u64 = @bitCast(integer);
+                    if (spec.size < 8 and unsigned >= (@as(u64, 1) << @intCast(spec.size * 8)))
+                        return vm.raiseArgument(argument, short, long, "unsigned overflow", .{});
+                    try vm.appendPackedInteger(&output, unsigned, spec.size, format.little_endian);
+                    argument += 1;
                 },
                 .float32 => {
-                    if (argument_index >= args.len or args[argument_index] != .number) return error.RuntimeError;
-                    argument_index += 1;
-                    const bits: u32 = @bitCast(@as(f32, @floatCast(args[argument_index - 1].number.toFloat())));
+                    const number = try vm.checkNumber(stack, argument, short, long);
+                    const bits: u32 = @bitCast(@as(f32, @floatCast(number.toFloat())));
                     try vm.appendPackedInteger(&output, bits, spec.size, format.little_endian);
+                    argument += 1;
                 },
                 .float64 => {
-                    if (argument_index >= args.len or args[argument_index] != .number) return error.RuntimeError;
-                    argument_index += 1;
-                    const bits: u64 = @bitCast(args[argument_index - 1].number.toFloat());
+                    const number = try vm.checkNumber(stack, argument, short, long);
+                    const bits: u64 = @bitCast(number.toFloat());
                     try vm.appendPackedInteger(&output, bits, spec.size, format.little_endian);
+                    argument += 1;
                 },
                 .fixed_string => {
-                    if (argument_index >= args.len or args[argument_index] != .string) return error.RuntimeError;
-                    const bytes = args[argument_index].string.slice();
-                    argument_index += 1;
-                    if (bytes.len > spec.size) return error.RuntimeError;
+                    const bytes = try vm.checkString(stack, argument, short, long);
+                    if (bytes.len > spec.size)
+                        return vm.raiseArgument(argument, short, long, "string longer than given size", .{});
                     output.appendSlice(vm.allocator, bytes) catch return error.OutOfMemory;
                     try output.appendNTimes(vm.allocator, 0, spec.size - bytes.len);
+                    argument += 1;
                 },
                 .zero_string => {
-                    if (argument_index >= args.len or args[argument_index] != .string) return error.RuntimeError;
-                    const bytes = args[argument_index].string.slice();
-                    argument_index += 1;
-                    if (std.mem.indexOfScalar(u8, bytes, 0) != null) return error.RuntimeError;
+                    const bytes = try vm.checkString(stack, argument, short, long);
+                    if (std.mem.indexOfScalar(u8, bytes, 0) != null)
+                        return vm.raiseArgument(argument, short, long, "string contains zeros", .{});
                     output.appendSlice(vm.allocator, bytes) catch return error.OutOfMemory;
                     output.append(vm.allocator, 0) catch return error.OutOfMemory;
+                    argument += 1;
                 },
                 .sized_string => {
-                    if (argument_index >= args.len or args[argument_index] != .string) return error.RuntimeError;
-                    const bytes = args[argument_index].string.slice();
-                    argument_index += 1;
+                    const bytes = try vm.checkString(stack, argument, short, long);
                     const length: u128 = bytes.len;
-                    if (spec.prefix_size < 16 and length >= (@as(u128, 1) << @as(u7, @intCast(spec.prefix_size * 8)))) return error.RuntimeError;
+                    if (spec.prefix_size < 8 and length >= (@as(u128, 1) << @intCast(spec.prefix_size * 8)))
+                        return vm.raiseArgument(argument, short, long, "string length does not fit in given size", .{});
                     try vm.appendPackedInteger(&output, length, spec.prefix_size, format.little_endian);
                     output.appendSlice(vm.allocator, bytes) catch return error.OutOfMemory;
+                    argument += 1;
                 },
             }
         }
@@ -1838,106 +2038,119 @@ pub const VM = struct {
     }
 
     fn stringPackSize(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 1 or args[0] != .string) return error.RuntimeError;
-        var format: PackFormat = .{ .source = args[0].string.slice() };
+        const short = "packsize";
+        const long = "string.packsize";
+        const format_text = try vm.checkString(args, 1, short, long);
+        var format: PackFormat = .{ .source = format_text, .short = short, .long = long };
         var size: usize = 0;
-        while (try format.next()) |spec| {
-            if (spec.kind == .zero_string or spec.kind == .sized_string) return error.RuntimeError;
-            size = std.math.add(usize, size, packPadding(size, spec.alignment)) catch return error.RuntimeError;
-            size = std.math.add(usize, size, spec.size) catch return error.RuntimeError;
+        while (try format.next(vm)) |spec| {
+            if (spec.kind == .zero_string or spec.kind == .sized_string)
+                return vm.raiseArgument(1, short, long, "variable-length format", .{});
+            size += packPadding(size, spec.alignment) + spec.size;
+            if (size > std.math.maxInt(i32)) return vm.raiseArgument(1, short, long, "format result too large", .{});
         }
-        return vm.singleNumber(Number.Number.fromInt(std.math.cast(i64, size) orelse return error.RuntimeError));
+        return vm.singleNumber(Number.Number.fromInt(@intCast(size)));
     }
 
     fn stringUnpack(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 2 or args[0] != .string or args[1] != .string) return error.RuntimeError;
-        const format_text = args[0].string.slice();
-        const bytes = args[1].string.slice();
-        const raw_position = if (args.len == 3) try intArgument(args[2]) else 1;
-        const position: usize = if (raw_position > 0)
-            std.math.cast(usize, raw_position - 1) orelse return error.RuntimeError
-        else if (raw_position < 0)
-            std.math.cast(usize, @as(i128, @intCast(bytes.len)) + raw_position) orelse return error.RuntimeError
+        const short = "unpack";
+        const long = "string.unpack";
+        const format_text = try vm.checkString(args, 1, short, long);
+        const bytes = try vm.checkString(args, 2, short, long);
+        // `posrelatI`: a positive position is itself, zero is one, and a
+        // negative one counts back from the end but is clipped to one.
+        const raw_position = try vm.optInteger(args, 3, 1, short, long);
+        const length: i64 = std.math.cast(i64, bytes.len) orelse return error.RuntimeError;
+        const position: i64 = if (raw_position > 0)
+            raw_position
+        else if (raw_position == 0)
+            1
+        else if (raw_position < -length)
+            1
         else
-            return error.RuntimeError;
-        if (position > bytes.len) return error.RuntimeError;
-        var cursor = position;
-        var format: PackFormat = .{ .source = format_text };
+            length + raw_position + 1;
+        if (position - 1 > length) return vm.raiseArgument(3, short, long, "initial position out of string", .{});
+        var cursor: usize = @intCast(position - 1);
+        var format: PackFormat = .{ .source = format_text, .short = short, .long = long };
         var values: std.ArrayList(Value) = .empty;
         defer values.deinit(vm.allocator);
-        while (try format.next()) |spec| {
-            cursor = std.math.add(usize, cursor, packPadding(cursor, spec.alignment)) catch return error.RuntimeError;
-            if (spec.kind == .padding) {
-                cursor = std.math.add(usize, cursor, spec.size) catch return error.RuntimeError;
-                if (cursor > bytes.len) return error.RuntimeError;
-                continue;
-            }
-            if (spec.kind == .align_only) continue;
+        while (try format.next(vm)) |spec| {
+            const padding_offset = packPadding(cursor, spec.alignment);
+            if (padding_offset + spec.size > bytes.len - cursor)
+                return vm.raiseArgument(2, short, long, "data string too short", .{});
+            cursor += padding_offset;
             switch (spec.kind) {
                 .signed, .unsigned => {
-                    if (spec.size > bytes.len -| cursor) return error.RuntimeError;
-                    const bits = readPackedInteger(bytes, cursor, spec.size, format.little_endian);
+                    const integer = try unpackInteger(vm, bytes, cursor, spec.size, format.little_endian, spec.kind == .signed);
+                    try values.append(vm.allocator, .{ .number = Number.Number.fromInt(integer) });
                     cursor += spec.size;
-                    if (spec.kind == .signed) {
-                        var signed_bits = bits;
-                        const sign_shift: u7 = @intCast(spec.size * 8 - 1);
-                        if ((bits & (@as(u128, 1) << sign_shift)) != 0 and spec.size < 16) signed_bits |= @as(u128, std.math.maxInt(u128)) << @as(u7, @intCast(spec.size * 8));
-                        const signed: i128 = @bitCast(signed_bits);
-                        if (signed < std.math.minInt(i64) or signed > std.math.maxInt(i64)) return error.RuntimeError;
-                        try values.append(vm.allocator, .{ .number = Number.Number.fromInt(@intCast(signed)) });
-                    } else {
-                        if (bits > std.math.maxInt(i64)) return error.RuntimeError;
-                        try values.append(vm.allocator, .{ .number = Number.Number.fromInt(@intCast(bits)) });
-                    }
                 },
                 .float32 => {
-                    if (spec.size > bytes.len -| cursor) return error.RuntimeError;
                     const bits: u32 = @truncate(readPackedInteger(bytes, cursor, spec.size, format.little_endian));
-                    cursor += spec.size;
                     try values.append(vm.allocator, .{ .number = Number.Number.fromFloat(@as(f64, @floatCast(@as(f32, @bitCast(bits))))) });
+                    cursor += spec.size;
                 },
                 .float64 => {
-                    if (spec.size > bytes.len -| cursor) return error.RuntimeError;
-                    const bits: u64 = @truncate(readPackedInteger(bytes, cursor, spec.size, format.little_endian));
-                    cursor += spec.size;
+                    const bits = readPackedInteger(bytes, cursor, spec.size, format.little_endian);
                     try values.append(vm.allocator, .{ .number = Number.Number.fromFloat(@bitCast(bits)) });
+                    cursor += spec.size;
                 },
                 .fixed_string => {
-                    if (spec.size > bytes.len -| cursor) return error.RuntimeError;
                     const string = vm.interner.intern(bytes[cursor .. cursor + spec.size]) catch return error.OutOfMemory;
                     try values.append(vm.allocator, .{ .string = string });
                     cursor += spec.size;
                 },
                 .zero_string => {
-                    const end = std.mem.indexOfScalarPos(u8, bytes, cursor, 0) orelse return error.RuntimeError;
+                    const end = std.mem.indexOfScalarPos(u8, bytes, cursor, 0) orelse
+                        return vm.raiseArgument(2, short, long, "unfinished string for format 'z'", .{});
                     const string = vm.interner.intern(bytes[cursor..end]) catch return error.OutOfMemory;
                     try values.append(vm.allocator, .{ .string = string });
                     cursor = end + 1;
                 },
                 .sized_string => {
-                    if (spec.prefix_size > bytes.len -| cursor) return error.RuntimeError;
-                    const length = readPackedInteger(bytes, cursor, spec.prefix_size, format.little_endian);
-                    cursor += spec.prefix_size;
-                    if (length > bytes.len -| cursor) return error.RuntimeError;
-                    const len: usize = @intCast(length);
-                    const string = vm.interner.intern(bytes[cursor .. cursor + len]) catch return error.OutOfMemory;
+                    const prefix = try unpackInteger(vm, bytes, cursor, spec.prefix_size, format.little_endian, false);
+                    const available = bytes.len - cursor - spec.prefix_size;
+                    if (prefix < 0 or @as(u64, @bitCast(prefix)) > available)
+                        return vm.raiseArgument(2, short, long, "data string too short", .{});
+                    const len: usize = @intCast(prefix);
+                    const start = cursor + spec.prefix_size;
+                    const string = vm.interner.intern(bytes[start .. start + len]) catch return error.OutOfMemory;
                     try values.append(vm.allocator, .{ .string = string });
-                    cursor += len;
+                    cursor = start + len;
                 },
-                .padding => unreachable,
-                .align_only => unreachable,
+                .padding => {
+                    cursor += spec.size;
+                },
+                .align_only => {},
             }
         }
-        try values.append(vm.allocator, .{ .number = Number.Number.fromInt(std.math.cast(i64, cursor + 1) orelse return error.RuntimeError) });
+        try values.append(vm.allocator, .{ .number = Number.Number.fromInt(@intCast(cursor + 1)) });
         return vm.allocator.dupe(Value, values.items) catch return error.OutOfMemory;
     }
 
+    /// `str_dump`. The reference refuses a C function with "unable to dump
+    /// given function" and otherwise writes a bytecode prelude; lualite has
+    /// no bytecode writer, so every function — a closure or a native one,
+    /// since both pass `luaL_checktype(..., LUA_TFUNCTION)` — meets that same
+    /// refusal. A positioned raise, since `luaL_error` is what reports it.
+    fn stringDump(vm: *VM, args: []const Value) Error![]Value {
+        const short = "dump";
+        const long = "string.dump";
+        if (args.len < 1) return vm.typeError(1, short, long, "function", null);
+        switch (args[0]) {
+            .function, .native_function => return vm.raise("unable to dump given function", .{}),
+            else => return vm.typeError(1, short, long, "function", args[0]),
+        }
+    }
+
     fn stringFormat(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len == 0 or args[0] != .string) return error.RuntimeError;
-        const format = args[0].string.slice();
+        const short = "format";
+        const long = "string.format";
+        const format = try vm.checkString(args, 1, short, long);
         var output: std.ArrayList(u8) = .empty;
         defer output.deinit(vm.allocator);
-        var next_arg: usize = 1;
+        // the format itself is argument one, so the values start at two
+        var consumed: usize = 0;
         var i: usize = 0;
         while (i < format.len) {
             if (format[i] != '%') {
@@ -1945,71 +2158,80 @@ pub const VM = struct {
                 i += 1;
                 continue;
             }
-            const conversion_start = i;
             i += 1;
             if (i < format.len and format[i] == '%') {
                 output.append(vm.allocator, '%') catch return error.OutOfMemory;
                 i += 1;
                 continue;
             }
-            var flags: [8]u8 = undefined;
-            var flag_count: usize = 0;
-            var left = false;
-            while (i < format.len) : (i += 1) switch (format[i]) {
-                '-', '+', ' ', '0', '#' => {
-                    // The reference stops at six flags, the width of its flag set.
-                    if (flag_count == 6) return vm.raise("invalid format (repeated flags)", .{});
-                    if (format[i] == '-') left = true;
-                    flags[flag_count] = format[i];
-                    flag_count += 1;
-                },
-                else => break,
-            };
-            var width: usize = 0;
-            const width_start = i;
-            while (i < format.len and std.ascii.isDigit(format[i])) : (i += 1) {}
-            if (i - width_start > 2) return vm.raise("invalid format (width or precision too long)", .{});
-            if (i > width_start) width = std.fmt.parseInt(usize, format[width_start..i], 10) catch return error.RuntimeError;
-            var precision: ?usize = null;
-            if (i < format.len and format[i] == '.') {
+            // a format item takes its value before it is even looked at
+            const argument = consumed + 2;
+            if (argument > args.len) return vm.raiseArgument(argument, short, long, "no value", .{});
+            consumed += 1;
+            // `getformat`: spans the flags, width and precision, and then takes
+            // the conversion character that follows them.
+            const item_start = i;
+            while (i < format.len and (std.mem.indexOfScalar(u8, "-+#0 ", format[i]) != null or
+                std.ascii.isDigit(format[i]) or format[i] == '.')) i += 1;
+            if (i - item_start >= 21) return vm.raise("invalid format (too long)", .{});
+            const conversion = format[item_start - 1 .. @min(i + 1, format.len)];
+            const specifier: u8 = if (i < format.len) blk: {
+                const specifier = format[i];
                 i += 1;
-                const precision_start = i;
-                while (i < format.len and std.ascii.isDigit(format[i])) : (i += 1) {}
-                if (i - precision_start > 2) return vm.raise("invalid format (width or precision too long)", .{});
-                precision = if (i == precision_start) 0 else std.fmt.parseInt(usize, format[precision_start..i], 10) catch return error.RuntimeError;
-            }
-            const conversion = format[conversion_start..@min(i + 1, format.len)];
-            if (i >= format.len) return vm.raise("invalid conversion '{s}' to 'format'", .{conversion});
-            const specifier = format[i];
-            i += 1;
-            // `checkformat` in lstrlib.c: each conversion accepts a fixed flag
-            // set, and only some take a precision.
-            const allowed_flags: []const u8 = switch (specifier) {
-                'd', 'i' => "-+0 ",
-                'u' => "-0",
-                'o', 'x', 'X' => "-#0",
-                'c', 'p', 's' => "-",
-                'a', 'A', 'f', 'F', 'e', 'E', 'g', 'G' => "-+#0 ",
-                'q' => "",
-                else => return vm.raise("invalid conversion '{s}' to 'format'", .{conversion}),
-            };
-            if (specifier == 'q') {
-                if (conversion.len != 2) return vm.raise("specifier '%q' cannot have modifiers", .{});
-            } else {
-                for (flags[0..flag_count]) |flag| {
-                    if (std.mem.indexOfScalar(u8, allowed_flags, flag) == null)
-                        return vm.raise("invalid conversion specification: '{s}'", .{conversion});
-                }
-                if (precision != null and (specifier == 'c' or specifier == 'p'))
-                    return vm.raise("invalid conversion specification: '{s}'", .{conversion});
-            }
-            if (next_arg >= args.len) return vm.raise("bad argument #{d} to 'format' (no value)", .{next_arg + 1});
-            const value = args[next_arg];
-            next_arg += 1;
+                break :blk specifier;
+            } else 0;
+            const value = args[argument - 1];
             switch (specifier) {
+                'c' => {
+                    try vm.formatCheck(conversion, "-", false);
+                    const integer = try vm.checkInteger(args, argument, short, long);
+                    try vm.appendNumericFormat(&output, .{ .number = Number.Number.fromInt(integer) }, conversion, specifier);
+                },
+                // for the integer conversions `checkformat` comes second, the
+                // way `str_format` reads its argument first
+                'd', 'i' => {
+                    const integer = try vm.checkInteger(args, argument, short, long);
+                    try vm.formatCheck(conversion, "-+0 ", true);
+                    try vm.appendNumericFormat(&output, .{ .number = Number.Number.fromInt(integer) }, conversion, specifier);
+                },
+                'u' => {
+                    const integer = try vm.checkInteger(args, argument, short, long);
+                    try vm.formatCheck(conversion, "-0", true);
+                    try vm.appendNumericFormat(&output, .{ .number = Number.Number.fromInt(integer) }, conversion, specifier);
+                },
+                'o', 'x', 'X' => {
+                    const integer = try vm.checkInteger(args, argument, short, long);
+                    try vm.formatCheck(conversion, "-#0", true);
+                    try vm.appendNumericFormat(&output, .{ .number = Number.Number.fromInt(integer) }, conversion, specifier);
+                },
+                'a', 'A' => {
+                    try vm.formatCheck(conversion, "-+#0 ", true);
+                    const number = try vm.checkNumber(args, argument, short, long);
+                    try vm.appendNumericFormat(&output, .{ .number = number }, conversion, specifier);
+                },
+                'f', 'e', 'E', 'g', 'G' => {
+                    const number = try vm.checkNumber(args, argument, short, long);
+                    try vm.formatCheck(conversion, "-+#0 ", true);
+                    try vm.appendNumericFormat(&output, .{ .number = number }, conversion, specifier);
+                },
+                'p' => {
+                    try vm.formatCheck(conversion, "-", false);
+                    try vm.appendNumericFormat(&output, value, conversion, specifier);
+                },
+                'q' => {
+                    // `addliteral`: strings and numbers have a literal form,
+                    // nil and booleans are written out by `luaL_tolstring`
+                    if (conversion.len != 2) return vm.raise("specifier '%q' cannot have modifiers", .{});
+                    switch (value) {
+                        .string => |string| try vm.appendQuoted(&output, string.slice()),
+                        .number => |number| try vm.appendQuotedNumber(&output, number),
+                        .nil, .boolean => try vm.appendTolstring(&output, value),
+                        else => return vm.raiseArgument(argument, short, long, "value has no literal form", .{}),
+                    }
+                },
                 's' => {
-                    // `%s` accepts anything `tostring` can render, as
-                    // `luaL_tolstring` does for the reference.
+                    // `luaL_tolstring`: a string is used as it is, and anything
+                    // else goes through `tostring`
                     var owned: ?[]Value = null;
                     defer if (owned) |results| vm.allocator.free(results);
                     const bytes = if (value == .string) value.string.slice() else blk: {
@@ -2017,40 +2239,86 @@ pub const VM = struct {
                         owned = results;
                         break :blk results[0].string.slice();
                     };
-                    if (conversion.len > 2 and std.mem.indexOfScalar(u8, bytes, 0) != null)
-                        return vm.raise("bad argument #{d} to 'format' (string contains zeros)", .{next_arg - 1});
-                    const count = @min(bytes.len, precision orelse bytes.len);
-                    try vm.appendFormatField(&output, bytes[0..count], width, left, ' ');
+                    if (conversion.len == 2) {
+                        output.appendSlice(vm.allocator, bytes) catch return error.OutOfMemory;
+                    } else {
+                        if (std.mem.indexOfScalar(u8, bytes, 0) != null)
+                            return vm.raiseArgument(argument, short, long, "string contains zeros", .{});
+                        try vm.formatCheck(conversion, "-", true);
+                        if (std.mem.indexOfScalar(u8, conversion, '.') == null and bytes.len >= 100) {
+                            // no precision and too long a string to format, so
+                            // the reference adds it without applying the width
+                            output.appendSlice(vm.allocator, bytes) catch return error.OutOfMemory;
+                        } else {
+                            const options = sFormat(conversion);
+                            const count = if (options.precision) |precision| @min(bytes.len, precision) else bytes.len;
+                            try vm.appendFormatField(&output, bytes[0..count], options.width, options.left, ' ');
+                        }
+                    }
                 },
-                'q' => switch (value) {
-                    .string => |string| try vm.appendQuoted(&output, string.slice()),
-                    .number => |number| try vm.appendQuotedNumber(&output, number),
-                    .nil => output.appendSlice(vm.allocator, "nil") catch return error.OutOfMemory,
-                    .boolean => |boolean| output.appendSlice(vm.allocator, if (boolean) "true" else "false") catch return error.OutOfMemory,
-                    else => return vm.raise("bad argument #{d} to 'format' (value has no literal form)", .{next_arg - 1}),
-                },
-                'c',
-                'p',
-                'd',
-                'i',
-                'u',
-                'o',
-                'x',
-                'X',
-                'f',
-                'F',
-                'e',
-                'E',
-                'g',
-                'G',
-                'a',
-                'A',
-                => try vm.appendNumericFormat(&output, value, flags[0..flag_count], width, precision, specifier),
                 else => return vm.raise("invalid conversion '{s}' to 'format'", .{conversion}),
             }
         }
         const string = vm.interner.intern(output.items) catch return error.OutOfMemory;
         return vm.allocator.dupe(Value, &.{.{ .string = string }}) catch return error.OutOfMemory;
+    }
+
+    /// `checkformat` in lstrlib.c: a specification is valid when its flags are
+    /// the conversion's own, its width and precision are at most two digits
+    /// each, and what follows them is the conversion character again.
+    fn formatCheck(vm: *VM, form: []const u8, flags: []const u8, precision: bool) Error!void {
+        var index: usize = 1;
+        while (index < form.len and std.mem.indexOfScalar(u8, flags, form[index]) != null) index += 1;
+        if (index < form.len and form[index] != '0') {
+            index = get2digits(form, index);
+            if (index < form.len and form[index] == '.' and precision) {
+                index += 1;
+                index = get2digits(form, index);
+            }
+        }
+        if (index >= form.len or !std.ascii.isAlphabetic(form[index]))
+            return vm.raise("invalid conversion specification: '{s}'", .{form});
+    }
+
+    /// `get2digits`: a width or a precision of at most two digits.
+    fn get2digits(form: []const u8, start: usize) usize {
+        var index = start;
+        if (index < form.len and std.ascii.isDigit(form[index])) index += 1;
+        if (index < form.len and std.ascii.isDigit(form[index])) index += 1;
+        return index;
+    }
+
+    /// The width and precision a `%s` specification asks for, which the
+    /// reference hands to `sprintf` but have to be applied by hand here.
+    fn sFormat(form: []const u8) struct { left: bool, width: usize, precision: ?usize } {
+        var index: usize = 1;
+        var left = false;
+        if (index < form.len and form[index] == '-') {
+            left = true;
+            index += 1;
+        }
+        const width_start = index;
+        while (index < form.len and std.ascii.isDigit(form[index])) index += 1;
+        const width = std.fmt.parseInt(usize, form[width_start..index], 10) catch 0;
+        var precision: ?usize = null;
+        if (index < form.len and form[index] == '.') {
+            index += 1;
+            const precision_start = index;
+            while (index < form.len and std.ascii.isDigit(form[index])) index += 1;
+            precision = std.fmt.parseInt(usize, form[precision_start..index], 10) catch 0;
+        }
+        return .{ .left = left, .width = width, .precision = precision };
+    }
+
+    /// `%q` for the values that reach `luaL_tolstring` without a literal form:
+    /// nil and the two booleans.
+    fn appendTolstring(vm: *VM, output: *std.ArrayList(u8), value: Value) Error!void {
+        const bytes: []const u8 = switch (value) {
+            .nil => "nil",
+            .boolean => |boolean| if (boolean) "true" else "false",
+            else => unreachable,
+        };
+        output.appendSlice(vm.allocator, bytes) catch return error.OutOfMemory;
     }
 
     fn appendFormatField(vm: *VM, output: *std.ArrayList(u8), bytes: []const u8, width: usize, left: bool, fill: u8) Error!void {
@@ -2089,7 +2357,8 @@ pub const VM = struct {
     /// in decimal (their minimum in hex), floats as C hexadecimal floats, and
     /// the infinities and NaN get Lua's spellings.
     fn appendQuotedNumber(vm: *VM, output: *std.ArrayList(u8), number: Number.Number) Error!void {
-        if (number.toIntExact()) |integer| {
+        if (number.isInt()) {
+            const integer = number.toIntExact() orelse unreachable;
             if (integer == std.math.minInt(i64)) {
                 output.appendSlice(vm.allocator, "0x8000000000000000") catch return error.OutOfMemory;
                 return;
@@ -2119,74 +2388,57 @@ pub const VM = struct {
         output.appendSlice(vm.allocator, float_buffer[0..written]) catch return error.OutOfMemory;
     }
 
-    /// Numeric conversions hand the parsed flags, width and precision to the
-    /// C library; integers go through `long long` and floats stay `double`,
-    /// mirroring `addlenmod` and `LUAI_UACNUMBER` in lstrlib.c. `%c` truncates
-    /// to `int` (which C then narrows to a byte) and `%p` prints a collector
-    /// address, with `(null)` for values `lua_topointer` refuses, as Lua does.
-    fn appendNumericFormat(vm: *VM, output: *std.ArrayList(u8), value: Value, flags: []const u8, width: usize, precision: ?usize, specifier: u8) Error!void {
-        if (specifier == 'p') {
-            const pointer: ?*const anyopaque = switch (value) {
-                .string => |string| @ptrCast(string),
-                .table => |table| @ptrCast(table),
-                .function => |function| @ptrCast(function),
-                .thread => |thread| @ptrCast(thread),
-                .native_function => |native| @ptrFromInt(@intFromEnum(native) + 1),
-                else => null,
-            };
-            if (pointer == null) {
-                try vm.appendFormatField(output, "(null)", width, std.mem.indexOfScalar(u8, flags, '-') != null, ' ');
-                return;
-            }
-        }
+    /// One conversion of `string.format`, written out by C's own `printf` the
+    /// way `str_format` does once `checkformat` has let the specification
+    /// through. Integers go through `long long` the way `addlenmod` and
+    /// `LUA_INTEGER_FRMLEN` do, `%c` truncates to `int` (which C then narrows
+    /// to a byte), and `%p` prints a collector address, with `(null)` for the
+    /// values `lua_topointer` refuses.
+    fn appendNumericFormat(vm: *VM, output: *std.ArrayList(u8), value: Value, form: []const u8, specifier: u8) Error!void {
         const is_integer = specifier == 'd' or specifier == 'i' or specifier == 'u' or specifier == 'o' or specifier == 'x' or specifier == 'X';
-        var format_buffer: [64]u8 = undefined;
-        var length: usize = 0;
-        format_buffer[length] = '%';
-        length += 1;
-        @memcpy(format_buffer[length..][0..flags.len], flags);
-        length += flags.len;
-        if (width != 0) {
-            const printed = std.fmt.bufPrint(format_buffer[length..], "{d}", .{width}) catch return error.RuntimeError;
-            length += printed.len;
-        }
-        if (precision) |digits| {
-            const printed = std.fmt.bufPrint(format_buffer[length..], ".{d}", .{digits}) catch return error.RuntimeError;
-            length += printed.len;
-        }
+        var pointer: ?*const anyopaque = null;
+        if (specifier == 'p') pointer = switch (value) {
+            .string => |string| @ptrCast(string),
+            .table => |table| @ptrCast(table),
+            .function => |function| @ptrCast(function),
+            .thread => |thread| @ptrCast(thread),
+            .native_function => |native| @ptrFromInt(@intFromEnum(native) + 1),
+            else => null,
+        };
+        var form_buffer: [64]u8 = undefined;
+        if (form.len + 3 > form_buffer.len) return vm.raise("invalid format (too long)", .{});
+        @memcpy(form_buffer[0..form.len], form);
+        var length = form.len;
         if (is_integer) {
-            format_buffer[length] = 'l';
-            format_buffer[length + 1] = 'l';
-            length += 2;
+            // `addlenmod` writes the length modifier before the specifier
+            form_buffer[form.len - 1] = 'l';
+            form_buffer[form.len] = 'l';
+            form_buffer[form.len + 1] = form[form.len - 1];
+            length = form.len + 2;
+        } else if (specifier == 'p' and pointer == null) {
+            // `lua_topointer` has nothing to show, so the reference formats
+            // "(null)" as a string instead
+            form_buffer[form.len - 1] = 's';
         }
-        format_buffer[length] = specifier;
-        length += 1;
-        format_buffer[length] = 0;
+        form_buffer[length] = 0;
 
-        const capacity = 512 + width + (precision orelse 0);
+        const capacity = 768;
         const buffer = vm.allocator.alloc(u8, capacity) catch return error.OutOfMemory;
         defer vm.allocator.free(buffer);
         const needed: c_int = if (is_integer) blk: {
             const integer = try intArgument(value);
             if (specifier == 'd' or specifier == 'i')
-                break :blk snprintf(buffer.ptr, buffer.len, @ptrCast(&format_buffer), @as(c_longlong, integer));
-            break :blk snprintf(buffer.ptr, buffer.len, @ptrCast(&format_buffer), @as(c_ulonglong, @bitCast(integer)));
+                break :blk snprintf(buffer.ptr, buffer.len, @ptrCast(&form_buffer), @as(c_longlong, integer));
+            break :blk snprintf(buffer.ptr, buffer.len, @ptrCast(&form_buffer), @as(c_ulonglong, @bitCast(integer)));
         } else if (specifier == 'c') blk: {
             const integer = try intArgument(value);
-            break :blk snprintf(buffer.ptr, buffer.len, @ptrCast(&format_buffer), @as(c_int, @truncate(integer)));
+            break :blk snprintf(buffer.ptr, buffer.len, @ptrCast(&form_buffer), @as(c_int, @truncate(integer)));
         } else if (specifier == 'p') blk: {
-            const pointer: ?*const anyopaque = switch (value) {
-                .string => |string| @ptrCast(string),
-                .table => |table| @ptrCast(table),
-                .function => |function| @ptrCast(function),
-                .thread => |thread| @ptrCast(thread),
-                .native_function => |native| @ptrFromInt(@intFromEnum(native) + 1),
-                else => null,
-            };
-            break :blk snprintf(buffer.ptr, buffer.len, @ptrCast(&format_buffer), pointer.?);
+            if (pointer) |address| break :blk snprintf(buffer.ptr, buffer.len, @ptrCast(&form_buffer), address);
+            break :blk snprintf(buffer.ptr, buffer.len, @ptrCast(&form_buffer), "(null)");
         } else blk: {
             if (value != .number) return error.RuntimeError;
-            break :blk snprintf(buffer.ptr, buffer.len, @ptrCast(&format_buffer), value.number.toFloat());
+            break :blk snprintf(buffer.ptr, buffer.len, @ptrCast(&form_buffer), value.number.toFloat());
         };
         if (needed < 0) return error.RuntimeError;
         const written = @min(@as(usize, @intCast(needed)), buffer.len - 1);
@@ -2213,11 +2465,17 @@ pub const VM = struct {
     }
 
     fn utf8Char(vm: *VM, args: []const Value) Error![]Value {
+        const short = "char";
+        const long = "utf8.char";
         var bytes: std.ArrayList(u8) = .empty;
         defer bytes.deinit(vm.allocator);
-        for (args) |argument| {
-            const integer = try intArgument(argument);
-            const encoded = Utf8.encode(@as(u64, @bitCast(integer))) orelse return error.RuntimeError;
+        for (args, 0..) |_, i| {
+            const integer = try vm.checkInteger(args, i + 1, short, long);
+            const unsigned: u64 = @bitCast(integer);
+            // `luaL_argcheck(L, code <= UNICODE_MAX, i, "value out of range")`,
+            // against a `lua_Unsigned`, so a negative argument is caught here
+            if (unsigned > 0x7fffffff) return vm.raiseArgument(i + 1, short, long, "value out of range", .{});
+            const encoded = Utf8.encode(unsigned) orelse return vm.raiseArgument(i + 1, short, long, "value out of range", .{});
             bytes.appendSlice(vm.allocator, encoded.bytes[0..encoded.len]) catch return error.OutOfMemory;
         }
         const string = vm.interner.intern(bytes.items) catch return error.OutOfMemory;
@@ -2231,19 +2489,17 @@ pub const VM = struct {
         return length + position + 1;
     }
 
-    fn utf8Source(args: []const Value, minimum: usize) Error![]const u8 {
-        if (args.len < minimum or args[0] != .string) return error.RuntimeError;
-        return args[0].string.slice();
-    }
-
     fn utf8Len(vm: *VM, args: []const Value) Error![]Value {
-        const source = try utf8Source(args, 1);
+        const short = "len";
+        const long = "utf8.len";
+        const source = try vm.checkString(args, 1, short, long);
         const length = std.math.cast(i64, source.len) orelse return error.RuntimeError;
-        const initial = if (args.len >= 2) try intArgument(args[1]) else 1;
-        const final = if (args.len >= 3) try intArgument(args[2]) else -1;
+        const initial = try vm.optInteger(args, 2, 1, short, long);
+        const final = try vm.optInteger(args, 3, -1, short, long);
         const start = utf8RelativePosition(initial, length);
         const end = utf8RelativePosition(final, length);
-        if (start < 1 or start - 1 > length or end > length) return error.RuntimeError;
+        if (start < 1 or start - 1 > length) return vm.raiseArgument(2, short, long, "initial position out of bounds", .{});
+        if (end - 1 >= length) return vm.raiseArgument(3, short, long, "final position out of bounds", .{});
         const lax = args.len >= 4 and args[3].truthy();
         var position: usize = @intCast(start - 1);
         const end_exclusive: usize = if (end <= 0) 0 else @intCast(end);
@@ -2259,12 +2515,14 @@ pub const VM = struct {
     }
 
     fn utf8Codepoint(vm: *VM, args: []const Value) Error![]Value {
-        const source = try utf8Source(args, 1);
+        const short = "codepoint";
+        const long = "utf8.codepoint";
+        const source = try vm.checkString(args, 1, short, long);
         const length = std.math.cast(i64, source.len) orelse return error.RuntimeError;
-        const initial = if (args.len >= 2) try intArgument(args[1]) else 1;
-        const start = utf8RelativePosition(initial, length);
-        const final = if (args.len >= 3) utf8RelativePosition(try intArgument(args[2]), length) else start;
-        if (start < 1 or final > length) return error.RuntimeError;
+        const start = utf8RelativePosition(try vm.optInteger(args, 2, 1, short, long), length);
+        const final = utf8RelativePosition(try vm.optInteger(args, 3, start, short, long), length);
+        if (start < 1) return vm.raiseArgument(2, short, long, "out of bounds", .{});
+        if (final > length) return vm.raiseArgument(3, short, long, "out of bounds", .{});
         if (start > final) return vm.allocator.alloc(Value, 0) catch return error.OutOfMemory;
         const lax = args.len >= 4 and args[3].truthy();
         var values: std.ArrayList(Value) = .empty;
@@ -2272,7 +2530,7 @@ pub const VM = struct {
         var position: usize = @intCast(start - 1);
         const end: usize = @intCast(final);
         while (position < end) {
-            const decoded = Utf8.decode(source, position, lax) orelse return error.RuntimeError;
+            const decoded = Utf8.decode(source, position, lax) orelse return vm.raise("invalid UTF-8 code", .{});
             values.append(vm.allocator, .{ .number = Number.Number.fromInt(decoded.codepoint) }) catch return error.OutOfMemory;
             position = decoded.next;
         }
@@ -2280,18 +2538,20 @@ pub const VM = struct {
     }
 
     fn utf8Offset(vm: *VM, args: []const Value) Error![]Value {
-        const source = try utf8Source(args, 2);
-        const n = try intArgument(args[1]);
+        const short = "offset";
+        const long = "utf8.offset";
+        const source = try vm.checkString(args, 1, short, long);
+        const n = try vm.checkInteger(args, 2, short, long);
         const length = std.math.cast(i64, source.len) orelse return error.RuntimeError;
         const default_position = if (n >= 0) @as(i64, 1) else length + 1;
-        const one_based = utf8RelativePosition(if (args.len >= 3) try intArgument(args[2]) else default_position, length);
-        if (one_based < 1 or one_based - 1 > length) return error.RuntimeError;
+        const one_based = utf8RelativePosition(try vm.optInteger(args, 3, default_position, short, long), length);
+        if (one_based < 1 or one_based - 1 > length) return vm.raiseArgument(3, short, long, "position out of bounds", .{});
         var position: usize = @intCast(one_based - 1);
         var remaining = n;
         if (remaining == 0) {
             while (position > 0 and position < source.len and Utf8.isContinuation(source[position])) position -= 1;
         } else {
-            if (position < source.len and Utf8.isContinuation(source[position])) return error.RuntimeError;
+            if (position < source.len and Utf8.isContinuation(source[position])) return vm.raise("initial position is a continuation byte", .{});
             if (remaining < 0) {
                 while (remaining < 0 and position > 0) {
                     position -= 1;
@@ -2314,28 +2574,38 @@ pub const VM = struct {
         return vm.allocator.dupe(Value, &.{result}) catch return error.OutOfMemory;
     }
 
+    /// `iter_codes`: the subject string, the byte offset zero, and one of the
+    /// two iterators — the reference hands back `iter_auxlax` or
+    /// `iter_auxstrict` depending on the second argument, and that difference
+    /// is what stands between them.
     fn utf8Codes(vm: *VM, args: []const Value) Error![]Value {
-        const source = try utf8Source(args, 1);
-        if (source.len > 0 and Utf8.isContinuation(source[0])) return error.RuntimeError;
-        const state = try vm.newTable();
-        state.set(.{ .string = vm.interner.intern("source") catch return error.OutOfMemory }, args[0]) catch return error.OutOfMemory;
-        state.set(.{ .string = vm.interner.intern("lax") catch return error.OutOfMemory }, .{ .boolean = args.len >= 2 and args[1].truthy() }) catch return error.OutOfMemory;
-        return vm.allocator.dupe(Value, &.{ .{ .native_function = .utf8_codes_iterator }, .{ .table = state }, .{ .number = Number.Number.fromInt(0) } }) catch return error.OutOfMemory;
+        const short = "codes";
+        const long = "utf8.codes";
+        const source = try vm.checkString(args, 1, short, long);
+        if (source.len > 0 and Utf8.isContinuation(source[0]))
+            return vm.raiseArgument(1, short, long, "invalid UTF-8 code", .{});
+        const lax = args.len >= 2 and args[1].truthy();
+        const held = Value{ .string = vm.interner.intern(source) catch return error.OutOfMemory };
+        const iterator: Value = .{ .native_function = if (lax) .utf8_codes_iterator_lax else .utf8_codes_iterator };
+        return vm.allocator.dupe(Value, &.{ iterator, held, .{ .number = Number.Number.fromInt(0) } }) catch return error.OutOfMemory;
     }
 
-    fn utf8CodesIterator(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 2 or args[0] != .table) return error.RuntimeError;
-        const source = args[0].table.get(.{ .string = vm.interner.intern("source") catch return error.OutOfMemory });
-        if (source != .string) return error.RuntimeError;
-        const control = try intArgument(args[1]);
-        if (control < 0) return vm.allocator.alloc(Value, 0) catch return error.OutOfMemory;
-        const bytes = source.string.slice();
+    /// `iter_aux`: the state is the string itself and the control is a raw
+    /// byte offset read the way `lua_tointeger` reads it, so anything that is
+    /// not an integer counts as zero and a negative one has run off the end.
+    fn utf8CodesIterator(vm: *VM, args: []const Value, lax: bool) Error![]Value {
+        if (args.len < 2 or args[0] != .string) return vm.allocator.alloc(Value, 0) catch return error.OutOfMemory;
+        const bytes = args[0].string.slice();
+        const control: i64 = switch (args[1]) {
+            .number => |number| number.toIntExact() orelse 0,
+            else => 0,
+        };
+        if (control < 0 or control >= bytes.len) return vm.allocator.alloc(Value, 0) catch return error.OutOfMemory;
         var position: usize = @intCast(control);
         while (position < bytes.len and Utf8.isContinuation(bytes[position])) position += 1;
         if (position >= bytes.len) return vm.allocator.alloc(Value, 0) catch return error.OutOfMemory;
-        const lax_value = args[0].table.get(.{ .string = vm.interner.intern("lax") catch return error.OutOfMemory });
-        const decoded = Utf8.decode(bytes, position, lax_value.truthy()) orelse return error.RuntimeError;
-        if (decoded.next < bytes.len and Utf8.isContinuation(bytes[decoded.next])) return error.RuntimeError;
+        const decoded = Utf8.decode(bytes, position, lax) orelse return vm.raise("invalid UTF-8 code", .{});
+        if (decoded.next < bytes.len and Utf8.isContinuation(bytes[decoded.next])) return vm.raise("invalid UTF-8 code", .{});
         return vm.allocator.dupe(Value, &.{
             .{ .number = Number.Number.fromInt(std.math.cast(i64, position + 1) orelse return error.RuntimeError) },
             .{ .number = Number.Number.fromInt(decoded.codepoint) },
@@ -2343,60 +2613,81 @@ pub const VM = struct {
     }
 
     fn mathAbs(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 1 or args[0] != .number) return error.RuntimeError;
-        const n = args[0].number;
-        return singleNumber(vm, switch (n) {
-            .int => |i| .{ .int = if (i < 0) 0 -% i else i },
-            .float => |f| .{ .float = @abs(f) },
-        });
+        // `luaL_checknumber` is only reached for something that is not already
+        // an integer, which is what keeps `math.abs(-3)` an integer
+        if (args.len >= 1 and args[0] == .number and args[0].number == .int) {
+            const i = args[0].number.int;
+            return singleNumber(vm, .{ .int = if (i < 0) 0 -% i else i });
+        }
+        const n = try vm.checkNumber(args, 1, "abs", "math.abs");
+        return singleNumber(vm, .{ .float = @abs(n.toFloat()) });
     }
 
     fn mathRound(vm: *VM, args: []const Value, floor: bool) Error![]Value {
-        if (args.len < 1 or args[0] != .number) return error.RuntimeError;
-        const n = args[0].number;
-        if (n == .int) return singleNumber(vm, n);
-        const f = if (floor) @floor(n.float) else @ceil(n.float);
-        if (Number.Number.fromFloat(f).toIntExact()) |integer| return singleNumber(vm, .{ .int = integer });
-        return singleNumber(vm, .{ .float = f });
+        const short: []const u8 = if (floor) "floor" else "ceil";
+        const long: []const u8 = if (floor) "math.floor" else "math.ceil";
+        if (args.len >= 1 and args[0] == .number and args[0].number == .int) return singleNumber(vm, args[0].number);
+        const n = try vm.checkNumber(args, 1, short, long);
+        const rounded = if (floor) @floor(n.toFloat()) else @ceil(n.toFloat());
+        // `pushnumint`: a float that names an integer is handed back as one
+        if (Number.Number.fromFloat(rounded).toIntExact()) |integer| return singleNumber(vm, .{ .int = integer });
+        return singleNumber(vm, .{ .float = rounded });
     }
 
     fn mathSqrt(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 1 or args[0] != .number) return error.RuntimeError;
-        return singleNumber(vm, .{ .float = @sqrt(args[0].number.toFloat()) });
+        const n = try vm.checkNumber(args, 1, "sqrt", "math.sqrt");
+        return singleNumber(vm, .{ .float = @sqrt(n.toFloat()) });
     }
 
     fn mathFmod(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 2 or args[0] != .number or args[1] != .number) return error.RuntimeError;
-        if (args[0].number == .int and args[1].number == .int) {
+        const short = "fmod";
+        const long = "math.fmod";
+        if (args.len >= 2 and args[0] == .number and args[1] == .number and args[0].number == .int and args[1].number == .int) {
             const divisor = args[1].number.int;
-            if (divisor == 0) return vm.raisePlain("bad argument #2 to 'fmod' (zero)", .{});
-            if (divisor == -1) return singleNumber(vm, .{ .int = 0 });
+            // `d + 1u <= 1u` is the reference's way of naming -1 and 0
+            if (@as(u64, @bitCast(divisor)) +% 1 <= 1) {
+                if (divisor == 0) return vm.raiseArgument(2, short, long, "zero", .{});
+                return singleNumber(vm, .{ .int = 0 });
+            }
             return singleNumber(vm, .{ .int = @rem(args[0].number.int, divisor) });
         }
-        return singleNumber(vm, .{ .float = @rem(args[0].number.toFloat(), args[1].number.toFloat()) });
+        const a = try vm.checkNumber(args, 1, short, long);
+        const b = try vm.checkNumber(args, 2, short, long);
+        return singleNumber(vm, .{ .float = @rem(a.toFloat(), b.toFloat()) });
     }
 
+    /// `math.max` and `math.min`: any first argument at all is accepted and
+    /// handed back when it is the only one, and from there the reference's
+    /// `lua_compare` decides, which is the same `<` this runtime raises for.
     fn mathMinMax(vm: *VM, args: []const Value, maximum: bool) Error![]Value {
-        if (args.len == 0 or args[0] != .number) return error.RuntimeError;
-        var best = args[0].number;
-        for (args[1..]) |arg| {
-            if (arg != .number) return error.RuntimeError;
-            const less = Number.less(arg.number, best);
-            const greater = Number.less(best, arg.number);
-            if ((maximum and greater) or (!maximum and less)) best = arg.number;
+        const short: []const u8 = if (maximum) "max" else "min";
+        const long: []const u8 = if (maximum) "math.max" else "math.min";
+        if (args.len == 0) return vm.raiseArgument(1, short, long, "value expected", .{});
+        var best: usize = 0;
+        for (args[1..], 1..) |arg, i| {
+            const keep = if (maximum)
+                try vm.lessThanValues(args[best], arg)
+            else
+                try vm.lessThanValues(arg, args[best]);
+            if (keep) best = i;
         }
-        return singleNumber(vm, best);
+        return vm.allocator.dupe(Value, &.{args[best]}) catch return error.OutOfMemory;
     }
 
     fn mathToInteger(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 1 or args[0] == .nil) return vm.raisePlain("bad argument #1 to 'tointeger' (value expected)", .{});
-        const number = arithmeticNumber(args[0]) orelse return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
-        const integer = number.toIntExact() orelse return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
-        return singleNumber(vm, .{ .int = integer });
+        // a failure is only refused for an argument that was never passed
+        const number: ?Number.Number = if (args.len == 0) null else switch (args[0]) {
+            .number => |number| number,
+            .string => |string| Number.parse(string.slice()),
+            else => null,
+        };
+        if (number) |value| if (value.toIntExact()) |integer| return singleNumber(vm, .{ .int = integer });
+        try vm.checkAny(args, 1, "tointeger", "math.tointeger");
+        return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
     }
 
     fn mathType(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 1) return error.RuntimeError;
+        if (args.len < 1) return vm.raiseArgument(1, "type", "math.type", "value expected", .{});
         const type_name = args[0].mathType() orelse return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
         const string = vm.interner.intern(type_name) catch return error.OutOfMemory;
         return vm.allocator.dupe(Value, &.{.{ .string = string }}) catch return error.OutOfMemory;
@@ -2405,8 +2696,19 @@ pub const VM = struct {
     const MathUnary = enum { sin, cos, tan, asin, acos, exp, deg, rad };
 
     fn mathUnary(vm: *VM, args: []const Value, op: MathUnary) Error![]Value {
-        if (args.len < 1 or args[0] != .number) return error.RuntimeError;
-        const x = args[0].number.toFloat();
+        const long = switch (op) {
+            .sin => "math.sin",
+            .cos => "math.cos",
+            .tan => "math.tan",
+            .asin => "math.asin",
+            .acos => "math.acos",
+            .exp => "math.exp",
+            .deg => "math.deg",
+            .rad => "math.rad",
+        };
+        const short = long[5..];
+        const n = try vm.checkNumber(args, 1, short, long);
+        const x = n.toFloat();
         const result: f64 = switch (op) {
             .sin => @sin(x),
             .cos => @cos(x),
@@ -2421,44 +2723,51 @@ pub const VM = struct {
     }
 
     fn mathAtan(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 1 or args[0] != .number or (args.len >= 2 and args[1] != .number)) return error.RuntimeError;
-        const y = args[0].number.toFloat();
-        const result = if (args.len == 2) std.math.atan2(y, args[1].number.toFloat()) else std.math.atan(y);
-        return singleNumber(vm, .{ .float = result });
+        const short = "atan";
+        const long = "math.atan";
+        const y = try vm.checkNumber(args, 1, short, long);
+        const x = try vm.optNumber(args, 2, Number.Number.fromFloat(1), short, long);
+        return singleNumber(vm, .{ .float = std.math.atan2(y.toFloat(), x.toFloat()) });
     }
 
     fn mathLog(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 1 or args[0] != .number or (args.len >= 2 and args[1] != .number)) return error.RuntimeError;
-        const x = args[0].number.toFloat();
-        const result = if (args.len == 2) @log(x) / @log(args[1].number.toFloat()) else @log(x);
+        const short = "log";
+        const long = "math.log";
+        const x = try vm.checkNumber(args, 1, short, long);
+        const result = if (args.len >= 2 and args[1] != .nil) blk: {
+            const base = try vm.checkNumber(args, 2, short, long);
+            break :blk @log(x.toFloat()) / @log(base.toFloat());
+        } else @log(x.toFloat());
         return singleNumber(vm, .{ .float = result });
     }
 
     fn mathModf(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 1 or args[0] != .number) return error.RuntimeError;
-        const n = args[0].number;
+        const short = "modf";
+        const long = "math.modf";
         const values = vm.allocator.alloc(Value, 2) catch return error.OutOfMemory;
-        switch (n) {
-            .int => |integer| {
-                values[0] = .{ .number = .{ .int = integer } };
-                values[1] = .{ .number = .{ .float = 0 } };
-            },
-            .float => |float| {
-                const integral = @trunc(float);
-                values[0] = if (integral >= -9223372036854775808.0 and integral < 9223372036854775808.0)
-                    .{ .number = .{ .int = @intFromFloat(integral) } }
-                else
-                    .{ .number = .{ .float = integral } };
-                values[1] = .{ .number = .{ .float = if (float == integral) 0 else float - integral } };
-            },
+        if (args.len >= 1 and args[0] == .number and args[0].number == .int) {
+            // the integer is its own integral part, and the fraction is `0.0`
+            values[0] = args[0];
+            values[1] = .{ .number = Number.Number.fromFloat(0) };
+            return values;
         }
+        const n = try vm.checkNumber(args, 1, short, long);
+        const float = n.toFloat();
+        const integral = if (float < 0) @ceil(float) else @floor(float);
+        // `pushnumint`: an integral part that names an integer is one
+        values[0] = if (Number.Number.fromFloat(integral).toIntExact()) |integer|
+            .{ .number = .{ .int = integer } }
+        else
+            .{ .number = Number.Number.fromFloat(integral) };
+        values[1] = .{ .number = Number.Number.fromFloat(if (float == integral) 0 else float - integral) };
         return values;
     }
 
     fn mathUlt(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 2) return error.RuntimeError;
-        const a = try intArgument(args[0]);
-        const b = try intArgument(args[1]);
+        const short = "ult";
+        const long = "math.ult";
+        const a = try vm.checkInteger(args, 1, short, long);
+        const b = try vm.checkInteger(args, 2, short, long);
         const result: Value = .{ .boolean = @as(u64, @bitCast(a)) < @as(u64, @bitCast(b)) };
         return vm.allocator.dupe(Value, &.{result}) catch return error.OutOfMemory;
     }
@@ -2468,17 +2777,21 @@ pub const VM = struct {
     }
 
     fn mathRandom(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len > 2) return error.RuntimeError;
+        const short = "random";
+        const long = "math.random";
+        if (args.len > 2) return vm.raise("wrong number of arguments", .{});
         try vm.tick();
         const sample = vm.nextRandom();
         if (args.len == 0) {
             const fraction = @as(f64, @floatFromInt(sample >> 11)) / 9007199254740992.0;
             return vm.singleNumber(.{ .float = fraction });
         }
-        const low: i64 = if (args.len == 1) 1 else try intArgument(args[0]);
-        const high: i64 = try intArgument(args[args.len - 1]);
-        if (args.len == 1 and high == 0) return vm.singleNumber(.{ .int = @bitCast(sample) });
-        if (low > high) return error.RuntimeError;
+        const upper = try vm.checkInteger(args, 1, short, long);
+        if (args.len == 1 and upper == 0) return vm.singleNumber(.{ .int = @bitCast(sample) });
+        const low: i64 = if (args.len == 1) 1 else try vm.checkInteger(args, 1, short, long);
+        const high = if (args.len == 1) upper else try vm.checkInteger(args, 2, short, long);
+        // the interval check names argument one whatever the arity was
+        if (low > high) return vm.raiseArgument(1, short, long, "interval is empty", .{});
         const bound = @as(u64, @bitCast(high)) -% @as(u64, @bitCast(low));
         var mask = bound;
         if ((mask & (mask +% 1)) != 0) {
@@ -2499,17 +2812,48 @@ pub const VM = struct {
     }
 
     fn mathRandomSeed(vm: *VM, args: []const Value) Error![]Value {
-        const first = if (args.len == 0) @as(i64, 0x6c75616c697465) else try intArgument(args[0]);
-        const second = if (args.len == 2) try intArgument(args[1]) else if (args.len == 0) @as(i64, 0x72616e646f6d) else 0;
+        const short = "randomseed";
+        const long = "math.randomseed";
+        // an absent first argument asks for a seed from the clock; a present
+        // one has to be an integer, and `nil` counts as present
+        if (args.len == 0) {
+            const first: i64 = if (vm.io) |io| std.Io.Clock.real.now(io).toSeconds() else 0;
+            const second: i64 = @bitCast(@intFromPtr(vm));
+            vm.rng_state = seedRandomState(@bitCast(first), @bitCast(second));
+            return vm.allocator.dupe(Value, &.{ .{ .number = Number.Number.fromInt(first) }, .{ .number = Number.Number.fromInt(second) } }) catch return error.OutOfMemory;
+        }
+        const first = try vm.checkInteger(args, 1, short, long);
+        const second = try vm.optInteger(args, 2, 0, short, long);
         vm.rng_state = seedRandomState(@bitCast(first), @bitCast(second));
         return vm.allocator.dupe(Value, &.{ .{ .number = Number.Number.fromInt(first) }, .{ .number = Number.Number.fromInt(second) } }) catch return error.OutOfMemory;
     }
 
-    fn dateField(vm: *VM, table: *Table, name: []const u8, default: ?i64) Error!i64 {
+    /// `getfield`: a field that will not read as an integer is refused by
+    /// name, an absent one takes its default when it has one and is reported
+    /// missing when it does not, and a value too large for the C `int` the
+    /// reference builds its `struct tm` out of is out of bound. `delta` is
+    /// what the reference subtracts on the way in (1900 for a year, one for a
+    /// month) and it enters only the bound, since this runtime keeps the
+    /// field the way the date table wrote it.
+    fn dateField(vm: *VM, table: *Table, name: []const u8, default: ?i64, delta: i64) Error!i64 {
         const key = Value{ .string = vm.interner.intern(name) catch return error.OutOfMemory };
         const value = table.get(key);
-        if (value == .nil) return default orelse error.RuntimeError;
-        return intArgument(value);
+        const number: ?Number.Number = switch (value) {
+            .number => |number| number,
+            .string => |string| Number.parse(string.slice()),
+            else => null,
+        };
+        if (number) |candidate| if (candidate.toIntExact()) |integer| {
+            const in_bounds = if (integer >= 0)
+                integer - delta <= std.math.maxInt(i32)
+            else
+                std.math.minInt(i32) + delta <= integer;
+            if (!in_bounds) return vm.raise("field '{s}' is out-of-bound", .{name});
+            return integer;
+        };
+        if (value != .nil) return vm.raise("field '{s}' is not an integer", .{name});
+        if (default) |fallback| return fallback;
+        return vm.raise("field '{s}' missing in date table", .{name});
     }
 
     fn setDateField(vm: *VM, table: *Table, name: []const u8, value: i64) Error!void {
@@ -2546,7 +2890,10 @@ pub const VM = struct {
                 continue;
             }
             index += 1;
-            if (index >= format.len) return error.RuntimeError;
+            // `checkoption` blames the whole rest of the format for a
+            // specifier it does not know, and a trailing `%` has nothing
+            // after it at all
+            if (index >= format.len) return vm.raiseArgument(1, "date", "os.date", "invalid conversion specifier '%'", .{});
             switch (format[index]) {
                 '%' => try vm.appendDateText(&output, "%"),
                 'Y' => try vm.appendDateNumber(&output, "{d:0>4}", parts.year),
@@ -2627,7 +2974,7 @@ pub const VM = struct {
                 'z' => try vm.appendDateText(&output, "+0000"),
                 'n' => try vm.appendDateText(&output, "\n"),
                 't' => try vm.appendDateText(&output, "\t"),
-                else => return error.RuntimeError,
+                else => return vm.raiseArgument(1, "date", "os.date", "invalid conversion specifier '%{s}'", .{format[index..]}),
             }
         }
         return output.toOwnedSlice(vm.allocator) catch return error.OutOfMemory;
@@ -2641,17 +2988,20 @@ pub const VM = struct {
         return vm.singleNumber(.{ .float = seconds });
     }
 
+    /// `os.time`: with no argument, or with `nil`, the clock; otherwise a
+    /// date table, whose `year`, `month` and `day` have to be there.
     fn osTime(vm: *VM, args: []const Value) Error![]Value {
         const io = vm.io orelse return error.RuntimeError;
-        if (args.len == 0 or (args.len == 1 and args[0] == .nil)) return vm.singleNumber(.{ .int = std.Io.Clock.real.now(io).toSeconds() });
-        if (args.len < 1 or args[0] != .table) return error.RuntimeError;
-        const fields = args[0].table;
-        const year = try vm.dateField(fields, "year", null);
-        const month = try vm.dateField(fields, "month", null);
-        const day = try vm.dateField(fields, "day", null);
-        const hour = try vm.dateField(fields, "hour", 12);
-        const minute = try vm.dateField(fields, "min", 0);
-        const second = try vm.dateField(fields, "sec", 0);
+        if (args.len == 0 or args[0] == .nil) return vm.singleNumber(.{ .int = std.Io.Clock.real.now(io).toSeconds() });
+        const short = "time";
+        const long = "os.time";
+        const fields = try vm.checkTable(args, 1, short, long);
+        const year = try vm.dateField(fields, "year", null, 1900);
+        const month = try vm.dateField(fields, "month", null, 1);
+        const day = try vm.dateField(fields, "day", null, 0);
+        const hour = try vm.dateField(fields, "hour", 12, 0);
+        const minute = try vm.dateField(fields, "min", 0, 0);
+        const second = try vm.dateField(fields, "sec", 0, 0);
         const total_month = @as(i128, year) * 12 + @as(i128, month) - 1;
         const normalized_year = floorDiv128(total_month, 12);
         const normalized_month = total_month - normalized_year * 12 + 1;
@@ -2671,15 +3021,20 @@ pub const VM = struct {
         return vm.singleNumber(.{ .int = unix_seconds });
     }
 
+    /// `os.difftime`: two times, neither of them optional, read the way
+    /// `l_checktime` reads them, and the answer is a float.
     fn osDiffTime(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 2 or args[0] != .number or args[1] != .number) return error.RuntimeError;
-        const difference = args[0].number.toFloat() - args[1].number.toFloat();
+        const short = "difftime";
+        const long = "os.difftime";
+        const first = try vm.checkInteger(args, 1, short, long);
+        const second = try vm.checkInteger(args, 2, short, long);
+        const difference = @as(f64, @floatFromInt(first)) - @as(f64, @floatFromInt(second));
         return vm.singleNumber(.{ .float = difference });
     }
 
     fn osGetEnv(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 1 or args[0] != .string) return error.RuntimeError;
-        const value = if (vm.environ_map) |environment| environment.get(args[0].string.slice()) else null;
+        const name = try vm.checkString(args, 1, "getenv", "os.getenv");
+        const value = if (vm.environ_map) |environment| environment.get(name) else null;
         if (value) |bytes| {
             const string = vm.interner.intern(bytes) catch return error.OutOfMemory;
             return vm.allocator.dupe(Value, &.{.{ .string = string }}) catch return error.OutOfMemory;
@@ -2687,18 +3042,21 @@ pub const VM = struct {
         return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
     }
 
+    /// `os.date`: the format is a string with `nil` meaning `"%c"`, and the
+    /// time is a number when it is given at all, with `nil` meaning now.
     fn osDate(vm: *VM, args: []const Value) Error![]Value {
-        if ((args.len >= 1 and args[0] != .string and args[0] != .nil) or (args.len >= 2 and args[1] != .number and args[1] != .nil)) return error.RuntimeError;
         const io = vm.io orelse return error.RuntimeError;
-        const raw_format = if (args.len == 0 or args[0] == .nil) "%c" else args[0].string.slice();
+        const short = "date";
+        const long = "os.date";
+        const raw_format = try vm.optString(args, 1, "%c", short, long);
+        const timestamp: i128 = if (args.len >= 2 and args[2 - 1] != .nil)
+            @as(i128, try vm.checkInteger(args, 2, short, long))
+        else
+            @as(i128, std.Io.Clock.real.now(io).toSeconds());
         const utc = raw_format.len != 0 and raw_format[0] == '!';
         const format = if (utc) raw_format[1..] else raw_format;
         // This runtime currently uses UTC for both paths; `!` is accepted so
         // portable UTC date formatting works consistently on every host.
-        const timestamp = if (args.len == 2 and args[1] != .nil)
-            @as(i128, try intArgument(args[1]))
-        else
-            @as(i128, std.Io.Clock.real.now(io).toSeconds());
         const parts = dateParts(timestamp);
         if (std.mem.eql(u8, format, "*t")) {
             const table = try vm.newTable();
@@ -2759,37 +3117,73 @@ pub const VM = struct {
             .{ "FileBusy", 16 },    .{ "FileSystem", 5 },          .{ "IsDir", 21 },
             .{ "NotDir", 20 },      .{ "ReadOnlyFileSystem", 30 }, .{ "SystemResources", 12 },
             .{ "NoSpaceLeft", 28 }, .{ "DiskQuota", 122 },         .{ "CrossDevice", 18 },
-            .{ "DirNotEmpty", 39 },
+            .{ "DirNotEmpty", 39 }, .{ "InvalidArgument", 22 },
+            .{ "BadFileDescriptor", 9 },
         };
         inline for (mappings) |mapping| if (std.mem.eql(u8, error_name, mapping[0])) return mapping[1];
         return 1;
     }
 
-    fn osFileFailure(vm: *VM, err: anyerror) Error![]Value {
+    /// The strerror text the C library would have printed for the failure a
+    /// Zig error name stands for.
+    fn fileErrorMessage(error_name: []const u8) []const u8 {
+        const mappings = .{
+            .{ "FileNotFound", "No such file or directory" },
+            .{ "AccessDenied", "Permission denied" },
+            .{ "PermissionDenied", "Permission denied" },
+            .{ "FileBusy", "Device or resource busy" },
+            .{ "FileSystem", "Input/output error" },
+            .{ "IsDir", "Is a directory" },
+            .{ "NotDir", "Not a directory" },
+            .{ "ReadOnlyFileSystem", "Read-only file system" },
+            .{ "SystemResources", "Too many open files" },
+            .{ "NoSpaceLeft", "No space left on device" },
+            .{ "DiskQuota", "Disk quota exceeded" },
+            .{ "CrossDevice", "Cross-device link" },
+            .{ "DirNotEmpty", "Directory not empty" },
+            .{ "InvalidArgument", "Invalid argument" },
+            .{ "BadFileDescriptor", "Bad file descriptor" },
+        };
+        inline for (mappings) |mapping| if (std.mem.eql(u8, error_name, mapping[0])) return mapping[1];
+        return "Operation failed";
+    }
+
+    /// `luaL_fileresult`'s failure half: nil, the message and the errno. A
+    /// name in front of the strerror text is what the calls that know which
+    /// file they were working on pass.
+    fn osFileFailure(vm: *VM, err: anyerror, name: ?[]const u8) Error![]Value {
         const error_name = @errorName(err);
-        const message = vm.interner.intern(error_name) catch return error.OutOfMemory;
-        return vm.allocator.dupe(Value, &.{ .nil, .{ .string = message }, .{ .number = Number.Number.fromInt(osErrorCode(error_name)) } }) catch return error.OutOfMemory;
+        const message = if (name) |path|
+            std.fmt.allocPrint(vm.allocator, "{s}: {s}", .{ path, fileErrorMessage(error_name) }) catch return error.OutOfMemory
+        else
+            vm.allocator.dupe(u8, fileErrorMessage(error_name)) catch return error.OutOfMemory;
+        defer vm.allocator.free(message);
+        const interned = vm.interner.intern(message) catch return error.OutOfMemory;
+        return vm.allocator.dupe(Value, &.{ .nil, .{ .string = interned }, .{ .number = Number.Number.fromInt(osErrorCode(error_name)) } }) catch return error.OutOfMemory;
     }
 
     fn osRemove(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 1 or args[0] != .string) return error.RuntimeError;
+        const name = try vm.checkString(args, 1, "remove", "os.remove");
         const io = vm.io orelse return error.RuntimeError;
         const directory = std.Io.Dir.cwd();
-        directory.deleteFile(io, args[0].string.slice()) catch |err| {
+        directory.deleteFile(io, name) catch |err| {
             if (err == error.IsDir) {
-                directory.deleteDir(io, args[0].string.slice()) catch |dir_err| return vm.osFileFailure(dir_err);
+                directory.deleteDir(io, name) catch |dir_err| return vm.osFileFailure(dir_err, name);
                 return vm.allocator.dupe(Value, &.{.{ .boolean = true }}) catch return error.OutOfMemory;
             }
-            return vm.osFileFailure(err);
+            return vm.osFileFailure(err, name);
         };
         return vm.allocator.dupe(Value, &.{.{ .boolean = true }}) catch return error.OutOfMemory;
     }
 
     fn osRename(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 2 or args[0] != .string or args[1] != .string) return error.RuntimeError;
+        const short = "rename";
+        const long = "os.rename";
+        const from_name = try vm.checkString(args, 1, short, long);
+        const to_name = try vm.checkString(args, 2, short, long);
         const io = vm.io orelse return error.RuntimeError;
         const directory = std.Io.Dir.cwd();
-        directory.rename(args[0].string.slice(), directory, args[1].string.slice(), io) catch |err| return vm.osFileFailure(err);
+        directory.rename(from_name, directory, to_name, io) catch |err| return vm.osFileFailure(err, from_name);
         return vm.allocator.dupe(Value, &.{.{ .boolean = true }}) catch return error.OutOfMemory;
     }
 
@@ -2806,10 +3200,12 @@ pub const VM = struct {
     }
 
     fn ioOpen(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len == 0 or args[0] != .string or (args.len >= 2 and args[1] != .string)) return error.RuntimeError;
+        const short = "open";
+        const long = "io.open";
+        const path = try vm.checkString(args, 1, short, long);
+        const mode = try vm.optString(args, 2, "r", short, long);
+        if (!checkOpenMode(mode)) return vm.raiseArgument(2, short, long, "invalid mode", .{});
         const io = vm.io orelse return error.RuntimeError;
-        const path = args[0].string.slice();
-        const mode = if (args.len == 2) args[1].string.slice() else "r";
         const normalized = std.mem.replaceOwned(u8, vm.allocator, mode, "b", "") catch return error.OutOfMemory;
         defer vm.allocator.free(normalized);
         const read_mode = std.mem.eql(u8, normalized, "r");
@@ -2820,11 +3216,11 @@ pub const VM = struct {
         const append_update_mode = std.mem.eql(u8, normalized, "a+");
         const readable = read_mode or read_update_mode or write_update_mode or append_update_mode;
         const writable = read_update_mode or write_mode or write_update_mode or append_mode or append_update_mode;
-        if (!readable and !writable) return error.RuntimeError;
+        if (!readable and !writable) return vm.raiseArgument(2, short, long, "invalid mode", .{});
         const file = if (read_mode or read_update_mode)
-            std.Io.Dir.cwd().openFile(io, path, .{ .mode = if (readable and writable) .read_write else .read_only }) catch |err| return vm.osFileFailure(err)
+            std.Io.Dir.cwd().openFile(io, path, .{ .mode = if (readable and writable) .read_write else .read_only }) catch |err| return vm.osFileFailure(err, path)
         else
-            std.Io.Dir.cwd().createFile(io, path, .{ .read = readable, .truncate = write_mode or write_update_mode }) catch |err| return vm.osFileFailure(err);
+            std.Io.Dir.cwd().createFile(io, path, .{ .read = readable, .truncate = write_mode or write_update_mode }) catch |err| return vm.osFileFailure(err, path);
         errdefer file.close(io);
         const table = try vm.newTable();
         table.metatable = vm.file_metatable;
@@ -2835,7 +3231,7 @@ pub const VM = struct {
         if (writable) {
             if (append_mode or append_update_mode) {
                 var writer = file.writer(io, &handle.writer_buffer);
-                const stat = file.stat(io) catch |err| return vm.osFileFailure(err);
+                const stat = file.stat(io) catch |err| return vm.osFileFailure(err, path);
                 writer.pos = stat.size;
                 handle.writer = writer;
             } else {
@@ -2847,6 +3243,15 @@ pub const VM = struct {
         result[0] = .{ .table = table };
         vm.owned_files.append(vm.allocator, handle) catch return error.OutOfMemory;
         return result;
+    }
+
+    /// `l_checkmode`: a mode that starts in 'r', 'w' or 'a' is accepted as it
+    /// stands, and anything else only when it is a two-character prefix in
+    /// front of a binary 'b' — which is the shape the second half of the C
+    /// expression describes.
+    fn checkOpenMode(mode: []const u8) bool {
+        if (mode.len > 0 and std.mem.indexOfScalar(u8, "rwa", mode[0]) != null) return true;
+        return mode.len == 3 and mode[2] == 'b';
     }
 
     fn ioTmpFile(vm: *VM, args: []const Value) Error![]Value {
@@ -2869,80 +3274,213 @@ pub const VM = struct {
         return result;
     }
 
+    /// `g_write`: numbers are written the way the C library formats them, and
+    /// everything else has to be a string.
+    fn writeValues(vm: *VM, handle: *FileHandle, args: []const Value, first: usize, short: []const u8, long: []const u8) Error!void {
+        for (args[first - 1 ..], first..) |value, argument| {
+            const bytes = switch (value) {
+                .string => |string| string.slice(),
+                .number => |number| vm.numberBytes(number),
+                else => {
+                    const text = try vm.checkString(args, argument, short, long);
+                    try vm.writeHandleBytes(handle, text);
+                    continue;
+                },
+            };
+            try vm.writeHandleBytes(handle, bytes);
+        }
+    }
+
+    fn writeHandleBytes(vm: *VM, handle: *FileHandle, bytes: []const u8) Error!void {
+        _ = vm;
+        // An update stream has to jump to where the reads left off before it
+        // writes again, the way a C `FILE*` carries its one position across
+        // both directions
+        if (handle.last_side == .read) {
+            if (handle.reader) |*reader| {
+                const position = reader.logicalPos();
+                if (handle.writer) |*writer| {
+                    writer.interface.flush() catch return error.RuntimeError;
+                    writer.seekTo(position) catch return error.RuntimeError;
+                }
+            }
+            handle.last_side = .write;
+        }
+        if (handle.writer_interface) |writer| {
+            writer.writeAll(bytes) catch return error.RuntimeError;
+        } else if (handle.writer) |*writer| {
+            writer.interface.writeAll(bytes) catch return error.RuntimeError;
+        } else return error.RuntimeError;
+    }
+
     fn ioWrite(vm: *VM, args: []const Value) Error![]Value {
+        const short = "write";
+        const long = "io.write";
         const table = vm.default_output orelse try vm.standardFile(false);
-        const values = vm.allocator.alloc(Value, args.len + 1) catch return error.OutOfMemory;
-        defer vm.allocator.free(values);
-        values[0] = .{ .table = table };
-        @memcpy(values[1..], args);
-        return vm.fileWrite(values);
+        const handle = try vm.fileHandleArgument(.{ .table = table }, 1, short, long);
+        try vm.writeValues(handle, args, 1, short, long);
+        return vm.allocator.dupe(Value, &.{.{ .table = table }}) catch return error.OutOfMemory;
     }
 
     fn ioFlush(vm: *VM, args: []const Value) Error![]Value {
         _ = args;
         const table = vm.default_output orelse try vm.standardFile(false);
-        return vm.fileFlush(&.{.{ .table = table }});
+        const handle = try vm.fileHandleArgument(.{ .table = table }, 1, "flush", "io.flush");
+        if (handle.writer_interface) |writer| {
+            writer.flush() catch return error.RuntimeError;
+        } else if (handle.writer) |*writer| {
+            writer.interface.flush() catch return error.RuntimeError;
+        } else return error.RuntimeError;
+        return vm.allocator.dupe(Value, &.{.{ .boolean = true }}) catch return error.OutOfMemory;
     }
 
+    /// `io_type`: any value at all is accepted, and only a file handle answers
+    /// with a name for itself.
     fn ioType(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 1) return error.RuntimeError;
-        if (args[0] != .table) return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
-        for (vm.owned_files.items) |handle| if (handle.table == args[0].table) {
+        const short = "type";
+        const long = "io.type";
+        try vm.checkAny(args, 1, short, long);
+        const value = args[0];
+        if (value != .table) return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
+        for (vm.owned_files.items) |handle| if (handle.table == value.table) {
             const name = vm.interner.intern(if (handle.closed) "closed file" else "file") catch return error.OutOfMemory;
             return vm.allocator.dupe(Value, &.{.{ .string = name }}) catch return error.OutOfMemory;
         };
         return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
     }
 
+    /// `io_close` with no argument closes the default output; `f_close` is
+    /// what both it and the method share.
     fn ioClose(vm: *VM, args: []const Value) Error![]Value {
-        const file: Value = if (args.len == 1) args[0] else .{ .table = vm.default_output orelse try vm.standardFile(false) };
-        return vm.fileClose(&.{file});
+        const file: Value = if (args.len >= 1) args[0] else .{ .table = vm.default_output orelse try vm.standardFile(false) };
+        return vm.fileClose(&.{file}, "io.close");
     }
 
     fn ioLines(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len == 0) {
+        if (args.len == 0 or args[0] == .nil) {
             const table = vm.default_input orelse try vm.standardFile(true);
-            return vm.fileLines(&.{.{ .table = table }});
+            var file_args: std.ArrayList(Value) = .empty;
+            defer file_args.deinit(vm.allocator);
+            file_args.append(vm.allocator, .{ .table = table }) catch return error.OutOfMemory;
+            if (args.len > 0) file_args.appendSlice(vm.allocator, args[1..]) catch return error.OutOfMemory;
+            return vm.fileLines(file_args.items);
         }
-        if (args[0] != .string) return error.RuntimeError;
-        const opened = try vm.ioOpen(&.{ args[0], .{ .string = vm.interner.intern("r") catch return error.OutOfMemory } });
-        defer vm.allocator.free(opened);
-        if (opened.len == 0 or opened[0] != .table) return error.RuntimeError;
-        const file_args = vm.allocator.alloc(Value, args.len) catch return error.OutOfMemory;
-        defer vm.allocator.free(file_args);
-        file_args[0] = opened[0];
-        @memcpy(file_args[1..], args[1..]);
-        return vm.fileLines(file_args);
+        const name = try vm.checkString(args, 1, "lines", "io.lines");
+        const opened_table = try vm.openChecked(name, "r");
+        var file_args: std.ArrayList(Value) = .empty;
+        defer file_args.deinit(vm.allocator);
+        file_args.append(vm.allocator, .{ .table = opened_table }) catch return error.OutOfMemory;
+        file_args.appendSlice(vm.allocator, args[1..]) catch return error.OutOfMemory;
+        const results = try vm.fileLines(file_args.items);
+        errdefer vm.allocator.free(results);
+        if (results.len == 0 or results[0] != .function) return error.RuntimeError;
+        // `io.lines` opens the file itself, so the iterator closes it when it
+        // runs out of lines, and the file comes back as the fourth answer for
+        // the generic for to keep hold of
+        const handle = try vm.fileHandle(.{ .table = opened_table });
+        handle.owns_file = true;
+        handle.auto_close = true;
+        const answers = vm.allocator.alloc(Value, 4) catch return error.OutOfMemory;
+        answers[0] = results[0];
+        answers[1] = .nil;
+        answers[2] = .nil;
+        answers[3] = .{ .table = opened_table };
+        vm.allocator.free(results);
+        return answers;
     }
 
+    /// `f:lines`: the formats are remembered on the handle, and the answer is
+    /// the iterator alone — a function with the file bound in front of
+    /// whatever the generic for passes it.
     fn fileLines(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len == 0) return error.RuntimeError;
-        const handle = try vm.fileHandle(args[0]);
-        if (handle.closed or !handle.readable) return error.RuntimeError;
-        if (handle.owns_file) handle.auto_close = true;
+        const short = "lines";
+        const long = "?";
+        if (args.len == 0) return vm.typeError(1, short, long, "FILE*", null);
+        const file = args[0];
+        _ = try vm.fileHandleArgument(file, 1, short, long);
+        const handle = try vm.fileHandle(file);
         if (handle.line_formats) |old_formats| vm.allocator.free(old_formats);
         handle.line_formats = null;
+        // The formats are not looked at here at all: anything goes into the
+        // iterator and is only checked when a line is actually read
         if (args.len > 1) {
-            for (args[1..]) |format| if (format != .nil and format != .string and format != .number) return error.RuntimeError;
             handle.line_formats = vm.allocator.dupe(Value, args[1..]) catch return error.OutOfMemory;
         }
-        return vm.allocator.dupe(Value, &.{ .{ .native_function = .file_lines_iterator }, args[0], .nil }) catch return error.OutOfMemory;
+        return vm.boundNative(.file_lines_iterator, file);
+    }
+
+    /// `f:setvbuf`: the buffering mode is asked for and the size checked,
+    /// but lualite's files already decide their own buffering, so only the
+    /// arguments and the success answer are real.
+    fn fileSetvbuf(vm: *VM, args: []const Value) Error![]Value {
+        const short = "setvbuf";
+        const long = "?";
+        if (args.len == 0) return vm.typeError(1, short, long, "FILE*", null);
+        _ = try vm.fileHandleArgument(args[0], 1, short, long);
+        if (args.len < 2 or args[1] == .nil) return vm.raiseArgument(2, short, long, "option expected", .{});
+        const mode = switch (args[1]) {
+            .string => |string| string.slice(),
+            else => return vm.typeError(2, short, long, "string", args[1]),
+        };
+        if (!std.mem.eql(u8, mode, "no") and !std.mem.eql(u8, mode, "full") and !std.mem.eql(u8, mode, "line"))
+            return vm.raiseArgument(2, short, long, "invalid option '{s}'", .{mode});
+        _ = try vm.optInteger(args, 3, 8192, short, long);
+        return vm.allocator.dupe(Value, &.{.{ .boolean = true }}) catch return error.OutOfMemory;
     }
 
     fn fileLinesIterator(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len != 2) return error.RuntimeError;
+        if (args.len == 0) return error.RuntimeError;
         const handle = try vm.fileHandle(args[0]);
-        const formats = handle.line_formats orelse return vm.fileRead(&.{args[0]});
-        const read_args = vm.allocator.alloc(Value, formats.len + 1) catch return error.OutOfMemory;
-        defer vm.allocator.free(read_args);
-        read_args[0] = args[0];
-        @memcpy(read_args[1..], formats);
-        return vm.fileRead(read_args);
+        if (handle.closed) return vm.raise("file is already closed", .{});
+        const formats = handle.line_formats orelse return vm.finishLine(vm.fileRead(&.{args[0]}));
+        var read_args: std.ArrayList(Value) = .empty;
+        defer read_args.deinit(vm.allocator);
+        read_args.append(vm.allocator, args[0]) catch return error.OutOfMemory;
+        read_args.appendSlice(vm.allocator, formats) catch return error.OutOfMemory;
+        return vm.finishLine(vm.fileRead(read_args.items));
     }
 
+    /// `io_readline`'s last step: an answer that starts with nil ends the
+    /// iteration by returning nothing at all rather than that nil.
+    fn finishLine(vm: *VM, results: Error![]Value) Error![]Value {
+        const values = try results;
+        defer vm.allocator.free(values);
+        if (values.len == 0 or values[0] == .nil) return &.{};
+        return vm.allocator.dupe(Value, values) catch return error.OutOfMemory;
+    }
+
+    /// A native function with one value bound in front of its arguments, the
+    /// way `coroutine.wrap` and the line iterators are put together.
+    fn boundNative(vm: *VM, native: ValueModule.NativeFunction, bound: Value) Error![]Value {
+        const function = vm.tracker.alloc(ValueModule.Function, .function) catch return error.OutOfMemory;
+        errdefer vm.tracker.free(function);
+        function.semantics = vm.exec.semantics;
+        function.body = &vm.wrapper_body;
+        function.function_index = 0;
+        function.captures = &.{};
+        function.environment = vm.exec.active_environment;
+        function.native = native;
+        function.bound = bound;
+        vm.owned_functions.append(vm.allocator, function) catch return error.OutOfMemory;
+        return vm.allocator.dupe(Value, &.{.{ .function = function }}) catch return error.OutOfMemory;
+    }
+
+    /// One of the three standard streams, set up the first time it is asked
+    /// for: stdin reads, and stdout and stderr write through the VM's own
+    /// writers rather than owning a file.
+    const StandardStream = enum { stdin, stdout, stderr };
+
     fn standardFile(vm: *VM, input: bool) Error!*Table {
-        const current = if (input) vm.default_input else vm.default_output;
-        if (current) |table| return table;
+        return vm.standardFileStream(if (input) .stdin else .stdout);
+    }
+
+    fn standardFileStream(vm: *VM, stream: StandardStream) Error!*Table {
+        const cached: ?*Table = switch (stream) {
+            .stdin => vm.stdin_cache,
+            .stdout => vm.stdout_cache,
+            .stderr => vm.stderr_cache,
+        };
+        if (cached) |table| return table;
         const io = vm.io orelse return error.RuntimeError;
         const table = try vm.newTable();
         table.metatable = vm.file_metatable;
@@ -2951,67 +3489,161 @@ pub const VM = struct {
         handle.* = .{
             .allocator = vm.allocator,
             .io = io,
-            .file = if (input) std.Io.File.stdin() else std.Io.File.stdout(),
+            .file = switch (stream) {
+                .stdin => std.Io.File.stdin(),
+                .stdout => std.Io.File.stdout(),
+                .stderr => std.Io.File.stderr(),
+            },
             .table = table,
-            .readable = input,
-            .writable = !input,
+            .readable = stream == .stdin,
+            .writable = stream != .stdin,
             .owns_file = false,
         };
-        if (input) {
-            handle.reader = handle.file.readerStreaming(io, &handle.reader_buffer);
-        } else {
-            handle.writer_interface = vm.writer orelse return error.RuntimeError;
+        switch (stream) {
+            .stdin => handle.reader = handle.file.readerStreaming(io, &handle.reader_buffer),
+            .stdout => handle.writer_interface = vm.writer orelse return error.RuntimeError,
+            .stderr => handle.writer_interface = vm.stderr orelse return error.RuntimeError,
         }
         vm.owned_files.append(vm.allocator, handle) catch return error.OutOfMemory;
-        if (input) vm.default_input = table else vm.default_output = table;
+        // Until something says otherwise the defaults are the standard streams
+        switch (stream) {
+            .stdin => {
+                vm.stdin_cache = table;
+                if (vm.default_input == null) vm.default_input = table;
+            },
+            .stdout => {
+                vm.stdout_cache = table;
+                if (vm.default_output == null) vm.default_output = table;
+            },
+            .stderr => {
+                vm.stderr_cache = table;
+                if (vm.default_error == null) vm.default_error = table;
+            },
+        }
         return table;
     }
 
-    fn ioInput(vm: *VM, args: []const Value) Error![]Value {
+    /// `io.stdin`, `io.stdout` and `io.stderr` are handed out by name the
+    /// first time they are asked for; every other field is left alone.
+    fn ioIndex(vm: *VM, args: []const Value) Error![]Value {
+        if (args.len < 2 or args[1] != .string) return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
+        const name = args[1].string.slice();
+        const stream: ?StandardStream = if (std.mem.eql(u8, name, "stdin"))
+            .stdin
+        else if (std.mem.eql(u8, name, "stdout"))
+            .stdout
+        else if (std.mem.eql(u8, name, "stderr"))
+            .stderr
+        else
+            null;
+        if (stream) |which| {
+            const table = try vm.standardFileStream(which);
+            return vm.allocator.dupe(Value, &.{.{ .table = table }}) catch return error.OutOfMemory;
+        }
+        return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
+    }
+
+    /// `f_tostring`: the handle's own address, which is all the C version
+    /// prints as well.
+    fn fileToString(vm: *VM, args: []const Value) Error![]Value {
+        const handle = try vm.fileHandle(args[0]);
+        const text = std.fmt.allocPrint(vm.allocator, "file (0x{x})", .{@intFromPtr(handle)}) catch return error.OutOfMemory;
+        defer vm.allocator.free(text);
+        const string = vm.interner.intern(text) catch return error.OutOfMemory;
+        return vm.allocator.dupe(Value, &.{.{ .string = string }}) catch return error.OutOfMemory;
+    }
+
+    /// `g_iofile`: a name opens a file in the given mode and refuses to go on
+    /// when that fails, and a handle is taken as it stands; an absent or nil
+    /// argument only asks for the current one.
+    fn ioFileSetting(vm: *VM, args: []const Value, field: enum { input, output }) Error![]Value {
+        const short: []const u8 = if (field == .input) "input" else "output";
+        const long: []const u8 = if (field == .input) "io.input" else "io.output";
+        const mode: []const u8 = if (field == .input) "r" else "w";
+        if (args.len == 0 or args[0] == .nil) {
+            const table = if (field == .input)
+                vm.default_input orelse try vm.standardFile(true)
+            else
+                vm.default_output orelse try vm.standardFile(false);
+            return vm.allocator.dupe(Value, &.{.{ .table = table }}) catch return error.OutOfMemory;
+        }
         var table: *Table = undefined;
-        if (args.len == 0) {
-            table = try vm.standardFile(true);
-        } else if (args[0] == .string) {
-            const mode = Value{ .string = vm.interner.intern("r") catch return error.OutOfMemory };
-            const opened = try vm.ioOpen(&.{ args[0], mode });
-            defer vm.allocator.free(opened);
-            if (opened.len == 0 or opened[0] != .table) return error.RuntimeError;
-            table = opened[0].table;
-        } else if (args[0] == .table) {
-            const handle = vm.fileHandle(args[0]) catch return error.RuntimeError;
-            if (handle.closed or !handle.readable) return error.RuntimeError;
+        if (args[0] == .string or args[0] == .number) {
+            const name = try vm.checkString(args, 1, short, long);
+            table = try vm.openChecked(name, mode);
+        } else {
+            _ = try vm.fileHandleArgument(args[0], 1, short, long);
             table = args[0].table;
-        } else return error.RuntimeError;
-        vm.default_input = table;
+        }
+        if (field == .input) vm.default_input = table else vm.default_output = table;
         return vm.allocator.dupe(Value, &.{.{ .table = table }}) catch return error.OutOfMemory;
+    }
+
+    /// `opencheck`: an open that has to work, raising the way `luaL_error`
+    /// does when it does not.
+    fn openChecked(vm: *VM, path: []const u8, mode: []const u8) Error!*Table {
+        const opened = try vm.ioOpen(&.{ .{ .string = vm.interner.intern(path) catch return error.OutOfMemory }, .{ .string = vm.interner.intern(mode) catch return error.OutOfMemory } });
+        defer vm.allocator.free(opened);
+        if (opened.len == 0 or opened[0] != .table) {
+            // `ioOpen` answered with nil, `path: strerror` and the errno;
+            // `opencheck` raises `cannot open file '%s' (%s)` with just the
+            // strerror text, so the path prefix goes back off
+            if (opened.len >= 2 and opened[1] == .string) {
+                const text = opened[1].string.slice();
+                const bare = if (std.mem.startsWith(u8, text, path) and text.len > path.len + 1 and text[path.len] == ':' and text[path.len + 1] == ' ')
+                    text[path.len + 2 ..]
+                else
+                    text;
+                return vm.raise("cannot open file '{s}' ({s})", .{ path, bare });
+            }
+            return error.RuntimeError;
+        }
+        return opened[0].table;
+    }
+
+    fn ioInput(vm: *VM, args: []const Value) Error![]Value {
+        return vm.ioFileSetting(args, .input);
     }
 
     fn ioOutput(vm: *VM, args: []const Value) Error![]Value {
-        var table: *Table = undefined;
-        if (args.len == 0) {
-            table = try vm.standardFile(false);
-        } else if (args[0] == .string) {
-            const mode = Value{ .string = vm.interner.intern("w") catch return error.OutOfMemory };
-            const opened = try vm.ioOpen(&.{ args[0], mode });
-            defer vm.allocator.free(opened);
-            if (opened.len == 0 or opened[0] != .table) return error.RuntimeError;
-            table = opened[0].table;
-        } else if (args[0] == .table) {
-            const handle = vm.fileHandle(args[0]) catch return error.RuntimeError;
-            if (handle.closed or !handle.writable) return error.RuntimeError;
-            table = args[0].table;
-        } else return error.RuntimeError;
-        vm.default_output = table;
-        return vm.allocator.dupe(Value, &.{.{ .table = table }}) catch return error.OutOfMemory;
+        return vm.ioFileSetting(args, .output);
     }
 
+    /// `g_read`: the formats come one after another and the answers pile up
+    /// until one of them fails, which leaves nil in its place.
     fn ioRead(vm: *VM, args: []const Value) Error![]Value {
+        const short = "read";
+        const long = "io.read";
         const table = vm.default_input orelse try vm.standardFile(true);
-        const file_args = vm.allocator.alloc(Value, args.len + 1) catch return error.OutOfMemory;
-        defer vm.allocator.free(file_args);
-        file_args[0] = .{ .table = table };
-        @memcpy(file_args[1..], args);
-        return vm.fileRead(file_args);
+        const handle = try vm.fileHandleArgument(.{ .table = table }, 1, short, long);
+        // A stream that cannot be read at all answers with `luaL_fileresult`'s
+        // failure half: nil, the strerror text and the errno
+        if (handle.reader == null) return vm.osFileFailure(error.BadFileDescriptor, null);
+        if (args.len == 0) {
+            const line = Value{ .string = vm.interner.intern("*l") catch return error.OutOfMemory };
+            const value = try vm.readFormat(handle, line, 1, short, long);
+            return vm.allocator.dupe(Value, &.{value}) catch return error.OutOfMemory;
+        }
+        var results: std.ArrayList(Value) = .empty;
+        defer results.deinit(vm.allocator);
+        for (args, 1..) |format, argument| {
+            const value = try vm.readFormat(handle, format, argument, short, long);
+            results.append(vm.allocator, value) catch return error.OutOfMemory;
+            if (value == .nil) break;
+        }
+        return results.toOwnedSlice(vm.allocator) catch return error.OutOfMemory;
+    }
+
+    /// `tofile`: a file handle that is still open. Anything else is refused
+    /// the way `luaL_checkudata` refuses it, and a closed one the way
+    /// `luaL_error` spells it, from a C frame.
+    fn fileHandleArgument(vm: *VM, value: Value, argument: usize, short: []const u8, long: []const u8) Error!*FileHandle {
+        if (value != .table) return vm.typeError(argument, short, long, "FILE*", value);
+        for (vm.owned_files.items) |handle| if (handle.table == value.table) {
+            if (handle.closed) return vm.raise("attempt to use a closed file", .{});
+            return handle;
+        };
+        return vm.typeError(argument, short, long, "FILE*", value);
     }
 
     fn fileHandle(vm: *VM, value: Value) Error!*FileHandle {
@@ -3040,257 +3672,391 @@ pub const VM = struct {
         }
     }
 
-    fn fileClose(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len == 0) return error.RuntimeError;
-        const handle = try vm.fileHandle(args[0]);
-        if (handle.closed) return error.RuntimeError;
+    /// `aux_close`: a standard file refuses to be closed and says why, and
+    /// anything else flushes and shuts.
+    fn fileClose(vm: *VM, args: []const Value, long: []const u8) Error![]Value {
+        const short = "close";
+        if (args.len == 0) return vm.typeError(1, short, long, "FILE*", null);
+        const handle = try vm.fileHandleArgument(args[0], 1, short, long);
+        if (!handle.owns_file) {
+            const message = vm.interner.intern("cannot close standard file") catch return error.OutOfMemory;
+            return vm.allocator.dupe(Value, &.{ .nil, .{ .string = message } }) catch return error.OutOfMemory;
+        }
         closeFileHandle(handle);
         return vm.allocator.dupe(Value, &.{.{ .boolean = true }}) catch return error.OutOfMemory;
     }
 
     fn fileSeek(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len == 0) return error.RuntimeError;
-        const handle = try vm.fileHandle(args[0]);
-        if (handle.closed or (!handle.readable and !handle.writable)) return error.RuntimeError;
-        const whence = if (args.len >= 2) switch (args[1]) {
-            .string => |string| string.slice(),
-            else => return error.RuntimeError,
-        } else "cur";
-        const offset: i64 = if (args.len == 3) try intArgument(args[2]) else 0;
-        const base: i128 = if (std.mem.eql(u8, whence, "set")) 0 else if (std.mem.eql(u8, whence, "cur"))
-            if (handle.readable) handle.reader.?.logicalPos() else handle.writer.?.logicalPos()
-        else if (std.mem.eql(u8, whence, "end")) (handle.file.stat(handle.io) catch return error.RuntimeError).size else return error.RuntimeError;
-        const target_i128 = base + offset;
-        if (target_i128 < 0 or target_i128 > std.math.maxInt(u64)) return error.RuntimeError;
-        const target: u64 = @intCast(target_i128);
-        if (handle.writer) |*writer| writer.seekTo(target) catch return error.RuntimeError;
-        if (handle.reader) |*reader| reader.seekTo(target) catch return error.RuntimeError;
-        return vm.singleNumber(.{ .int = @intCast(target) });
+        const short = "seek";
+        const long = "?";
+        if (args.len == 0) return vm.typeError(1, short, long, "FILE*", null);
+        const handle = try vm.fileHandleArgument(args[0], 1, short, long);
+        const whence = if (args.len >= 2) blk: {
+            const text = try vm.checkString(args, 2, short, long);
+            if (std.mem.eql(u8, text, "set")) break :blk @as(usize, 0) else if (std.mem.eql(u8, text, "cur")) break :blk @as(usize, 1) else if (std.mem.eql(u8, text, "end")) break :blk @as(usize, 2);
+            return vm.raiseArgument(2, short, long, "invalid option '{s}'", .{text});
+        } else 1;
+        const offset: i64 = try vm.optInteger(args, 3, 0, short, long);
+        // `File.Writer.pos` only moves as the buffer drains, so the position
+        // the writes have reached is that plus what is still held back
+        const current: i128 = if (handle.last_side == .write)
+            if (handle.writer) |*writer| writer.pos + writer.interface.buffered().len else if (handle.reader) |*reader| reader.logicalPos() else 0
+        else if (handle.reader) |*reader| reader.logicalPos() else if (handle.writer) |*writer| writer.pos + writer.interface.buffered().len else 0;
+        const base: i128 = switch (whence) {
+            0 => 0,
+            1 => current,
+            else => (handle.file.stat(handle.io) catch return error.RuntimeError).size,
+        };
+        const target = base + offset;
+        // `fseeko` reports a target it cannot reach with EINVAL, which comes
+        // back through `luaL_fileresult` as nil, the strerror text and the
+        // errno rather than as an argument error
+        if (target < 0 or target > std.math.maxInt(u64)) return vm.osFileFailure(error.InvalidArgument, null);
+        const position: u64 = @intCast(target);
+        if (handle.writer) |*writer| writer.seekTo(position) catch return vm.osFileFailure(error.InvalidArgument, null);
+        if (handle.reader) |*reader| reader.seekTo(position) catch return vm.osFileFailure(error.InvalidArgument, null);
+        handle.last_side = .read;
+        return vm.singleNumber(.{ .int = @intCast(position) });
     }
 
     fn fileFlush(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 1) return error.RuntimeError;
-        const handle = try vm.fileHandle(args[0]);
-        if (handle.closed or !handle.writable) return error.RuntimeError;
+        const short = "flush";
+        const long = "?";
+        if (args.len == 0) return vm.typeError(1, short, long, "FILE*", null);
+        const handle = try vm.fileHandleArgument(args[0], 1, short, long);
+        // `fflush` on a read stream is a no-op that still succeeds; the
+        // answer is the success flag, not the file the way `write` has it
         if (handle.writer_interface) |writer| {
             writer.flush() catch return error.RuntimeError;
-        } else handle.writer.?.interface.flush() catch return error.RuntimeError;
-        return vm.allocator.dupe(Value, &.{args[0]}) catch return error.OutOfMemory;
+        } else if (handle.writer) |*writer| {
+            writer.interface.flush() catch return error.RuntimeError;
+        }
+        return vm.allocator.dupe(Value, &.{.{ .boolean = true }}) catch return error.OutOfMemory;
     }
 
     fn fileWrite(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 2) return error.RuntimeError;
-        const handle = try vm.fileHandle(args[0]);
-        if (handle.closed or !handle.writable) return error.RuntimeError;
-        const writer = handle.writer_interface orelse &handle.writer.?.interface;
-        for (args[1..]) |value| {
-            const bytes = switch (value) {
-                .string => |string| string.slice(),
-                .number => |number| vm.numberBytes(number),
-                else => return error.RuntimeError,
-            };
-            writer.writeAll(bytes) catch return error.RuntimeError;
-        }
+        const short = "write";
+        const long = "?";
+        if (args.len == 0) return vm.typeError(1, short, long, "FILE*", null);
+        const handle = try vm.fileHandleArgument(args[0], 1, short, long);
+        if (args.len == 1) return vm.allocator.dupe(Value, &.{args[0]}) catch return error.OutOfMemory;
+        try vm.writeValues(handle, args, 2, short, long);
         return vm.allocator.dupe(Value, &.{args[0]}) catch return error.OutOfMemory;
     }
 
     fn fileRead(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len == 0) return error.RuntimeError;
-        if (args.len > 2) {
-            var results: std.ArrayList(Value) = .empty;
-            errdefer results.deinit(vm.allocator);
-            for (args[1..]) |format| {
-                const values = try vm.fileRead(&.{ args[0], format });
-                defer vm.allocator.free(values);
-                if (values.len == 0) return error.RuntimeError;
-                results.append(vm.allocator, values[0]) catch return error.OutOfMemory;
-                if (values[0] == .nil) break;
-            }
-            return results.toOwnedSlice(vm.allocator) catch return error.OutOfMemory;
+        const short = "read";
+        const long = "?";
+        if (args.len == 0) return vm.typeError(1, short, long, "FILE*", null);
+        const handle = try vm.fileHandleArgument(args[0], 1, short, long);
+        if (handle.reader == null) return vm.osFileFailure(error.BadFileDescriptor, null);
+        if (args.len == 1) {
+            const line = Value{ .string = vm.interner.intern("*l") catch return error.OutOfMemory };
+            const value = try vm.readFormat(handle, line, 2, short, long);
+            return vm.allocator.dupe(Value, &.{value}) catch return error.OutOfMemory;
         }
-        const handle = try vm.fileHandle(args[0]);
-        if (handle.closed or !handle.readable) return error.RuntimeError;
-        const format = if (args.len == 1 or args[1] == .nil) "*l" else switch (args[1]) {
-            .string => |string| string.slice(),
-            .number => |number| vm.numberBytes(number),
-            else => return error.RuntimeError,
-        };
-        var bytes: []u8 = undefined;
-        var owned = false;
-        if (std.mem.eql(u8, format, "*l") or std.mem.eql(u8, format, "*L")) {
-            const reader = &handle.reader.?.interface;
-            var line: std.ArrayList(u8) = .empty;
-            defer line.deinit(vm.allocator);
-            var ended = false;
-            while (true) {
-                const byte = reader.take(1) catch |err| switch (err) {
-                    error.EndOfStream => break,
-                    else => return error.RuntimeError,
-                };
-                ended = true;
-                if (byte[0] == '\n') {
-                    if (format[1] == 'L') line.append(vm.allocator, '\n') catch return error.OutOfMemory;
-                    break;
-                }
-                line.append(vm.allocator, byte[0]) catch return error.OutOfMemory;
+        var results: std.ArrayList(Value) = .empty;
+        defer results.deinit(vm.allocator);
+        for (args[1..], 2..) |format, argument| {
+            const value = try vm.readFormat(handle, format, argument, short, long);
+            results.append(vm.allocator, value) catch return error.OutOfMemory;
+            if (value == .nil) break;
+        }
+        return results.toOwnedSlice(vm.allocator) catch return error.OutOfMemory;
+    }
+
+    /// `g_read`'s body: one format, one answer. A count of zero looks at the
+    /// next byte the way `test_eof` does — nil at the end of the file and the
+    /// empty string anywhere before it, with the byte left in place.
+    fn readFormat(vm: *VM, handle: *FileHandle, format: Value, argument: usize, short: []const u8, long: []const u8) Error!Value {
+        // A buffered write stands between the reads and the bytes it has not
+        // put down yet; flush it and bring the reader up to the same spot
+        if (handle.last_side == .write) {
+            if (handle.writer) |*writer| {
+                writer.interface.flush() catch return error.RuntimeError;
+                const position = writer.pos;
+                if (handle.reader) |*reader| reader.seekTo(position) catch return error.RuntimeError;
             }
-            if (!ended and line.items.len == 0) {
-                if (handle.auto_close) closeFileHandle(handle);
-                return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
-            }
-            bytes = vm.allocator.dupe(u8, line.items) catch return error.OutOfMemory;
-            owned = true;
-        } else if (std.mem.eql(u8, format, "*n")) {
+            handle.last_side = .read;
+        }
+        if (format == .number) {
+            const count = format.number.toIntExact() orelse
+                return vm.raiseArgument(argument, short, long, "number has no integer representation", .{});
+            // A negative count wraps to a huge `size_t` in C, so the buffer
+            // it asks for cannot be had
+            if (count < 0) return vm.raisePlain("not enough memory", .{});
             const reader = &handle.reader.?.interface;
-            while (true) {
-                const next = reader.peek(1) catch |err| switch (err) {
+            if (count == 0) {
+                _ = reader.peek(1) catch |err| switch (err) {
                     error.EndOfStream => {
                         if (handle.auto_close) closeFileHandle(handle);
-                        return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
+                        return .nil;
                     },
                     else => return error.RuntimeError,
                 };
-                if (!std.ascii.isWhitespace(next[0])) break;
-                reader.toss(1);
+                const empty = vm.interner.intern("") catch return error.OutOfMemory;
+                return .{ .string = empty };
             }
-            var token: std.ArrayList(u8) = .empty;
-            defer token.deinit(vm.allocator);
-            while (true) {
-                const next = reader.peek(1) catch |err| switch (err) {
-                    error.EndOfStream => break,
-                    else => return error.RuntimeError,
-                };
-                const byte = next[0];
-                if (!(std.ascii.isAlphanumeric(byte) or byte == '+' or byte == '-' or byte == '.')) break;
-                token.append(vm.allocator, byte) catch return error.OutOfMemory;
-                reader.toss(1);
-            }
-            const number = Number.parse(token.items) orelse {
-                if (token.items.len == 0 and handle.auto_close) closeFileHandle(handle);
-                return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
-            };
-            return vm.allocator.dupe(Value, &.{.{ .number = number }}) catch return error.OutOfMemory;
-        } else if (std.mem.eql(u8, format, "*a")) {
-            var output: std.ArrayList(u8) = .empty;
-            defer output.deinit(vm.allocator);
-            const reader = &handle.reader.?.interface;
-            while (true) {
-                var chunk_buffer: [1024]u8 = undefined;
-                const chunk_len = reader.readSliceShort(&chunk_buffer) catch return error.RuntimeError;
-                if (chunk_len == 0) break;
-                const chunk = chunk_buffer[0..chunk_len];
-                output.appendSlice(vm.allocator, chunk) catch return error.OutOfMemory;
-            }
-            if (handle.auto_close) closeFileHandle(handle);
-            bytes = vm.allocator.dupe(u8, output.items) catch return error.OutOfMemory;
-            owned = true;
-        } else {
-            const count = std.fmt.parseInt(usize, format, 10) catch return error.RuntimeError;
-            const reader = &handle.reader.?.interface;
-            const buffer = vm.allocator.alloc(u8, count) catch return error.OutOfMemory;
-            const actual = reader.readSliceShort(buffer) catch {
-                vm.allocator.free(buffer);
-                return error.RuntimeError;
-            };
+            const buffer = vm.allocator.alloc(u8, @intCast(count)) catch return error.OutOfMemory;
+            defer vm.allocator.free(buffer);
+            const actual = reader.readSliceShort(buffer) catch return error.RuntimeError;
             if (actual == 0) {
-                vm.allocator.free(buffer);
                 if (handle.auto_close) closeFileHandle(handle);
-                return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
+                return .nil;
             }
-            bytes = buffer[0..actual];
-            owned = true;
+            const string = vm.interner.intern(buffer[0..actual]) catch return error.OutOfMemory;
+            return .{ .string = string };
         }
-        defer if (owned) vm.allocator.free(bytes);
-        const string = vm.interner.intern(bytes) catch return error.OutOfMemory;
-        return vm.allocator.dupe(Value, &.{.{ .string = string }}) catch return error.OutOfMemory;
+        const text = switch (format) {
+            .string => |string| string.slice(),
+            .number => unreachable,
+            else => return vm.typeError(argument, short, long, "string", format),
+        };
+        // `*l` and friends are spelled with an optional star in front
+        const pattern = if (text.len > 0 and text[0] == '*') text[1..] else text;
+        if (pattern.len == 0 or (pattern[0] != 'n' and pattern[0] != 'l' and pattern[0] != 'L' and pattern[0] != 'a'))
+            return vm.raiseArgument(argument, short, long, "invalid format", .{});
+        switch (pattern[0]) {
+            'l', 'L' => {
+                const keep_ends = pattern[0] == 'L';
+                const reader = &handle.reader.?.interface;
+                var line: std.ArrayList(u8) = .empty;
+                defer line.deinit(vm.allocator);
+                var ended = false;
+                while (true) {
+                    const byte = reader.take(1) catch |err| switch (err) {
+                        error.EndOfStream => break,
+                        else => return error.RuntimeError,
+                    };
+                    ended = true;
+                    if (byte[0] == '\n') {
+                        if (keep_ends) line.append(vm.allocator, '\n') catch return error.OutOfMemory;
+                        break;
+                    }
+                    line.append(vm.allocator, byte[0]) catch return error.OutOfMemory;
+                }
+                if (!ended and line.items.len == 0) {
+                    if (handle.auto_close) closeFileHandle(handle);
+                    return .nil;
+                }
+                const string = vm.interner.intern(line.items) catch return error.OutOfMemory;
+                return .{ .string = string };
+            },
+            'n' => {
+                const reader = &handle.reader.?.interface;
+                while (true) {
+                    const next = reader.peek(1) catch |err| switch (err) {
+                        error.EndOfStream => {
+                            if (handle.auto_close) closeFileHandle(handle);
+                            return .nil;
+                        },
+                        else => return error.RuntimeError,
+                    };
+                    if (!std.ascii.isWhitespace(next[0])) break;
+                    reader.toss(1);
+                }
+                var token: std.ArrayList(u8) = .empty;
+                defer token.deinit(vm.allocator);
+                while (true) {
+                    const next = reader.peek(1) catch |err| switch (err) {
+                        error.EndOfStream => break,
+                        else => return error.RuntimeError,
+                    };
+                    const byte = next[0];
+                    if (!(std.ascii.isAlphanumeric(byte) or byte == '+' or byte == '-' or byte == '.')) break;
+                    token.append(vm.allocator, byte) catch return error.OutOfMemory;
+                    reader.toss(1);
+                }
+                const number = Number.parse(token.items) orelse {
+                    if (token.items.len == 0 and handle.auto_close) closeFileHandle(handle);
+                    return .nil;
+                };
+                return .{ .number = number };
+            },
+            else => {
+                var output: std.ArrayList(u8) = .empty;
+                defer output.deinit(vm.allocator);
+                const reader = &handle.reader.?.interface;
+                while (true) {
+                    var chunk_buffer: [1024]u8 = undefined;
+                    const chunk_len = reader.readSliceShort(&chunk_buffer) catch return error.RuntimeError;
+                    if (chunk_len == 0) break;
+                    output.appendSlice(vm.allocator, chunk_buffer[0..chunk_len]) catch return error.OutOfMemory;
+                }
+                if (handle.auto_close) closeFileHandle(handle);
+                const string = vm.interner.intern(output.items) catch return error.OutOfMemory;
+                return .{ .string = string };
+            },
+        }
+    }
+
+    /// Which metamethods a value has to offer for `checktab` to accept it in
+    /// place of a table.
+    const TableNeed = struct { read: bool = false, write: bool = false, len: bool = false };
+
+    /// `checktab`: a table, or any value whose metatable supplies every
+    /// metamethod the operation needs. Anything else is refused the way
+    /// `luaL_checktype(L, arg, LUA_TTABLE)` would have refused it.
+    fn checkTableLike(vm: *VM, value: Value, need: TableNeed, argument: usize, short: []const u8, long: []const u8) Error!void {
+        if (value == .table) return;
+        if (need.read and (try vm.valueMetamethod(value, "__index")) == .nil)
+            return vm.typeError(argument, short, long, "table", value);
+        if (need.write and (try vm.valueMetamethod(value, "__newindex")) == .nil)
+            return vm.typeError(argument, short, long, "table", value);
+        if (need.len and (try vm.valueMetamethod(value, "__len")) == .nil)
+            return vm.typeError(argument, short, long, "table", value);
+    }
+
+    /// `luaL_len`: the `__len` metamethod where there is one, the raw length
+    /// of a table or a string otherwise, and a refusal to accept an answer
+    /// that is not an integer. The length failure is `luaG_runerror` from a C
+    /// frame, so it carries no position; `luaL_error`'s refusals do.
+    fn objectLength(vm: *VM, value: Value) Error!i64 {
+        if (value == .table) {
+            const method = try vm.metamethod(value.table, "__len");
+            if (method != .nil) return vm.lengthAnswer(method, value);
+            return value.table.len();
+        }
+        if (value == .string) return std.math.cast(i64, value.string.slice().len) orelse return error.RuntimeError;
+        const method = try vm.valueMetamethod(value, "__len");
+        if (method != .nil) return vm.lengthAnswer(method, value);
+        return vm.raisePlain("attempt to get length of a {s} value", .{value.typeName()});
+    }
+
+    /// `luaL_len`'s conversion of what `__len` answered: an integer, or a
+    /// float or numeric string that names one, or a refusal.
+    fn lengthAnswer(vm: *VM, method: Value, value: Value) Error!i64 {
+        const results = try vm.invokeCallableValues(method, &.{value});
+        defer vm.allocator.free(results);
+        const answer = if (results.len == 0) Value.nil else results[0];
+        return switch (answer) {
+            .number => |number| if (number.toIntExact()) |integer| integer else return vm.raise("object length is not an integer", .{}),
+            // `luaL_len` accepts a numeric string that names an integer too
+            .string => |string| blk: {
+                const parsed = Number.parse(string.slice()) orelse return vm.raise("object length is not an integer", .{});
+                break :blk parsed.toIntExact() orelse return vm.raise("object length is not an integer", .{});
+            },
+            else => vm.raise("object length is not an integer", .{}),
+        };
+    }
+
+    /// `lua_geti`.
+    fn tableGetIndex(vm: *VM, receiver: Value, index: i64) Error!Value {
+        return vm.getTableIndex(receiver, intKey(index));
+    }
+
+    /// `lua_seti`.
+    fn tableSetIndex(vm: *VM, receiver: Value, index: i64, value: Value) Error!void {
+        try vm.setTableIndex(receiver, intKey(index), value);
     }
 
     fn tableInsert(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len != 2 and args.len != 3) return error.RuntimeError;
-        const table = switch (args[0]) {
-            .table => |table| table,
-            else => return error.RuntimeError,
-        };
-        const length: i64 = table.len();
-        const position = if (args.len == 2) length + 1 else try intArgument(args[1]);
-        if (position < 1 or position > length + 1) return error.RuntimeError;
-        const value = args[if (args.len == 2) 1 else 2];
-        var index = length + 1;
-        while (index > position) : (index -= 1) {
-            table.set(intKey(index), table.get(intKey(index - 1))) catch return error.OutOfMemory;
+        const short = "insert";
+        const long = "table.insert";
+        if (args.len == 0) return vm.typeError(1, short, long, "table", null);
+        try vm.checkTableLike(args[0], .{ .read = true, .write = true, .len = true }, 1, short, long);
+        if (args.len == 2 or args.len == 3) {
+            var length = try vm.objectLength(args[0]);
+            // `luaL_intop(+, e, 1)` wraps the same way
+            length = length +% 1;
+            const position = if (args.len == 2) length else try vm.checkInteger(args, 2, short, long);
+            if (@as(u64, @bitCast(position -% 1)) >= @as(u64, @bitCast(length)))
+                return vm.raiseArgument(2, short, long, "position out of bounds", .{});
+            if (args.len == 3) {
+                var index = length;
+                while (index > position) {
+                    index -= 1;
+                    const value = try vm.tableGetIndex(args[0], index);
+                    try vm.tableSetIndex(args[0], index + 1, value);
+                }
+            }
+            try vm.tableSetIndex(args[0], position, args[if (args.len == 2) 1 else 2]);
+            return vm.allocator.alloc(Value, 0) catch return error.OutOfMemory;
         }
-        table.set(intKey(position), value) catch return error.OutOfMemory;
-        return vm.allocator.alloc(Value, 0) catch return error.OutOfMemory;
+        return vm.raise("wrong number of arguments to 'insert'", .{});
     }
 
     fn tableRemove(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len == 0) return error.RuntimeError;
-        const table = switch (args[0]) {
-            .table => |table| table,
-            else => return error.RuntimeError,
-        };
-        const length: i64 = table.len();
-        const position = if (args.len == 1) length else try intArgument(args[1]);
-        if (position < 1 or position > length) return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
-        const removed = table.get(intKey(position));
-        var index = position;
-        while (index < length) : (index += 1) {
-            table.set(intKey(index), table.get(intKey(index + 1))) catch return error.OutOfMemory;
+        const short = "remove";
+        const long = "table.remove";
+        if (args.len == 0) return vm.typeError(1, short, long, "table", null);
+        try vm.checkTableLike(args[0], .{ .read = true, .write = true, .len = true }, 1, short, long);
+        const size = try vm.objectLength(args[0]);
+        const position = try vm.optInteger(args, 2, size, short, long);
+        if (position != size) {
+            if (@as(u64, @bitCast(position -% 1)) > @as(u64, @bitCast(size)))
+                return vm.raiseArgument(2, short, long, "position out of bounds", .{});
         }
-        table.set(intKey(length), .nil) catch return error.OutOfMemory;
+        const removed = try vm.tableGetIndex(args[0], position);
+        var index = position;
+        while (index < size) {
+            const value = try vm.tableGetIndex(args[0], index + 1);
+            try vm.tableSetIndex(args[0], index, value);
+            index += 1;
+        }
+        // the shift walks `index` up to `size`, which is the slot the reference
+        // clears once the loop it shares with this one finishes
+        try vm.tableSetIndex(args[0], index, .nil);
         return vm.allocator.dupe(Value, &.{removed}) catch return error.OutOfMemory;
     }
 
     fn tableConcat(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len == 0) return error.RuntimeError;
-        const table = switch (args[0]) {
-            .table => |table| table,
-            else => return error.RuntimeError,
-        };
-        const separator = if (args.len > 1) switch (args[1]) {
-            .string => |string| string.slice(),
-            else => return error.RuntimeError,
-        } else "";
-        const first = if (args.len > 2) try intArgument(args[2]) else @as(i64, 1);
-        const last = if (args.len > 3) try intArgument(args[3]) else @as(i64, table.len());
+        const short = "concat";
+        const long = "table.concat";
+        if (args.len == 0) return vm.typeError(1, short, long, "table", null);
+        try vm.checkTableLike(args[0], .{ .read = true, .len = true }, 1, short, long);
+        const separator = try vm.optString(args, 2, "", short, long);
+        const first = try vm.optInteger(args, 3, 1, short, long);
+        const last = try vm.optInteger(args, 4, try vm.objectLength(args[0]), short, long);
         var output: std.ArrayList(u8) = .empty;
         defer output.deinit(vm.allocator);
         if (first <= last) {
             var index = first;
-            while (true) : (index += 1) {
+            while (index < last) : (index += 1) {
                 try vm.tick();
-                if (index != first) output.appendSlice(vm.allocator, separator) catch return error.OutOfMemory;
-                const value = table.get(intKey(index));
-                const bytes = switch (value) {
-                    .string => |string| string.slice(),
-                    .number => |number| Number.toBytes(number, &vm.number_buffer) catch return error.RuntimeError,
-                    else => return error.RuntimeError,
-                };
-                output.appendSlice(vm.allocator, bytes) catch return error.OutOfMemory;
-                if (index == last) break;
-                if (index == std.math.maxInt(i64)) return error.RuntimeError;
+                try vm.appendConcatField(&output, args[0], index);
+                output.appendSlice(vm.allocator, separator) catch return error.OutOfMemory;
             }
+            if (index == last) try vm.appendConcatField(&output, args[0], index);
         }
         const string = vm.interner.intern(output.items) catch return error.OutOfMemory;
         return vm.allocator.dupe(Value, &.{.{ .string = string }}) catch return error.OutOfMemory;
     }
 
-    fn tableUnpack(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len == 0) return error.RuntimeError;
-        const table = switch (args[0]) {
-            .table => |table| table,
-            else => return error.RuntimeError,
+    /// `addfield`: one element of `table.concat`, which is a string or a
+    /// number and refuses everything else by naming where it was found.
+    fn appendConcatField(vm: *VM, output: *std.ArrayList(u8), receiver: Value, index: i64) Error!void {
+        const value = try vm.tableGetIndex(receiver, index);
+        const bytes = switch (value) {
+            .string => |string| string.slice(),
+            .number => |number| vm.scratchNumber(number),
+            else => return vm.raise("invalid value ({s}) at index {d} in table for 'concat'", .{ value.typeName(), index }),
         };
-        const first = if (args.len > 1) try intArgument(args[1]) else @as(i64, 1);
-        const last = if (args.len > 2) try intArgument(args[2]) else @as(i64, table.len());
+        output.appendSlice(vm.allocator, bytes) catch return error.OutOfMemory;
+    }
+
+    /// `tunpack`: argument one is never checked as a table, because the
+    /// bounds come first and the default for the last one is a length that
+    /// fails on its own for whatever it was given, which is how `table.unpack()`
+    /// and `table.unpack(nil)` both end in `attempt to get length of a nil value`.
+    fn tableUnpack(vm: *VM, args: []const Value) Error![]Value {
+        const short = "unpack";
+        const long = "table.unpack";
+        const table: Value = if (args.len >= 1) args[0] else .nil;
+        const first = try vm.optInteger(args, 2, 1, short, long);
+        const last: i64 = if (args.len >= 3 and args[2] != .nil)
+            try vm.optInteger(args, 3, 1, short, long)
+        else
+            try vm.objectLength(table);
         if (first > last) return vm.allocator.alloc(Value, 0) catch return error.OutOfMemory;
         const distance = std.math.sub(i64, last, first) catch return error.RuntimeError;
         const count = std.math.add(i64, distance, 1) catch return error.RuntimeError;
+        if (count > std.math.maxInt(i32)) return vm.raise("too many results to unpack", .{});
         const size = std.math.cast(usize, count) orelse return error.RuntimeError;
         if (size > vm.exec.steps_left) return error.StepLimit;
         const values = vm.allocator.alloc(Value, size) catch return error.OutOfMemory;
         for (values, 0..) |*value, offset| {
-            value.* = table.get(intKey(first + @as(i64, @intCast(offset))));
+            value.* = try vm.tableGetIndex(table, first + @as(i64, @intCast(offset)));
         }
         return values;
     }
@@ -3307,70 +4073,153 @@ pub const VM = struct {
     }
 
     fn tableMove(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 4 or args[0] != .table) return error.RuntimeError;
-        const source = args[0].table;
-        const first = try intArgument(args[1]);
-        const last = try intArgument(args[2]);
-        const target_first = try intArgument(args[3]);
-        const destination = if (args.len == 5) switch (args[4]) {
-            .table => |table| table,
-            else => return error.RuntimeError,
-        } else source;
-        if (last < first) return vm.allocator.dupe(Value, &.{.{ .table = destination }}) catch return error.OutOfMemory;
-        const count = std.math.cast(usize, @as(i128, last) - @as(i128, first) + 1) orelse return error.RuntimeError;
-        const backwards = source == destination and target_first > first and target_first <= last;
-        var offset: usize = 0;
-        while (offset < count) : (offset += 1) {
-            try vm.tick();
-            const current_offset = if (backwards) count - offset - 1 else offset;
-            const source_index = std.math.cast(i64, @as(i128, first) + @as(i128, current_offset)) orelse return error.RuntimeError;
-            const destination_index = std.math.cast(i64, @as(i128, target_first) + @as(i128, current_offset)) orelse return error.RuntimeError;
-            destination.set(intKey(destination_index), source.get(intKey(source_index))) catch return error.OutOfMemory;
+        const short = "move";
+        const long = "table.move";
+        const first = try vm.checkInteger(args, 2, short, long);
+        const last = try vm.checkInteger(args, 3, short, long);
+        const target_first = try vm.checkInteger(args, 4, short, long);
+        try vm.checkTableLike(args[0], .{ .read = true }, 1, short, long);
+        const explicit_destination = args.len >= 5 and args[4] != .nil;
+        const destination: Value = if (explicit_destination) blk: {
+            try vm.checkTableLike(args[4], .{ .write = true }, 5, short, long);
+            break :blk args[4];
+        } else args[0];
+        if (last >= first) {
+            if (!(first > 0 or last < std.math.maxInt(i64) +% first))
+                return vm.raiseArgument(3, short, long, "too many elements to move", .{});
+            const count = @as(i128, last) - @as(i128, first) + 1;
+            if (@as(i128, target_first) > @as(i128, std.math.maxInt(i64)) - count + 1)
+                return vm.raiseArgument(4, short, long, "destination wrap around", .{});
+            const forwards = target_first > last or target_first <= first or
+                (explicit_destination and !(try vm.equalWithMetamethod(args[0], destination)));
+            var offset: i128 = 0;
+            while (offset < count) {
+                const step: i64 = @intCast(if (forwards) offset else count - offset - 1);
+                const value = try vm.tableGetIndex(args[0], first + step);
+                try vm.tableSetIndex(destination, target_first + step, value);
+                offset += 1;
+                try vm.tick();
+            }
         }
-        return vm.allocator.dupe(Value, &.{.{ .table = destination }}) catch return error.OutOfMemory;
+        return vm.allocator.dupe(Value, &.{destination}) catch return error.OutOfMemory;
     }
 
     fn tableSort(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len == 0) return error.RuntimeError;
-        const table = switch (args[0]) {
-            .table => |table| table,
-            else => return error.RuntimeError,
-        };
-        const comparator: ?Value = if (args.len == 2 and args[1] != .nil) args[1] else null;
-        if (comparator) |function| if (function != .function and function != .native_function) return error.RuntimeError;
-        const length: usize = table.len();
-        const values = vm.allocator.alloc(Value, length) catch return error.OutOfMemory;
-        defer vm.allocator.free(values);
-        for (values, 0..) |*value, i| value.* = table.getInt(@intCast(i + 1));
-        for (1..values.len) |i| {
-            const value = values[i];
-            var insertion = i;
-            while (insertion > 0 and try vm.tableSortLess(comparator, value, values[insertion - 1])) : (insertion -= 1) {
-                values[insertion] = values[insertion - 1];
-            }
-            values[insertion] = value;
+        const short = "sort";
+        const long = "table.sort";
+        if (args.len == 0) return vm.typeError(1, short, long, "table", null);
+        try vm.checkTableLike(args[0], .{ .read = true, .write = true, .len = true }, 1, short, long);
+        const length = try vm.objectLength(args[0]);
+        if (length > 1) {
+            if (length >= std.math.maxInt(i32)) return vm.raiseArgument(1, short, long, "array too big", .{});
+            // only a non-trivial interval is checked for a comparator, which is
+            // what makes `table.sort({}, 1)` succeed
+            const comparator: ?Value = if (args.len > 1 and args[1] != .nil)
+                try vm.checkFunction(args, 2, short, long)
+            else
+                null;
+            const size: usize = @intCast(length);
+            const values = vm.allocator.alloc(Value, size) catch return error.OutOfMemory;
+            defer vm.allocator.free(values);
+            for (values, 0..) |*value, i| value.* = try vm.tableGetIndex(args[0], @intCast(i + 1));
+            try vm.auxSort(values, comparator, 1, size);
+            for (values, 0..) |value, i| try vm.tableSetIndex(args[0], @intCast(i + 1), value);
         }
-        for (values, 0..) |value, i| table.set(intKey(@intCast(i + 1)), value) catch return error.OutOfMemory;
         return vm.allocator.alloc(Value, 0) catch return error.OutOfMemory;
     }
 
-    fn tableSortLess(vm: *VM, comparator: ?Value, left: Value, right: Value) Error!bool {
-        if (comparator) |function| {
-            const result = try vm.invokeCallableValues(function, &.{ left, right });
-            defer vm.allocator.free(result);
-            return result.len != 0 and result[0].truthy();
+    /// `auxsort`: the reference's quicksort over the copied range, indices
+    /// one-based and inclusive on both ends the way `ltablib.c` writes them, so
+    /// that the two `invalid order function for sorting` refusals land on the
+    /// same comparisons.
+    fn auxSort(vm: *VM, values: []Value, comparator: ?Value, start: usize, end: usize) Error!void {
+        var lo = start;
+        var up = end;
+        while (lo < up) {
+            try vm.tick();
+            if (try vm.sortLess(comparator, values[up - 1], values[lo - 1])) sortSwap(values, lo, up);
+            if (up - lo == 1) return;
+            const middle = (lo + up) / 2;
+            if (try vm.sortLess(comparator, values[middle - 1], values[lo - 1])) {
+                sortSwap(values, middle, lo);
+            } else if (try vm.sortLess(comparator, values[up - 1], values[middle - 1])) {
+                sortSwap(values, middle, up);
+            }
+            if (up - lo == 2) return;
+            // the pivot goes to `up - 1` so the partition can hold it there
+            sortSwap(values, middle, up - 1);
+            const cut = try vm.sortPartition(values, comparator, lo, up);
+            if (cut - lo < up - cut) {
+                try vm.auxSort(values, comparator, lo, cut - 1);
+                lo = cut + 1;
+            } else {
+                try vm.auxSort(values, comparator, cut + 1, up);
+                up = cut - 1;
+            }
         }
-        return switch (left) {
-            .number => |a| switch (right) {
-                .number => |b| Number.less(a, b),
-                else => error.RuntimeError,
-            },
-            .string => |a| switch (right) {
-                .string => |b| std.mem.lessThan(u8, a.slice(), b.slice()),
-                else => error.RuntimeError,
-            },
-            else => error.RuntimeError,
-        };
+    }
+
+    fn sortPartition(vm: *VM, values: []Value, comparator: ?Value, lo: usize, up: usize) Error!usize {
+        // the pivot sits at `up - 1` for the whole partition and is only moved
+        // by the swap that returns
+        const pivot = values[up - 2];
+        var i = lo;
+        var j = up - 1;
+        while (true) {
+            i += 1;
+            while (true) {
+                if (!try vm.sortLess(comparator, values[i - 1], pivot)) break;
+                if (i == up - 1) return vm.raise("invalid order function for sorting", .{});
+                i += 1;
+            }
+            j -= 1;
+            while (true) {
+                if (!try vm.sortLess(comparator, pivot, values[j - 1])) break;
+                if (j < i) return vm.raise("invalid order function for sorting", .{});
+                j -= 1;
+            }
+            if (j < i) {
+                sortSwap(values, i, up - 1);
+                return i;
+            }
+            sortSwap(values, i, j);
+        }
+    }
+
+    fn sortSwap(values: []Value, a: usize, b: usize) void {
+        const held = values[a - 1];
+        values[a - 1] = values[b - 1];
+        values[b - 1] = held;
+    }
+
+    fn sortLess(vm: *VM, comparator: ?Value, left: Value, right: Value) Error!bool {
+        if (comparator) |function| {
+            const results = try vm.invokeCallableValues(function, &.{ left, right });
+            defer vm.allocator.free(results);
+            return results.len != 0 and results[0].truthy();
+        }
+        return vm.lessThanValues(left, right);
+    }
+
+    /// The `<` operator without an AST to describe its operands with, which is
+    /// what `table.sort` compares with when it is handed no function. The
+    /// comparison failure reaches us through `lua_compare`, so it is
+    /// `luaG_runerror` and carries no position of its own.
+    fn lessThanValues(vm: *VM, left: Value, right: Value) Error!bool {
+        if (left == .string and right == .string)
+            return std.mem.order(u8, left.string.slice(), right.string.slice()) == .lt;
+        if (left == .number and right == .number) return Number.less(left.number, right.number);
+        const method = try vm.binaryMetamethod(left, right, "__lt");
+        if (method == .nil) {
+            const left_name = left.typeName();
+            const right_name = right.typeName();
+            if (std.mem.eql(u8, left_name, right_name))
+                return vm.raisePlain("attempt to compare two {s} values", .{left_name});
+            return vm.raisePlain("attempt to compare {s} with {s}", .{ left_name, right_name });
+        }
+        const results = try vm.invokeCallableValues(method, &.{ left, right });
+        defer vm.allocator.free(results);
+        return results.len != 0 and results[0].truthy();
     }
 
     fn intArgument(value: Value) Error!i64 {
@@ -3536,19 +4385,22 @@ pub const VM = struct {
         return vm.allocator.alloc(Value, 0) catch return error.OutOfMemory;
     }
 
+    /// `luaB_warn`: a first argument has to be there and read as a string,
+    /// and so does every argument after it. A control message is only a
+    /// control message when it is the whole call, which is where the
+    /// reference's `tocont` is zero on the first and only warning part.
     fn baseWarn(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len != 0 and args.len == 1) {
-            const message = switch (args[0]) {
-                .string => |string| string.slice(),
-                .number => vm.numberBytes(args[0].number),
-                else => return error.RuntimeError,
-            };
-            if (message.len > 0 and message[0] == '@') {
-                if (std.mem.eql(u8, message, "@on")) vm.warn_state = .ready else if (std.mem.eql(u8, message, "@off")) vm.warn_state = .off;
-                return vm.allocator.alloc(Value, 0) catch return error.OutOfMemory;
-            }
+        const short = "warn";
+        const long = "warn";
+        const first = try vm.checkString(args, 1, short, long);
+        for (2..args.len + 1) |index| _ = try vm.checkString(args, index, short, long);
+        if (args.len == 1 and first.len > 0 and first[0] == '@') {
+            if (std.mem.eql(u8, first, "@on")) vm.warn_state = .ready else if (std.mem.eql(u8, first, "@off")) vm.warn_state = .off;
+            // an unknown control message is swallowed the way `checkcontrol`
+            // swallows it: nothing is printed either way
+            return vm.allocator.alloc(Value, 0) catch return error.OutOfMemory;
         }
-        if (args.len == 0 or vm.warn_state == .off) return vm.allocator.alloc(Value, 0) catch return error.OutOfMemory;
+        if (vm.warn_state == .off) return vm.allocator.alloc(Value, 0) catch return error.OutOfMemory;
         const writer = vm.stderr orelse return error.RuntimeError;
         writer.writeAll("Lua warning: ") catch return error.RuntimeError;
         for (args) |value| {
@@ -3560,12 +4412,25 @@ pub const VM = struct {
         return vm.allocator.alloc(Value, 0) catch return error.OutOfMemory;
     }
 
+    /// `luaB_collectgarbage`. The option is read the way `luaL_checkoption`
+    /// reads it: an absent or nil first argument means `"collect"`, anything
+    /// else is a string once it has been coerced, and an unknown name is the
+    /// refusal naming what it was given. The options this runtime has no
+    /// knobs for are still accepted, so that the call succeeds as it does in
+    /// the reference.
     fn baseCollectGarbage(vm: *VM, args: []const Value) Error![]Value {
-        const option = if (args.len == 0) "collect" else switch (args[0]) {
-            .string => |string| string.slice(),
-            else => return error.RuntimeError,
-        };
-        if (!std.mem.eql(u8, option, "step") and args.len > 1) return error.RuntimeError;
+        const short = "collectgarbage";
+        const long = "collectgarbage";
+        const option = try vm.optString(args, 1, "collect", short, long);
+        const known = [_][]const u8{ "stop", "restart", "collect", "count", "step", "setpause", "setstepmul", "isrunning", "generational", "incremental" };
+        var valid = false;
+        for (known) |candidate| {
+            if (std.mem.eql(u8, option, candidate)) {
+                valid = true;
+                break;
+            }
+        }
+        if (!valid) return vm.raiseArgument(1, short, long, "invalid option '{s}'", .{option});
         if (std.mem.eql(u8, option, "collect")) {
             vm.gc_pending = true;
             return vm.allocator.alloc(Value, 0) catch return error.OutOfMemory;
@@ -3587,11 +4452,13 @@ pub const VM = struct {
             return vm.singleNumber(Number.Number.fromFloat(kilobytes));
         }
         if (std.mem.eql(u8, option, "step")) {
-            if (args.len == 2 and try intArgument(args[1]) < 0) return error.RuntimeError;
+            if (args.len > 1 and args[1] != .nil) _ = try vm.checkInteger(args, 2, short, long);
             vm.gc_pending = true;
             return vm.allocator.dupe(Value, &.{.{ .boolean = true }}) catch return error.OutOfMemory;
         }
-        return error.RuntimeError;
+        // `setpause`, `setstepmul`, `generational`, `incremental`: nothing to
+        // adjust here, but the reference accepts them and answers something
+        return vm.allocator.alloc(Value, 0) catch return error.OutOfMemory;
     }
 
     fn collectAtSafePoint(vm: *VM) Error!void {
@@ -3619,6 +4486,10 @@ pub const VM = struct {
         if (vm.string_metatable) |metatable| try roots.append(vm.allocator, .{ .table = metatable });
         if (vm.default_input) |table| try roots.append(vm.allocator, .{ .table = table });
         if (vm.default_output) |table| try roots.append(vm.allocator, .{ .table = table });
+        if (vm.default_error) |table| try roots.append(vm.allocator, .{ .table = table });
+        if (vm.stdin_cache) |table| try roots.append(vm.allocator, .{ .table = table });
+        if (vm.stdout_cache) |table| try roots.append(vm.allocator, .{ .table = table });
+        if (vm.stderr_cache) |table| try roots.append(vm.allocator, .{ .table = table });
         for (vm.exec.locals) |cell| try roots.append(vm.allocator, cell.value);
         for (vm.exec.suspended_locals.items) |frame| for (frame) |cell| try roots.append(vm.allocator, cell.value);
         for (vm.exec.upvalues) |cell| try roots.append(vm.allocator, cell.value);
@@ -3686,24 +4557,72 @@ pub const VM = struct {
     }
 
     fn baseType(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 1) return error.RuntimeError;
+        if (args.len < 1) return vm.raiseArgument(1, "type", "type", "value expected", .{});
         return vm.allocator.dupe(Value, &.{.{ .string = vm.interner.intern(args[0].typeName()) catch return error.OutOfMemory }}) catch return error.OutOfMemory;
     }
 
+    /// `luaB_load`. A string — or a number, which `lua_tolstring` converts in
+    /// place so `load(1)` compiles `"1"` — is the chunk to compile, and a
+    /// function is called for its pieces; anything else is refused the way
+    /// `luaL_checktype` refuses it. The chunk name defaults to the source
+    /// itself for a string and to `=(load)` for a reader.
     fn baseLoad(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len == 0 or args[0] != .string) return error.RuntimeError;
-        if (args.len > 2 and args[2] != .nil and args[2] != .string) return vm.loadFailure("bad argument #3 to 'load' (string expected)");
-        if (args.len > 2 and args[2] == .string) {
-            const mode = args[2].string.slice();
-            if (mode.len == 0 or (std.mem.indexOfScalar(u8, mode, 'b') == null and std.mem.indexOfScalar(u8, mode, 't') == null)) return vm.loadFailure("invalid mode");
-            for (mode) |byte| if (byte != 'b' and byte != 't') return vm.loadFailure("invalid mode");
-            if (std.mem.indexOfScalar(u8, mode, 'b') != null and std.mem.indexOfScalar(u8, mode, 't') == null) {
-                return vm.loadFailure("attempt to load a binary chunk (mode is 't')");
+        const short = "load";
+        const long = "load";
+        // `lua_tolstring` on arg 1: numbers are converted in place and
+        // anything else leaves s NULL, which decides the path below.
+        const is_text = args.len > 0 and (args[0] == .string or args[0] == .number);
+        const mode = try vm.optString(args, 3, "bt", short, long);
+        const chunk_name: []const u8 = if (args.len > 1 and args[1] != .nil)
+            try vm.checkString(args, 2, short, long)
+        else if (args.len > 0 and args[0] == .string)
+            args[0].string.slice()
+        else if (args.len > 0 and args[0] == .number)
+            vm.numberBytes(args[0].number)
+        else
+            "=(load)";
+        if (!is_text) {
+            // a native function reads pieces the same way a Lua one does, so
+            // `load(print)` is a load and not a type error
+            if (args.len == 0) return vm.typeError(1, short, long, "function", null);
+            switch (args[0]) {
+                .function, .native_function => {},
+                else => return vm.typeError(1, short, long, "function", args[0]),
             }
         }
+        if (std.mem.indexOfScalar(u8, mode, 't') == null) {
+            const message = std.fmt.allocPrint(vm.allocator, "attempt to load a text chunk (mode is '{s}')", .{mode}) catch return error.OutOfMemory;
+            defer vm.allocator.free(message);
+            return vm.loadFailure(message);
+        }
+        if (args.len > 0 and (args[0] == .function or args[0] == .native_function)) {
+            var pieces: std.ArrayList(u8) = .empty;
+            defer pieces.deinit(vm.allocator);
+            while (true) {
+                const results = try vm.invokeCallableValues(args[0], &.{});
+                defer vm.allocator.free(results);
+                // `generic_reader`: nil (or nothing) ends the chunk, and a
+                // number is a piece like any other, since `lua_isstring`
+                // accepts one. A function that never returns nil is the
+                // reference's own infinite read, so the loop is honest.
+                const piece = if (results.len == 0) .nil else results[0];
+                if (piece == .nil) break;
+                switch (piece) {
+                    .string => |string| pieces.appendSlice(vm.allocator, string.slice()) catch return error.OutOfMemory,
+                    .number => |number| pieces.appendSlice(vm.allocator, vm.numberBytes(number)) catch return error.OutOfMemory,
+                    else => return vm.loadFailure("reader function must return a string"),
+                }
+            }
+            return vm.loadCompile(pieces.items, chunk_name, args);
+        }
+        const source = if (args[0] == .number) vm.numberBytes(args[0].number) else args[0].string.slice();
+        return vm.loadCompile(source, chunk_name, args);
+    }
 
-        const chunk_name = if (args.len > 1 and args[1] == .string) args[1].string.slice() else "=(load)";
-        const source = args[0].string.slice();
+    /// Compile `source` as the chunk `chunk_name`, with `args[3]` as the
+    /// environment when present, and hand back the loaded function. Every
+    /// compile failure is a `nil, message` pair, never a raise.
+    fn loadCompile(vm: *VM, source: []const u8, chunk_name: []const u8, args: []const Value) Error![]Value {
         var arena_ptr = vm.allocator.create(std.heap.ArenaAllocator) catch return error.OutOfMemory;
         arena_ptr.* = .init(vm.allocator);
         var arena_transferred = false;
@@ -3723,7 +4642,7 @@ pub const VM = struct {
                 arena_ptr.deinit();
                 vm.allocator.destroy(arena_ptr);
                 arena_transferred = true;
-                return vm.loadFailureIn(chunk_name);
+                return vm.loadSyntaxFailure(&diagnostics, owned_source, chunk_name);
             },
         };
         const semantics = arena.create(Semantic.Program) catch return error.OutOfMemory;
@@ -3733,7 +4652,7 @@ pub const VM = struct {
                 arena_ptr.deinit();
                 vm.allocator.destroy(arena_ptr);
                 arena_transferred = true;
-                return vm.loadFailureIn(chunk_name);
+                return vm.loadSyntaxFailure(&diagnostics, owned_source, chunk_name);
             },
         };
         semantics.source = owned_source;
@@ -3742,7 +4661,7 @@ pub const VM = struct {
             arena_ptr.deinit();
             vm.allocator.destroy(arena_ptr);
             arena_transferred = true;
-            return vm.loadFailureIn(chunk_name);
+            return vm.loadSyntaxFailure(&diagnostics, owned_source, chunk_name);
         }
         vm.owned_program_arenas.append(vm.allocator, arena_ptr) catch return error.OutOfMemory;
         arena_transferred = true;
@@ -3776,6 +4695,152 @@ pub const VM = struct {
             return error.OutOfMemory;
         };
         return vm.allocator.dupe(Value, &.{.{ .function = function }}) catch return error.OutOfMemory;
+    }
+
+    /// A compile failure as the reference words one: the chunk name as
+    /// `luaO_chunkid` abbreviates it, the line, the message, and the token
+    /// the parser stopped on — `[string "s"]:1: syntax error near <eof>`.
+    ///
+    /// The message and the token come from the two places the reference builds
+    /// them: `luaX_syntaxerror` appends `near` the current token, and
+    /// `luaK_semerror` clears that token so no `near` is appended at all,
+    /// which is the whole shape of a semantic refusal.
+    fn loadSyntaxFailure(vm: *VM, diagnostics: *@import("Diagnostic.zig").Reporter, source: []const u8, chunk_name: []const u8) Error![]Value {
+        const Diagnostic = @import("Diagnostic.zig");
+        var name_buffer: [61]u8 = undefined;
+        const short_name = shortSource(&name_buffer, chunk_name);
+        if (diagnostics.errors.items.len == 0) {
+            const message = std.fmt.allocPrint(vm.allocator, "{s}: syntax error", .{short_name}) catch return error.OutOfMemory;
+            defer vm.allocator.free(message);
+            return vm.loadFailure(message);
+        }
+        const err: Diagnostic.Error = diagnostics.errors.items[0];
+        const line = lineAt(source, err.span.start);
+        // the line a semantic message names inside itself, which is the goto
+        // or the `break` rather than the position the check stopped at
+        const subject_line = if (err.name_span) |span| lineAt(source, span.start) else line;
+
+        // what goes between the position and the end: a semantic refusal with
+        // nothing after it, or a parser or lexer one with `near` behind it
+        const without_near = switch (err.kind) {
+            .break_outside_loop, .undefined_label, .duplicate_label, .goto_into_local_scope,
+            .assign_to_const, .vararg_outside_function, .unknown_attribute,
+            .multiple_close_variables, .too_many_locals, .too_many_upvalues,
+            => true,
+            else => false,
+        };
+
+        var what_buffer: [96]u8 = undefined;
+        const what: []const u8 = switch (err.kind) {
+            .break_outside_loop => std.fmt.bufPrint(&what_buffer, "break outside loop at line {d}", .{subject_line}) catch "syntax error",
+            .undefined_label => std.fmt.bufPrint(&what_buffer, "no visible label '{s}' for <goto> at line {d}", .{ err.name, subject_line }) catch "syntax error",
+            .duplicate_label => std.fmt.bufPrint(&what_buffer, "label '{s}' already defined on line {d}", .{
+                err.name,
+                if (err.opened_at) |at| lineAt(source, at.start) else line,
+            }) catch "syntax error",
+            .goto_into_local_scope => std.fmt.bufPrint(&what_buffer, "<goto {s}> at line {d} jumps into the scope of local '{s}'", .{ err.name, subject_line, err.opened_name }) catch "syntax error",
+            .assign_to_const => std.fmt.bufPrint(&what_buffer, "attempt to assign to const variable '{s}'", .{err.name}) catch "syntax error",
+            .vararg_outside_function => "cannot use '...' outside a vararg function",
+            .unknown_attribute => std.fmt.bufPrint(&what_buffer, "unknown attribute '{s}'", .{err.name}) catch "syntax error",
+            .multiple_close_variables => "multiple to-be-closed variables in local list",
+            // `errorlimit`'s wording, with the `where` the reference looks up
+            // from the function being compiled
+            .too_many_locals => limitWhat(&what_buffer, "local variables", 200, err, source),
+            .too_many_upvalues => limitWhat(&what_buffer, "upvalues", 255, err, source),
+            // what ran out of input too early, which the span lexeme says
+            .unexpected_eof => unfinishedWhat(&what_buffer, source, err.span.start),
+            .unexpected_newline => "unfinished string",
+            .invalid_char => "unexpected symbol",
+            .malformed_number => "malformed number",
+            // a stray closer at chunk level goes missing against the end of
+            // the file; a refused call is `exprstat`'s `syntax error`
+            .unexpected_token => if (err.found != null) closerWhat(&what_buffer, .eof) else "syntax error",
+            .invalid_assignment_target => "syntax error",
+            // `check_match` words the straggler against the closer the
+            // construct waits for: `<eof>` at chunk level, `end`, or `until`
+            .statement_after_return => closerWhat(&what_buffer, err.closer orelse .eof),
+            .expected_token => expectedWhat(&what_buffer, err.expected),
+            else => "syntax error",
+        };
+
+        var near_buffer: [64]u8 = undefined;
+        const near: []const u8 = near: {
+            if (without_near) break :near "";
+
+            // which span the quoted lexeme comes from, and when the token is
+            // end of file rather than a span at all
+            var lexeme_span = err.span;
+            var at_eof = err.found == .eof;
+            switch (err.kind) {
+                // the input ran out inside a string or a long bracket
+                .unexpected_eof => at_eof = true,
+                // a refused call or assignment target names the token after
+                // the expression, which is recorded rather than covered
+                .unexpected_token, .invalid_assignment_target => if (err.stopped) |at| {
+                    lexeme_span = at.span;
+                    at_eof = at.kind == .eof;
+                },
+                else => {},
+            }
+            if (at_eof) break :near "<eof>";
+            const lexeme = source[lexeme_span.start..@min(lexeme_span.end, source.len)];
+            if (lexeme.len == 0) break :near "<eof>";
+            break :near std.fmt.bufPrint(&near_buffer, "'{s}'", .{lexeme}) catch "<eof>";
+        };
+
+        const message: []const u8 = if (without_near)
+            std.fmt.allocPrint(vm.allocator, "{s}:{d}: {s}", .{ short_name, line, what }) catch return error.OutOfMemory
+        else
+            std.fmt.allocPrint(vm.allocator, "{s}:{d}: {s} near {s}", .{ short_name, line, what, near }) catch return error.OutOfMemory;
+        defer vm.allocator.free(message);
+        return vm.loadFailure(message);
+    }
+
+    // `errorlimit`'s `too many %s (limit is %d) in %s`, where the reference's
+    // `%s` is `main function` or `function at line N`
+    fn limitWhat(buffer: []u8, what: []const u8, limit: u32, err: @import("Diagnostic.zig").Error, source: []const u8) []const u8 {
+        if (err.opened_at) |body| return std.fmt.bufPrint(buffer, "too many {s} (limit is {d}) in {s} at line {d}", .{
+            what,
+            limit,
+            err.opened_name,
+            lineAt(source, body.start),
+        }) catch "syntax error";
+        return std.fmt.bufPrint(buffer, "too many {s} (limit is {d}) in {s}", .{ what, limit, err.opened_name }) catch "syntax error";
+    }
+
+    // what ran out of input too early, which the span lexeme says: a quote is
+    // a short string; `[[` is a long string and `--[[` the comment form, since
+    // the long-bracket scan starts at the `[` either way
+    fn unfinishedWhat(buffer: []u8, source: []const u8, start: u32) []const u8 {
+        const at: usize = start;
+        if (at >= source.len) return "syntax error";
+        return switch (source[at]) {
+            '"', '\'' => "unfinished string",
+            '[' => std.fmt.bufPrint(buffer, "unfinished long {s} (starting at line {d})", .{
+                if (at >= 2 and std.mem.eql(u8, source[at - 2 .. at], "--")) "comment" else "string",
+                lineAt(source, start),
+            }) catch "syntax error",
+            else => "syntax error",
+        };
+    }
+
+    // a closer named as itself, except end of file, which reads `<eof>` with
+    // no quotes around it — `luaX_token2str`'s split
+    fn closerWhat(buffer: []u8, kind: @import("Token.zig").Kind) []const u8 {
+        if (kind == .eof) return "<eof> expected";
+        const text = @import("Token.zig").luaText(kind) orelse "token";
+        return std.fmt.bufPrint(buffer, "'{s}' expected", .{text}) catch "syntax error";
+    }
+
+    // `error_expected`'s `'{X}' expected`, with the classes that stand for a
+    // run of tokens worded as the reference words them
+    fn expectedWhat(buffer: []u8, expected: ?@import("Diagnostic.zig").Error.Expected) []const u8 {
+        if (expected) |wanted| switch (wanted) {
+            .token => |kind| return closerWhat(buffer, kind),
+            .expression, .statement => return "unexpected symbol",
+            .arguments => return "function arguments expected",
+        };
+        return "syntax error";
     }
 
     fn loadFailure(vm: *VM, message: []const u8) Error![]Value {
@@ -3820,7 +4885,7 @@ pub const VM = struct {
     }
 
     fn baseToString(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 1) return error.RuntimeError;
+        try vm.checkAny(args, 1, "tostring", "tostring");
         const value = args[0];
         if (value == .string) return vm.allocator.dupe(Value, &.{value}) catch return error.OutOfMemory;
         if (value == .table) {
@@ -3828,8 +4893,14 @@ pub const VM = struct {
             if (method != .nil) {
                 const returned = try vm.invokeCallableValues(method, &.{value});
                 defer vm.allocator.free(returned);
-                if (returned.len == 0 or returned[0] != .string) return error.RuntimeError;
-                return vm.allocator.dupe(Value, &.{returned[0]}) catch return error.OutOfMemory;
+                // `lua_isstring` lets a number through, so only a value with
+                // no string reading at all is refused
+                const outcome: Value = if (returned.len == 0) .nil else returned[0];
+                return switch (outcome) {
+                    .string => |string| vm.allocator.dupe(Value, &.{.{ .string = string }}) catch return error.OutOfMemory,
+                    .number => |number| vm.allocator.dupe(Value, &.{.{ .string = vm.interner.intern(vm.scratchNumber(number)) catch return error.OutOfMemory }}) catch return error.OutOfMemory,
+                    else => vm.raise("'__tostring' must return a string", .{}),
+                };
             }
         }
         var buffer: [64]u8 = undefined;
@@ -3842,13 +4913,19 @@ pub const VM = struct {
     /// with `%s: %p`; the address itself differs run to run, so anything
     /// comparing output has to scrub it either way.
     fn defaultBytes(vm: *VM, value: Value, buffer: *[64]u8) Error![]const u8 {
-        _ = vm;
         return switch (value) {
             .nil => "nil",
             .boolean => |boolean| if (boolean) "true" else "false",
             .number => |number| Number.toBytes(number, buffer) catch return error.RuntimeError,
             .string => |string| string.slice(),
-            .table => |table| std.fmt.bufPrint(buffer, "table: 0x{x}", .{@intFromPtr(table)}) catch return error.RuntimeError,
+            // `luaL_tolstring` names an object by its metatable's `__name` when
+            // there is one, so `tostring` on a table that declares one reads
+            // `Zed: 0x...` rather than `table: 0x...`
+            .table => |table| blk: {
+                const named = try vm.metamethod(table, "__name");
+                const kind = if (named == .string) named.string.slice() else "table";
+                break :blk std.fmt.bufPrint(buffer, "{s}: 0x{x}", .{ kind, @intFromPtr(table) }) catch return error.RuntimeError;
+            },
             .function => |function| std.fmt.bufPrint(buffer, "function: 0x{x}", .{@intFromPtr(function)}) catch return error.RuntimeError,
             // a native function has no pointer of its own, so its ordinal
             // stands in for the C function address `%p` would print
@@ -3857,25 +4934,43 @@ pub const VM = struct {
         };
     }
 
+    /// `luaB_tonumber`. The two-argument form wants a string and refuses a
+    /// number outright, and its base is checked before the string is.
     fn baseToNumber(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len == 0) return error.RuntimeError;
-        const result: Value = if (args.len == 1 and args[0] == .number) args[0] else if (args[0] == .string) blk: {
+        const short = "tonumber";
+        const long = "tonumber";
+        const result: Value = if (args.len < 2 or args[1] == .nil) blk: {
+            if (args.len == 0) return vm.raiseArgument(1, short, long, "value expected", .{});
+            if (args[0] == .number) break :blk args[0];
+            if (args[0] == .string) {
+                const bytes = std.mem.trim(u8, args[0].string.slice(), " \t\r\n\x0b\x0c");
+                break :blk if (Number.parse(bytes)) |number| .{ .number = number } else .nil;
+            }
+            // something that cannot convert still has to have been passed
+            try vm.checkAny(args, 1, short, long);
+            break :blk .nil;
+        } else blk: {
+            const base = try vm.checkInteger(args, 2, short, long);
+            if (args.len < 1 or args[0] != .string) return vm.typeError(1, short, long, "string", if (args.len >= 1) args[0] else null);
+            if (base < 2 or base > 36) return vm.raiseArgument(2, short, long, "base out of range", .{});
             const bytes = std.mem.trim(u8, args[0].string.slice(), " \t\r\n\x0b\x0c");
-            if (args.len == 1) break :blk if (Number.parse(bytes)) |number| .{ .number = number } else .nil;
-            const base = try intArgument(args[1]);
-            if (base < 2 or base > 36) return error.RuntimeError;
-            const integer = std.fmt.parseInt(i64, bytes, @intCast(base)) catch break :blk .nil;
-            break :blk .{ .number = Number.Number.fromInt(integer) };
-        } else .nil;
+            const integer = std.fmt.parseInt(i64, bytes, @intCast(base)) catch break :blk Value.nil;
+            break :blk Value{ .number = Number.Number.fromInt(integer) };
+        };
         return vm.allocator.dupe(Value, &.{result}) catch return error.OutOfMemory;
     }
 
+    /// `luaB_assert`: a true first argument hands everything back, and a
+    /// failing one has to have been given at all before it can be blamed.
     fn baseAssert(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len == 0 or !args[0].truthy()) {
-            vm.exec.thrown_error = if (args.len > 1) args[1] else .{ .string = vm.interner.intern("assertion failed!") catch return error.OutOfMemory };
-            return error.RuntimeError;
-        }
-        return vm.allocator.dupe(Value, args) catch return error.OutOfMemory;
+        if (args.len > 0 and args[0].truthy()) return vm.allocator.dupe(Value, args) catch return error.OutOfMemory;
+        try vm.checkAny(args, 1, "assert", "assert");
+        // the message follows `error(msg, 1)`: a string gains the position of
+        // the call it came through, anything else is thrown whole
+        const message: Value = if (args.len > 1) args[1] else .{ .string = vm.interner.intern("assertion failed!") catch return error.OutOfMemory };
+        if (message == .string) return vm.raise("{s}", .{message.string.slice()});
+        vm.exec.thrown_error = message;
+        return error.RuntimeError;
     }
 
     /// Raises a runtime error the way `luaG_runerror` does: the message gains
@@ -3929,23 +5024,165 @@ pub const VM = struct {
         return error.RuntimeError;
     }
 
-    /// `luaL_argerror`: the short name when the caller is a Lua function,
-    /// which is when the reference reads it off the calling instruction, and
-    /// the qualified name when the caller is another native, which is when
-    /// `pushglobalfuncname` looks the function up in the loaded libraries.
-    fn raiseArgument(vm: *VM, argument: usize, short: []const u8, long: []const u8, comptime fmt: []const u8, args: anytype) Error {
-        var detail_buffer: [128]u8 = undefined;
-        const detail = std.fmt.bufPrint(&detail_buffer, fmt, args) catch fmt;
+    /// `luaL_argerror`. The name comes from the calling instruction when there
+    /// is one: the short name for a syntactic call (`string.sub(...)` reads
+    /// `sub`) and the qualified one when the call went through a value, which
+    /// is when the reference's `lua_getinfo` comes back empty and
+    /// `pushglobalfuncname` looks the function up in the loaded libraries. A
+    /// method call counts its receiver as argument zero, so the index moves
+    /// down one and an error about the receiver itself reads
+    /// `calling 'sub' on bad self (...)`.
+    fn argError(vm: *VM, argument: usize, short: []const u8, long: []const u8, detail: []const u8) Error {
+        var index = argument;
+        var bad_self: ?[]const u8 = null;
+        const frames = vm.exec.error_frames.items;
+        if (frames.len != 0) {
+            const frame = frames[frames.len - 1];
+            if (frame.method) |method| {
+                index -= 1;
+                if (index == 0) bad_self = method;
+            }
+        }
+        const name = if (frames.len != 0 and frames[frames.len - 1].from_call_site) short else long;
+        const shape = if (bad_self) |method|
+            std.fmt.allocPrint(vm.allocator, "calling '{s}' on bad self ({s})", .{ method, detail }) catch return error.OutOfMemory
+        else
+            std.fmt.allocPrint(vm.allocator, "bad argument #{d} to '{s}' ({s})", .{ index, name, detail }) catch return error.OutOfMemory;
+        defer vm.allocator.free(shape);
         var position_buffer: [192]u8 = undefined;
         const position = vm.nativeRaisePosition(&position_buffer) catch null;
-        const name = if (position == null) long else short;
         const message = if (position) |p|
-            std.fmt.allocPrint(vm.allocator, "{s}bad argument #{d} to '{s}' ({s})", .{ p, argument, name, detail }) catch return error.OutOfMemory
+            std.fmt.allocPrint(vm.allocator, "{s}{s}", .{ p, shape }) catch return error.OutOfMemory
         else
-            std.fmt.allocPrint(vm.allocator, "bad argument #{d} to '{s}' ({s})", .{ argument, name, detail }) catch return error.OutOfMemory;
+            vm.allocator.dupe(u8, shape) catch return error.OutOfMemory;
         defer vm.allocator.free(message);
         vm.exec.thrown_error = .{ .string = vm.interner.intern(message) catch return error.OutOfMemory };
         return error.RuntimeError;
+    }
+
+    /// `luaL_argerror` with the detail still a format string.
+    fn raiseArgument(vm: *VM, argument: usize, short: []const u8, long: []const u8, comptime fmt: []const u8, args: anytype) Error {
+        var detail_buffer: [128]u8 = undefined;
+        const detail = std.fmt.bufPrint(&detail_buffer, fmt, args) catch fmt;
+        return vm.argError(argument, short, long, detail);
+    }
+
+    /// `luaL_typeerror`: `"{expected} expected, got {actual}"`. An argument that
+    /// was never passed reads `no value`, and an object whose metatable names a
+    /// type through `__name` is reported under that name, which is how a named
+    /// table or a userdata describes itself.
+    fn typeError(vm: *VM, argument: usize, short: []const u8, long: []const u8, expected: []const u8, got: ?Value) Error {
+        const actual = if (got) |value| try vm.messageTypeName(value) else "no value";
+        return vm.raiseArgument(argument, short, long, "{s} expected, got {s}", .{ expected, actual });
+    }
+
+    fn messageTypeName(vm: *VM, value: Value) Error![]const u8 {
+        if (value == .table) {
+            const name = try vm.metamethod(value.table, "__name");
+            if (name == .string) return name.string.slice();
+        }
+        return value.typeName();
+    }
+
+    /// `luaL_checkany`: only an argument that was never passed is a failure.
+    fn checkAny(vm: *VM, args: []const Value, argument: usize, short: []const u8, long: []const u8) Error!void {
+        if (argument > args.len) return vm.raiseArgument(argument, short, long, "value expected", .{});
+    }
+
+    /// Where a number that has to be read as a string is written. Rotating, so
+    /// one call holding several of them at once does not clobber the earlier
+    /// one, and never freed, since the bytes outlive only the call that is
+    /// reading them.
+    fn scratchNumber(vm: *VM, number: Number.Number) []const u8 {
+        const slot = &vm.text_scratch[vm.text_scratch_slot];
+        vm.text_scratch_slot +%= 1;
+        return Number.toBytes(number, slot) catch "0";
+    }
+
+    /// `luaL_checklstring`: a string, or a number written out the way
+    /// `luaV_tostring` writes it.
+    fn checkString(vm: *VM, args: []const Value, argument: usize, short: []const u8, long: []const u8) Error![]const u8 {
+        const value = if (argument <= args.len) args[argument - 1] else return vm.typeError(argument, short, long, "string", null);
+        return switch (value) {
+            .string => |string| string.slice(),
+            .number => |number| vm.scratchNumber(number),
+            else => vm.typeError(argument, short, long, "string", value),
+        };
+    }
+
+    /// `luaL_optlstring`.
+    fn optString(vm: *VM, args: []const Value, argument: usize, comptime default: []const u8, short: []const u8, long: []const u8) Error![]const u8 {
+        if (argument > args.len or args[argument - 1] == .nil) return default;
+        return vm.checkString(args, argument, short, long);
+    }
+
+    /// `luaL_checknumber`, which always hands back a double: a string arrives as
+    /// the float it names, and `lua_isinteger` on the original argument is what
+    /// lets a function keep an integer path for an integer written as one.
+    fn checkNumber(vm: *VM, args: []const Value, argument: usize, short: []const u8, long: []const u8) Error!Number.Number {
+        const value = if (argument <= args.len) args[argument - 1] else return vm.typeError(argument, short, long, "number", null);
+        return switch (value) {
+            .number => |number| number,
+            .string => |string| blk: {
+                const parsed = Number.parse(string.slice()) orelse return vm.typeError(argument, short, long, "number", value);
+                break :blk switch (parsed) {
+                    .int => |integer| Number.Number.fromFloat(@floatFromInt(integer)),
+                    .float => |float| Number.Number.fromFloat(float),
+                };
+            },
+            else => vm.typeError(argument, short, long, "number", value),
+        };
+    }
+
+    /// `luaL_optnumber`.
+    fn optNumber(vm: *VM, args: []const Value, argument: usize, default: Number.Number, short: []const u8, long: []const u8) Error!Number.Number {
+        if (argument > args.len or args[argument - 1] == .nil) return default;
+        return vm.checkNumber(args, argument, short, long);
+    }
+
+    /// `luaL_checkinteger`, which reads a numeric string too and refuses a
+    /// number that has no integer representation by saying so.
+    fn checkInteger(vm: *VM, args: []const Value, argument: usize, short: []const u8, long: []const u8) Error!i64 {
+        const value = if (argument <= args.len) args[argument - 1] else return vm.typeError(argument, short, long, "number", null);
+        return switch (value) {
+            .number => |number| number.toIntExact() orelse
+                vm.raiseArgument(argument, short, long, "number has no integer representation", .{}),
+            .string => |string| blk: {
+                const parsed = Number.parse(string.slice()) orelse return vm.typeError(argument, short, long, "number", value);
+                break :blk switch (parsed) {
+                    .int => |integer| integer,
+                    .float => |float| blk2: {
+                        const truncated = @trunc(float);
+                        if (truncated != float or std.math.isNan(float) or std.math.isInf(float))
+                            return vm.raiseArgument(argument, short, long, "number has no integer representation", .{});
+                        break :blk2 @as(i64, @intFromFloat(truncated));
+                    },
+                };
+            },
+            else => vm.typeError(argument, short, long, "number", value),
+        };
+    }
+
+    /// `luaL_optinteger`.
+    fn optInteger(vm: *VM, args: []const Value, argument: usize, default: i64, short: []const u8, long: []const u8) Error!i64 {
+        if (argument > args.len or args[argument - 1] == .nil) return default;
+        return vm.checkInteger(args, argument, short, long);
+    }
+
+    fn checkTable(vm: *VM, args: []const Value, argument: usize, short: []const u8, long: []const u8) Error!*Table {
+        const value = if (argument <= args.len) args[argument - 1] else return vm.typeError(argument, short, long, "table", null);
+        return switch (value) {
+            .table => |table| table,
+            else => vm.typeError(argument, short, long, "table", value),
+        };
+    }
+
+    fn checkFunction(vm: *VM, args: []const Value, argument: usize, short: []const u8, long: []const u8) Error!Value {
+        const value = if (argument <= args.len) args[argument - 1] else return vm.typeError(argument, short, long, "function", null);
+        return switch (value) {
+            .function, .native_function => value,
+            else => vm.typeError(argument, short, long, "function", value),
+        };
     }
 
     fn baseError(vm: *VM, args: []const Value) Error![]Value {
@@ -3986,7 +5223,7 @@ pub const VM = struct {
         const offset = vm.exec.error_frames.items[index + 1].call_offset;
         if (offset == null or program.source.len == 0) return null;
         const line = lineAt(program.source, offset.?);
-        var name_buffer: [64]u8 = undefined;
+        var name_buffer: [61]u8 = undefined;
         const name = shortSource(&name_buffer, program.chunk_name);
         return std.fmt.bufPrint(buffer, "{s}:{d}: ", .{ name, line }) catch return error.RuntimeError;
     }
@@ -4004,7 +5241,7 @@ pub const VM = struct {
         const offset = frames[frames.len - 1].call_offset orelse return null;
         if (program.source.len == 0) return null;
         const line = lineAt(program.source, offset);
-        var name_buffer: [64]u8 = undefined;
+        var name_buffer: [61]u8 = undefined;
         const name = shortSource(&name_buffer, program.chunk_name);
         return std.fmt.bufPrint(buffer, "{s}:{d}: ", .{ name, line }) catch return error.RuntimeError;
     }
@@ -4016,67 +5253,92 @@ pub const VM = struct {
             const program = vm.exec.error_frames.items[index].program orelse continue;
             if (vm.exec.error_offset == null or program.source.len == 0) return null;
             const line = lineAt(program.source, vm.exec.error_offset.?);
-            var name_buffer: [64]u8 = undefined;
+            var name_buffer: [61]u8 = undefined;
             const name = shortSource(&name_buffer, program.chunk_name);
             return std.fmt.bufPrint(buffer, "{s}:{d}: ", .{ name, line }) catch return error.RuntimeError;
         }
         return null;
     }
 
+    /// `luaB_select`: a first argument starting with `'#'` counts the rest,
+    /// otherwise the index is clipped to `n` the way `luaB_select` clips it,
+    /// and only an index below one is out of range.
     fn baseSelect(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len == 0) return error.RuntimeError;
-        if (args[0] == .string and std.mem.eql(u8, args[0].string.slice(), "#")) {
-            return vm.allocator.dupe(Value, &.{.{ .number = Number.Number.fromInt(std.math.cast(i64, args.len - 1) orelse return error.RuntimeError) }}) catch return error.OutOfMemory;
+        const short = "select";
+        const long = "select";
+        if (args.len > 0 and args[0] == .string and args[0].string.slice()[0] == '#') {
+            const count = std.math.cast(i64, args.len - 1) orelse return error.RuntimeError;
+            return vm.allocator.dupe(Value, &.{.{ .number = Number.Number.fromInt(count) }}) catch return error.OutOfMemory;
         }
-        const selector = try intArgument(args[0]);
-        const start: usize = if (selector > 0)
-            @min(std.math.cast(usize, selector) orelse return error.RuntimeError, args.len)
-        else if (selector < 0) blk: {
-            if (selector == std.math.minInt(i64)) return error.RuntimeError;
-            const offset = std.math.cast(usize, -selector) orelse return error.RuntimeError;
-            if (offset > args.len - 1) return error.RuntimeError;
-            break :blk args.len - offset;
-        } else return error.RuntimeError;
+        const n = std.math.cast(i64, args.len) orelse return error.RuntimeError;
+        const selector = try vm.checkInteger(args, 1, short, long);
+        const chosen = if (selector < 0)
+            n + selector
+        else if (selector > n)
+            n
+        else
+            selector;
+        if (chosen < 1) return vm.raiseArgument(1, short, long, "index out of range", .{});
+        const start = std.math.cast(usize, chosen) orelse return error.RuntimeError;
         return vm.allocator.dupe(Value, args[start..]) catch return error.OutOfMemory;
     }
 
     fn baseRawequal(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 2) return error.RuntimeError;
+        const short = "rawequal";
+        const long = "rawequal";
+        try vm.checkAny(args, 1, short, long);
+        try vm.checkAny(args, 2, short, long);
         return vm.allocator.dupe(Value, &.{.{ .boolean = args[0].equal(args[1]) }}) catch return error.OutOfMemory;
     }
 
     fn baseRawGet(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 2 or args[0] != .table) return error.RuntimeError;
-        return vm.allocator.dupe(Value, &.{args[0].table.get(args[1])}) catch return error.OutOfMemory;
+        const table = try vm.checkTable(args, 1, "rawget", "rawget");
+        try vm.checkAny(args, 2, "rawget", "rawget");
+        return vm.allocator.dupe(Value, &.{table.get(if (args.len > 1) args[1] else .nil)}) catch return error.OutOfMemory;
     }
 
     fn baseRawSet(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 3 or args[0] != .table) return error.RuntimeError;
-        args[0].table.set(args[1], args[2]) catch return error.OutOfMemory;
+        const table = try vm.checkTable(args, 1, "rawset", "rawset");
+        try vm.checkAny(args, 2, "rawset", "rawset");
+        try vm.checkAny(args, 3, "rawset", "rawset");
+        table.set(if (args.len > 1) args[1] else .nil, if (args.len > 2) args[2] else .nil) catch return error.OutOfMemory;
         return vm.allocator.dupe(Value, &.{args[0]}) catch return error.OutOfMemory;
     }
 
     fn baseRawLen(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 1) return error.RuntimeError;
+        const short = "rawlen";
+        const long = "rawlen";
+        if (args.len == 0) return vm.typeError(1, short, long, "table or string", null);
         const length: i64 = switch (args[0]) {
             .string => |string| std.math.cast(i64, string.slice().len) orelse return error.RuntimeError,
             .table => |table| table.len(),
-            else => return error.RuntimeError,
+            else => return vm.typeError(1, short, long, "table or string", args[0]),
         };
         return vm.allocator.dupe(Value, &.{.{ .number = Number.Number.fromInt(length) }}) catch return error.OutOfMemory;
     }
 
     fn baseSetMetatable(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 2 or args[0] != .table) return error.RuntimeError;
+        const short = "setmetatable";
+        const long = "setmetatable";
+        if (args.len == 0) return vm.typeError(1, short, long, "table", null);
+        if (args[0] != .table) return vm.typeError(1, short, long, "table", args[0]);
+        // an omitted second argument is `no value`, not the `nil` that clears
+        if (args.len < 2) return vm.typeError(2, short, long, "nil or table", null);
+        const replacement = args[1];
+        if (replacement != .nil and replacement != .table)
+            return vm.typeError(2, short, long, "nil or table", replacement);
         const table = args[0].table;
         if (table.metatable) |metatable| if (metatable.get(.{ .string = vm.interner.intern("__metatable") catch return error.OutOfMemory }) != .nil)
-            return vm.raisePlain("cannot change a protected metatable", .{});
-        table.metatable = if (args[1] == .table) args[1].table else null;
+            return vm.raise("cannot change a protected metatable", .{});
+        table.metatable = switch (replacement) {
+            .table => |inner| inner,
+            else => null,
+        };
         return vm.allocator.dupe(Value, &.{args[0]}) catch return error.OutOfMemory;
     }
 
     fn baseGetMetatable(vm: *VM, args: []const Value) Error![]Value {
-        if (args.len < 1) return error.RuntimeError;
+        try vm.checkAny(args, 1, "getmetatable", "getmetatable");
         const metatable = switch (args[0]) {
             .table => |table| table.metatable orelse return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory,
             .string => vm.string_metatable orelse return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory,
@@ -4123,6 +5385,7 @@ pub const VM = struct {
         try vm.putNative(library, "pack", .string_pack);
         try vm.putNative(library, "packsize", .string_packsize);
         try vm.putNative(library, "unpack", .string_unpack);
+        try vm.putNative(library, "dump", .string_dump);
         const metatable = try vm.newTable();
         metatable.set(.{ .string = vm.interner.intern("__index") catch return error.OutOfMemory }, .{ .table = library }) catch return error.OutOfMemory;
         vm.string_metatable = metatable;
@@ -4198,9 +5461,12 @@ pub const VM = struct {
         try vm.putNative(methods, "close", .file_close);
         try vm.putNative(methods, "seek", .file_seek);
         try vm.putNative(methods, "lines", .file_lines);
+        try vm.putNative(methods, "setvbuf", .file_setvbuf);
         metatable.set(.{ .string = vm.interner.intern("__index") catch return error.OutOfMemory }, .{ .table = methods }) catch return error.OutOfMemory;
         try vm.putNative(metatable, "__close", .file_close);
         try vm.putNative(metatable, "__gc", .file_close);
+        try vm.putNative(metatable, "__tostring", .file_tostring);
+        metatable.set(.{ .string = vm.interner.intern("__name") catch return error.OutOfMemory }, .{ .string = vm.interner.intern("FILE*") catch return error.OutOfMemory }) catch return error.OutOfMemory;
         metatable.set(.{ .string = vm.interner.intern("__metatable") catch return error.OutOfMemory }, .{ .boolean = true }) catch return error.OutOfMemory;
         vm.file_metatable = metatable;
         const library = try vm.newTable();
@@ -4214,6 +5480,11 @@ pub const VM = struct {
         try vm.putNative(library, "output", .io_output);
         try vm.putNative(library, "read", .io_read);
         try vm.putNative(library, "tmpfile", .io_tmpfile);
+        // `io.stdin` and friends are handed out by name, which is the only
+        // thing the library's own `__index` is for
+        const io_metatable = try vm.newTable();
+        try vm.putNative(io_metatable, "__index", .io_index);
+        library.metatable = io_metatable;
         vm.globals.set(.{ .string = vm.interner.intern("io") catch return error.OutOfMemory }, .{ .table = library }) catch return error.OutOfMemory;
     }
 
@@ -4807,7 +6078,7 @@ test "byte string library operations" {
     try testing.expectEqualStrings("AB", values[9].string.slice());
     try testing.expectEqual(@as(i64, 5), values[10].number.int);
     try testing.expectEqual(@as(i64, 6), values[11].number.int);
-    try testing.expect(values[12] == .boolean and !values[12].boolean);
+    try testing.expect(values[12] == .nil);
     try testing.expectEqual(@as(i64, 1), values[13].number.int);
     try testing.expectEqual(@as(i64, 7), values[14].number.int);
     try testing.expectEqualStrings("abc", values[15].string.slice());
@@ -4909,7 +6180,7 @@ test "math random supports seeded repeatability and integer ranges" {
     defer arena.deinit();
     var reporter: Diagnostic.Reporter = .{ .gpa = testing.allocator };
     defer reporter.deinit();
-    var parser = Parser.fromSource("math.randomseed(123, 456); local a = math.random(); local x = math.random(10); local y = math.random(-5, 5); math.randomseed(123, 456); local b = math.random(); local seed1, seed2 = math.randomseed(); local full = math.random(0); local wide = math.random(-9223372036854775808, 9223372036854775807); return a == b, x >= 1 and x <= 10, y >= -5 and y <= 5, a >= 0 and a < 1, seed1 == 0x6c75616c697465, seed2 == 0x72616e646f6d, math.type(full) == 'integer', math.type(wide) == 'integer'", &arena, &reporter);
+    var parser = Parser.fromSource("math.randomseed(123, 456); local a = math.random(); local x = math.random(10); local y = math.random(-5, 5); math.randomseed(123, 456); local b = math.random(); local seed1, seed2 = math.randomseed(); local full = math.random(0); local wide = math.random(-9223372036854775808, 9223372036854775807); return a == b, x >= 1 and x <= 10, y >= -5 and y <= 5, a >= 0 and a < 1, math.type(seed1) == 'integer', math.type(seed2) == 'integer', math.type(full) == 'integer', math.type(wide) == 'integer'", &arena, &reporter);
     const chunk = try parser.parseChunk();
     const semantics = try Semantic.analyze(arena.allocator(), &reporter, &chunk);
     var tracker: @import("Object.zig").Tracker = .init(testing.allocator);
@@ -5070,7 +6341,8 @@ test "io files support formats, seeking, append, and automatic line iteration" {
         \\f = assert(io.open(path, "r"))
         \\local lines = ""
         \\for number, rest in f:lines("*n", "*l") do lines = lines .. number .. rest end
-        \\assert(io.type(f) == "closed file")
+        \\assert(io.type(f) == "file")
+        \\assert(f:close())
         \\local temp = assert(io.tmpfile())
         \\temp:write("temporary")
         \\temp:seek("set", 0)

@@ -283,7 +283,7 @@ fn parseCall(
     colon: ?Token,
     method: ?Ast.Identifier,
 ) Parser.Error!*Ast.FunctionCall {
-    const arguments = try parseArguments(parser, method != null);
+    const arguments = try parseArguments(parser);
 
     return parser.box(Ast.FunctionCall, .{
         .span = Token.merge(spanOf(object), argumentsSpan(arguments)),
@@ -295,10 +295,10 @@ fn parseCall(
 }
 
 // all three of `( ... )`, `{ ... }` and a string are open to a method call as
-// well as a plain one. colon_only only decides how a call with nothing to open
-// is reported: `:` promises an argument list so it names `(`, where a plain
-// call just has no arguments to parse.
-fn parseArguments(parser: *Parser, colon_only: bool) Parser.Error!Ast.Arguments {
+// well as a plain one, and a call with nothing to open either is refused the
+// same way — `funcargs` in lparser.c words it `function arguments expected`
+// for both, which `load` renders as its own.
+fn parseArguments(parser: *Parser) Parser.Error!Ast.Arguments {
     const token = try parser.peek();
 
     switch (token.kind) {
@@ -323,10 +323,7 @@ fn parseArguments(parser: *Parser, colon_only: bool) Parser.Error!Ast.Arguments 
                 .close_paren_span = close.span,
             } };
         },
-        else => if (colon_only)
-            return parser.fail(.expected_token, token, .{ .token = .lparen })
-        else
-            return parser.fail(.expected_token, token, .arguments),
+        else => return parser.fail(.expected_token, token, .arguments),
     }
 }
 
@@ -358,7 +355,18 @@ fn parseArgumentExpressions(parser: *Parser) Parser.Error![]Ast.Expression {
 pub fn toVariable(parser: *Parser, expr: Ast.Expression) Parser.Error!Ast.Variable {
     return switch (expr) {
         .variable => |variable| variable.*,
-        else => parser.failSpan(.invalid_assignment_target, spanOf(expr)),
+        else => {
+            // `restassign` in lparser.c refuses anything that is not a
+            // VKISVAR, and the `near` a message carries is the token the
+            // parser stopped on — the `=` — rather than the expression
+            const stopped = try parser.peek();
+            parser.report(.{
+                .kind = .invalid_assignment_target,
+                .span = spanOf(expr),
+                .stopped = stopped,
+            }) catch return error.ReportFailed;
+            return error.ParserFailed;
+        },
     };
 }
 

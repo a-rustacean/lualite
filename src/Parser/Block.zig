@@ -28,12 +28,20 @@ pub fn parseBlock(parser: *Parser, terminators: []const Token.Kind) Parser.Error
     while (!try parser.atBlockEnd(terminators)) {
         // `return` has to be the last statement of a block. Once one has been seen the
         // next statement is worth one diagnostic, but the block keeps parsing so
-        // the rest of it is not torn up as well.
+        // the rest of it is not torn up as well. The closer is the one the
+        // construct waits for, which is what the reference's `check_match`
+        // words the refusal as: `<eof>` for the chunk, `until` for a `repeat`,
+        // `end` for everything else.
         if (ret_statement != null and !reported_after_return) {
+            const closer: Token.Kind = if (parser.openBlock()) |open|
+                if (open.keyword == .repeat) .until else .end
+            else
+                .eof;
             try parser.report(.{
                 .kind = .statement_after_return,
                 .span = (try parser.peek()).span,
                 .found = (try parser.peek()).kind,
+                .closer = closer,
             });
             reported_after_return = true;
         }

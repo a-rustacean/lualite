@@ -95,7 +95,10 @@ fn lexString(lexer: *const @This(), reporter: *Diagnostic.Reporter, start: usize
                     curr += 1;
                 }
             },
-            '\n', '\r' => return report(reporter, .unexpected_newline, curr, curr + 1),
+            // the span is the partial string rather than the newline alone, so
+            // a message can quote it the way the reference quotes the lexer
+            // buffer: `unfinished string near '"abc'`
+            '\n', '\r' => return report(reporter, .unexpected_newline, start, curr),
             else => if (c == quote) return mkTokenEnd(.str, start, curr + 1),
         }
 

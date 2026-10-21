@@ -152,6 +152,9 @@ pub const Label = struct {
     // how many locals were in scope where the label sits, which is what a goto
     // written against it is measured by
     n_actvar: u32,
+    // the token after the closing `::`, which is where the reference's checks
+    // on a label stop, so a refusal about it names that line
+    after_span: Token.Span,
 };
 
 // a `goto` that no label has claimed yet. Gotos may name a label written later in
@@ -361,7 +364,10 @@ fn closeBlock(semantic: *Semantic) Error!void {
         const outer = scope.parent orelse {
             try semantic.report(.{
                 .kind = .undefined_label,
-                .span = goto.span,
+                // `undefgoto` runs when the function closes, so the position
+                // is the end of the body and only the `at line` inside the
+                // message is the goto's own
+                .span = .{ .start = semantic.function.body_span.end, .end = semantic.function.body_span.end },
                 .name = goto.name,
                 .name_span = goto.span,
             });
@@ -461,6 +467,10 @@ pub fn declare(
             .span = name.span,
             .name = name.name,
             .name_span = name.span,
+            // the `in main function` or `in function at line N` the reference
+            // ends the message with, the body span standing for the line
+            .opened_at = if (state.parent == null) null else state.body_span,
+            .opened_name = if (state.parent == null) "main function" else "function",
         });
     }
 
@@ -605,6 +615,9 @@ fn capture(
             .span = name.span,
             .name = name.name,
             .name_span = name.span,
+            // the same `in main function` or `in function at line N` clause
+            .opened_at = if (function.parent == null) null else function.body_span,
+            .opened_name = if (function.parent == null) "main function" else "function",
         });
         // reported and captured anyway, so the rest of the chunk reads a scope
         return 0;
@@ -631,8 +644,9 @@ pub fn record(semantic: *Semantic, name: Ast.Identifier, resolution: Resolution)
 // inside that, so a duplicate is one already declared anywhere up the chain.
 // `is_last` says the label is the last thing in its block. Lua treats that as
 // though the locals the block declared had already gone out of scope, since
-// nothing can jump to a label past the end of a block.
-pub fn declareLabel(semantic: *Semantic, name: Ast.Identifier, is_last: bool) Error!void {
+// nothing can jump to a label past the end of a block. `after` is the token
+// after the closing `::`, which is where the reference's checks stop.
+pub fn declareLabel(semantic: *Semantic, name: Ast.Identifier, is_last: bool, after: Token.Span) Error!void {
     var scope: ?*BlockScope = semantic.scope;
     while (scope) |block| {
         const label = findLabel(block.label_items.items, name.name) orelse {
@@ -642,7 +656,9 @@ pub fn declareLabel(semantic: *Semantic, name: Ast.Identifier, is_last: bool) Er
 
         try semantic.report(.{
             .kind = .duplicate_label,
-            .span = name.span,
+            // `checkrepeated` runs once the whole label has been read, so the
+            // position it reports from is the token behind it
+            .span = after,
             .name = name.name,
             .name_span = name.span,
             // where the one already there is written, which is the more useful
@@ -664,9 +680,10 @@ pub fn declareLabel(semantic: *Semantic, name: Ast.Identifier, is_last: bool) Er
         .name = name.name,
         .span = name.span,
         .n_actvar = n_actvar,
+        .after_span = after,
     });
 
-    try semantic.claimGotos(name.name, n_actvar);
+    try semantic.claimGotos(name.name, n_actvar, after);
 }
 
 fn findLabel(labels: []const Label, name: []const u8) ?Label {
@@ -686,7 +703,7 @@ fn findLabel(labels: []const Label, name: []const u8) ?Label {
 // what makes `do goto out end ::out::` legal while `do ::out:: end goto out` is
 // not. Two labels of one name, an inner and an outer, are not a duplicate, and the
 // goto is claimed by whichever comes first in the enclosing chain.
-fn claimGotos(semantic: *Semantic, name: []const u8, n_actvar: u32) Error!void {
+fn claimGotos(semantic: *Semantic, name: []const u8, n_actvar: u32, after: Token.Span) Error!void {
     const state = semantic.function;
     var claimed: usize = 0;
 
@@ -700,7 +717,7 @@ fn claimGotos(semantic: *Semantic, name: []const u8, n_actvar: u32) Error!void {
 
         // A goto with fewer locals in scope than the label has would bring the
         // difference into scope, which is the one jump Lua will not make.
-        if (goto.n_actvar < n_actvar) try semantic.reportScopeJump(goto);
+        if (goto.n_actvar < n_actvar) try semantic.reportScopeJump(goto, after);
     }
 
     if (claimed == 0) return;
@@ -716,13 +733,14 @@ fn claimGotos(semantic: *Semantic, name: []const u8, n_actvar: u32) Error!void {
 }
 
 // names the local the jump would bring into scope, which is the first one the
-// label has and the goto does not
-fn reportScopeJump(semantic: *Semantic, goto: *const Goto) Error!void {
+// label has and the goto does not. `after` is the token behind the label that
+// claimed the goto, which is where `jumpscopeerror` reports from
+fn reportScopeJump(semantic: *Semantic, goto: *const Goto, after: Token.Span) Error!void {
     const local = semantic.function.active.items[goto.n_actvar];
 
     try semantic.report(.{
         .kind = .goto_into_local_scope,
-        .span = goto.span,
+        .span = after,
         .name = goto.name,
         .name_span = goto.span,
         .opened_at = local.span,
@@ -758,7 +776,7 @@ pub fn declareGoto(semantic: *Semantic, node: *const Ast.GotoStatement) Error!vo
     };
 
     goto.resolved = true;
-    if (goto.n_actvar < label.n_actvar) try semantic.reportScopeJump(goto);
+    if (goto.n_actvar < label.n_actvar) try semantic.reportScopeJump(goto, label.after_span);
 }
 
 // the nearest label of that name in scope here, which is a label in this block or
@@ -785,7 +803,11 @@ pub fn declareBreak(semantic: *Semantic, node: *const Ast.BreakStatement) Error!
 
     try semantic.report(.{
         .kind = .break_outside_loop,
-        .span = node.break_span,
+        // a `break` is a goto to a label only a loop makes, so — like an
+        // undefined one — the position is the end of the function and the
+        // `at line` inside the message is the `break`'s own
+        .span = .{ .start = semantic.function.body_span.end, .end = semantic.function.body_span.end },
+        .name_span = node.break_span,
         .found = .@"break",
     });
 }

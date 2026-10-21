@@ -183,12 +183,6 @@ pub fn fail(
     return parser.failFull(kind, at.span, wanted, at.kind);
 }
 
-// the same, for a span that is not a single token and so cannot say what was
-// found there
-pub fn failSpan(parser: *Parser, kind: Diagnostic.Error.Kind, span: Token.Span) Error {
-    return parser.failFull(kind, span, null, null);
-}
-
 fn failFull(
     parser: *Parser,
     kind: Diagnostic.Error.Kind,

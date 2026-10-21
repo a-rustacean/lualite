@@ -55,6 +55,14 @@ pub const Error = struct {
     expected: ?Expected = null,
     // the token that was there instead
     found: ?Token.Kind = null,
+    // the token the parser stopped on, where it is not the one the span covers.
+    // `load` words its message around the reference's `near`, which for a
+    // refused call or assignment target is the token after the expression
+    stopped: ?Token = null,
+    // the closer the construct owning the diagnostic waits for, where that is
+    // not the token wanted: a statement after `return` reads `<eof> expected`
+    // at chunk level but `'end' expected` inside an `if`
+    closer: ?Token.Kind = null,
     // the name the semantic checks talk about, and where it was written. Set
     // only by those checks, and it borrows from the source
     name: []const u8 = "",
