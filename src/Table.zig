@@ -172,7 +172,7 @@ pub const Table = struct {
     /// is a hash key — and zero and negatives are excluded by the unsigned
     /// wrap, which is why this is one subtraction rather than two comparisons.
     pub fn arrayIndex(key: i64) u32 {
-        const unsigned: u32 = @truncate(@as(u64, @bitCast(key)));
+        const unsigned: u64 = @bitCast(key);
         if (unsigned -% 1 < max_asize) return @intCast(key);
         return 0;
     }
@@ -206,37 +206,54 @@ pub const Table = struct {
         };
     }
 
-    pub fn getInt(table: *Table, key: i64) Value.Value {
-        const alimit = table.alimit;
-        const unsigned: u32 = @truncate(@as(u64, @bitCast(key)));
+    /// Where the integer key `key` lives: an array slot, a hash node, or
+    /// nowhere. This is `luaH_getint`, side effects included — the reference
+    /// looks the key up the same way whether it is reading or writing, and it
+    /// mutates `alimit` from the Xmilia branch as it goes.
+    const IntSlot = union(enum) { array: u32, node: u32, absent };
 
-        if (unsigned -% 1 < alimit) return table.array[@intCast(key - 1)];
+    fn intSlot(table: *Table, key: i64) IntSlot {
+        const alimit = table.alimit;
+        const unsigned: u64 = @bitCast(key);
+
+        // The comparison runs in 64 bits, exactly like `l_castS2U(key) - 1u`
+        // against a `lua_Unsigned alimit`: truncating to u32 first makes a key
+        // of 2^32+1 look like index 1 (and a negative key like a huge one),
+        // which reaches `table.array[key-1]` far past its allocation.
+        if (unsigned -% 1 < alimit) return .{ .array = @intCast(key) };
 
         // The Xmilia trick, verbatim from `luaH_getint`: `alimit` may be a hint
         // below the real size, and `(key-1) & ~(alimit-1)` clears the bit that
         // distinguishes them. If the result is still under `alimit`, the key is
-        // inside the array after all. Getting this wrong puts integer keys in
-        // the hash part that belong in the array, which shows up as a wrong
-        // `pairs` order rather than as a crash.
-        if (!table.isrealasize and (unsigned -% 1) & ~(alimit -% 1) < alimit) {
+        // inside the array after all, and the reference moves the hint to the
+        // key ("probably '#t' is here now").
+        if (!table.isrealasize and (unsigned -% 1) & ~(@as(u64, alimit) -% 1) < alimit) {
             table.alimit = @intCast(key);
-            return table.array[@intCast(key - 1)];
+            return .{ .array = @intCast(key) };
         }
 
-        if (table.isdummy()) return .nil;
+        if (table.isdummy()) return .absent;
 
         var index = hashInt(table, key);
         while (true) {
             const node = &table.nodes[index];
             if (node.key == .number and node.key.number.isInt() and
-                node.key.number.int == key) return node.value;
+                node.key.number.int == key) return .{ .node = @intCast(index) };
 
             const offset = node.next;
             if (offset == 0) break;
             index = @intCast(@as(i64, @intCast(index)) + offset);
         }
 
-        return .nil;
+        return .absent;
+    }
+
+    pub fn getInt(table: *Table, key: i64) Value.Value {
+        return switch (table.intSlot(key)) {
+            .array => |index| table.array[@intCast(index - 1)],
+            .node => |index| table.nodes[index].value,
+            .absent => .nil,
+        };
     }
 
     /// The key a float index normalises to, or null when it stays a float.
@@ -292,50 +309,22 @@ pub const Table = struct {
         try table.setInHash(normalized, value);
     }
 
-    /// `luaH_setint`: write through the array part if the key is already an index
-    /// of it, and otherwise go through the hash.
+    /// `luaH_setint`: look the key up exactly as `luaH_getint` does, and write
+    /// wherever that lookup says it lives — the array slot if it found the key
+    /// in the array part, the hash node if it found it in the hash part (a nil
+    /// write leaves the key in place with an empty value, the way `setobj2t`
+    /// does; it does not unlink the node), and a fresh hash entry only when the
+    /// key is nowhere. A nil value for an absent key is dropped by
+    /// `luaH_newkey` before it can insert anything.
     fn setInt(table: *Table, key: i64, value: Value.Value) Error!void {
-        if (table.getInt(key) != .nil or table.intIsInArray(key)) {
-            const index = table.arrayIndexOf(key);
-            if (value == .nil) {
-                table.array[@intCast(index - 1)] = .nil;
-            } else {
-                table.array[@intCast(index - 1)] = value;
-            }
-            return;
+        switch (table.intSlot(key)) {
+            .array => |index| table.array[@intCast(index - 1)] = value,
+            .node => |index| table.nodes[index].value = value,
+            .absent => {
+                if (value == .nil) return;
+                try table.setInHash(intKey(key), value);
+            },
         }
-
-        if (value == .nil) {
-            table.removeFromHash(intKey(key));
-            return;
-        }
-
-        try table.setInHash(intKey(key), value);
-    }
-
-    /// Whether an integer key addresses a slot of the array part, including the
-    /// Xmilia trick `luaH_getint` uses for a key past a hint `alimit`. This is
-    /// the part of `luaH_getint` that decides whether the key is in the array
-    /// at all, and it is why `getInt` returning nil is not on its own enough to
-    /// tell "absent from the array" from "absent from the table".
-    fn intIsInArray(table: *Table, key: i64) bool {
-        const alimit = table.alimit;
-        const unsigned: u32 = @truncate(@as(u64, @bitCast(key)));
-
-        if (unsigned -% 1 < alimit) return true;
-        if (!table.isrealasize and (unsigned -% 1) & ~(alimit -% 1) < alimit) return true;
-        return false;
-    }
-
-    /// The array slot for a key `intIsInArray` has already accepted, with the
-    /// same two-part test `luaH_getint` does.
-    fn arrayIndexOf(table: *Table, key: i64) u32 {
-        const alimit = table.alimit;
-        const unsigned: u32 = @truncate(@as(u64, @bitCast(key)));
-
-        if (unsigned -% 1 < alimit) return @intCast(key);
-        table.alimit = @intCast(key);
-        return @intCast(key);
     }
 
     fn setInHash(table: *Table, key: Value.Value, value: Value.Value) Error!void {
@@ -570,6 +559,30 @@ pub const Table = struct {
         return null;
     }
 
+    /// `findindex`'s question about a resume key, which decides between the
+    /// walk and `next`'s refusal: nil begins one, an integer inside the array
+    /// part resumes there whether or not the slot is still filled, and any
+    /// other key has to be one the table holds. A key that is none of these is
+    /// what the reference reports as an invalid key to 'next'.
+    pub fn resumableNextKey(table: *const Table, key: Value.Value) bool {
+        if (key == .number and key.number.isInt()) {
+            const i = arrayIndex(key.number.int);
+            if (i -% 1 < table.realasize()) return true;
+        }
+
+        if (table.isdummy()) return false;
+
+        var index = mainPosition(table, key);
+        while (true) {
+            const node = &table.nodes[index];
+            if (keyEqual(node.key, key) and node.value != .nil) return true;
+
+            const offset = node.next;
+            if (offset == 0) return false;
+            index = @intCast(@as(i64, @intCast(index)) + offset);
+        }
+    }
+
     /// Where the walk resumes from for a given key. `findindex`: nil starts at
     /// zero, an integer in the array part gives its own index, and anything else
     /// is found in the hash part and numbered after the array entries.
@@ -601,7 +614,7 @@ pub const Table = struct {
     fn mainPosition(table: *const Table, key: Value.Value) usize {
         return switch (key) {
             .number => |n| if (n.isInt())
-                hashmod(table, @truncate(@as(u64, @bitCast(n.int))))
+                hashmod(table, @as(u64, @bitCast(n.int)))
             else
                 hashmod(table, hashFloat(n.toFloat())),
             .string => |s| hashpow2(table, hashString(s)),
@@ -627,14 +640,17 @@ pub const Table = struct {
     }
 
     /// `hashmod`: a real modulo against `(size-1)|1`, which is not the same
-    /// number as the size and so not the same bucket as the mask above.
-    fn hashmod(table: *const Table, n: u32) usize {
+    /// number as the size and so not the same bucket as the mask above. The
+    /// value runs in 64 bits because `hashint` does: `lua_Unsigned ui` of a
+    /// negative key is `2^64 - |key|`, and folding it to 32 bits first picks a
+    /// different bucket whenever `2^32` and `2^64` differ modulo `(size-1)|1`.
+    fn hashmod(table: *const Table, n: u64) usize {
         const size = table.sizenode();
-        return @intCast(@as(u64, n) % @as(u64, (size - 1) | 1));
+        return @intCast(n % @as(u64, (size - 1) | 1));
     }
 
     fn hashInt(table: *const Table, key: i64) usize {
-        return hashmod(table, @truncate(@as(u64, @bitCast(key))));
+        return hashmod(table, @as(u64, @bitCast(key)));
     }
 
     /// `l_hashfloat`, so that a float key lands in the bucket the reference
@@ -836,9 +852,36 @@ pub const Table = struct {
         // would put them
         table.installNodes(newnodes);
         for (oldnodes) |node| {
-            if (node.value != .nil) try table.setInHash(node.key, node.value);
+            // `reinsert` calls `luaH_set`, not a hash-only insert: with the new
+            // `alimit` already in place, an integer key from the old hash can
+            // belong to the grown array part now, and landing there is what
+            // makes a constructor's keyed field vanish under the list values
+            // that overwrite it (`{[4]=x,1,2,f2()}` in the reference).
+            if (node.value != .nil) try table.set(node.key, node.value);
         }
         freePart(table.allocator, oldnodes);
+    }
+
+    /// `OP_NEWTABLE`'s up-front allocation: the array sized to the constructor's
+    /// static list count and the hash part to `2^ceillog2(nrec)` nodes, done
+    /// before any field is evaluated. Both sizes are observable — a keyed field
+    /// inside the static count writes to the (still empty) array rather than
+    /// the hash, and a pre-sized hash takes every record field without a rehash.
+    pub fn prealloc(table: *Table, asize: u32, nhsize: u32) Error!void {
+        if (asize != 0 or nhsize != 0) try table.resize(asize, nhsize);
+    }
+
+    /// `luaH_resizearray`: grow the array part to exactly `newasize`, keeping
+    /// the hash part as it is. `OP_SETLIST` uses this to make room for the
+    /// values it is about to write, exact rather than rounded to a power of
+    /// two, which is what pins a literal constructor's final array size.
+    pub fn resizeArrayTo(table: *Table, newasize: u32) Error!void {
+        // `OP_SETLIST` only acts when `last > realasize`; it never shrinks.
+        if (newasize <= table.realasize()) return;
+        // `allocsizenode`: a dummy hash part is size zero, not `sizenode()`
+        // over `lsizenode = 0`, which would wrongly allocate one node.
+        const nhsize: u32 = if (table.isdummy()) 0 else table.sizenode();
+        try table.resize(newasize, nhsize);
     }
 
     /// Swaps in a node array, resetting `lastfree` the way `setnodevector` does.

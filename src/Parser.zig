@@ -38,6 +38,12 @@ depth: u32 = 0,
 // pushes are not matched to enter calls one for one
 open_blocks: [max_open_blocks]OpenBlock = undefined,
 open_len: u16 = 0,
+// where a token the lexer rejected stood, set by skipInvalid and taken by the
+// next expression parse: the reference stops at the lexer's complaint, so the
+// slot the rejected token was read for is filled without a second complaint
+// about it being empty. Consuming a token drops the mark, so a statement
+// dispatched over junk does not leave it behind for a later expression.
+lexer_gap: ?Token.Span = null,
 
 // a block that has been opened and not yet closed
 pub const OpenBlock = struct {
@@ -112,6 +118,9 @@ pub fn next(parser: *Parser) Error!Token {
     // an eof token spans nothing, so this leaves the cursor put and every
     // later call yields eof again
     parser.lexer.current_char_idx = token.span.end;
+    // a token consumed means the parse has moved past whatever was skipped
+    // to reach it, so the gap it was reached through is spent
+    parser.lexer_gap = null;
     return token;
 }
 
@@ -225,7 +234,9 @@ pub fn slice(parser: *const Parser, span: Token.Span) []const u8 {
 // steps past the input the lexer just rejected. mark is where the reporter
 // stood before that attempt, so the widest of the diagnostics since is how far
 // to jump. Always moves at least one byte, the rejected token may have reported
-// a span as long as itself.
+// a span as long as itself. The span jumped over is left behind as the parser's
+// lexer gap, so the expression that asked for the token is filled rather than
+// reported empty as well.
 fn skipInvalid(parser: *Parser, mark: usize) void {
     var next_idx = parser.lexer.current_char_idx + 1;
 
@@ -233,7 +244,9 @@ fn skipInvalid(parser: *Parser, mark: usize) void {
         if (e.span.end > next_idx) next_idx = e.span.end;
     }
 
-    parser.lexer.current_char_idx = @min(next_idx, parser.lexer.source.len);
+    const landed = @min(next_idx, parser.lexer.source.len);
+    parser.lexer_gap = .{ .start = @intCast(parser.lexer.current_char_idx), .end = @intCast(landed) };
+    parser.lexer.current_char_idx = landed;
 }
 
 pub fn enter(parser: *Parser) Error!void {

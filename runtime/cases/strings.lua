@@ -51,3 +51,17 @@ show(table.concat(pairs_found, " "))
 
 show(string.find("abc", "b", 1, true))
 show(string.match("a+b", "a+b", 1, true))
+
+-- gsub: the replacement value must be a string or a number, and which values
+-- are not is the reference's — a table raises, a boolean raises, nil and false
+-- keep the whole match instead
+show(pcall(string.gsub, "abc", "b", {}))
+show(pcall(string.gsub, "abc", "b", true))
+show(pcall(string.gsub, "abc", "b", false))
+show(pcall(string.gsub, "abc", "b", nil))
+show(pcall(string.gsub, "abc", "b", function() return {} end))
+show(pcall(string.gsub, "abc", "b", function() return true end))
+show(pcall(string.gsub, "abc", "b", function() return false end))
+show(pcall(string.gsub, "abc", "b", function() return nil end))
+show(pcall(string.gsub, "abc", "b", function() return 42 end))
+show(pcall(string.gsub, "abc", "b", function() return "ok" end))

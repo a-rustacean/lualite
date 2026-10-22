@@ -370,11 +370,21 @@ const FormatError = error{NoSpaceLeft};
 pub fn toBytes(n: Number, buffer: []u8) FormatError![]const u8 {
     return switch (n) {
         .int => |v| std.fmt.bufPrint(buffer, "{d}", .{v}),
-        .float => |f| formatFloat(f, buffer),
+        .float => |f| formatFloat(f, buffer, true),
     };
 }
 
-fn formatFloat(f: f64, buffer: []u8) FormatError![]const u8 {
+/// What `io.write` and `file:write` write for a number: the same digits
+/// `tostring` gives, but without the `.0`, because `g_write` formats floats
+/// with plain `LUA_NUMBER_FMT` (`%.14g`) there — `1.0` goes out as `"1"`.
+pub fn toWriteBytes(n: Number, buffer: []u8) FormatError![]const u8 {
+    return switch (n) {
+        .int => |v| std.fmt.bufPrint(buffer, "{d}", .{v}),
+        .float => |f| formatFloat(f, buffer, false),
+    };
+}
+
+fn formatFloat(f: f64, buffer: []u8, comptime with_zero: bool) FormatError![]const u8 {
     var scratch: [std.fmt.float.min_buffer_size]u8 = undefined;
 
     // the scientific form rounded to the precision, which is where both the digits
@@ -427,8 +437,8 @@ fn formatFloat(f: f64, buffer: []u8) FormatError![]const u8 {
     // `tostring` puts a `.0` on a float whose printed form reads as an integer, so
     // `1.0` is `"1.0"` and `100.0` is `"100.0"`. What is being tested is whether
     // every character is a digit or a sign, which `inf`, `nan` and anything with
-    // an exponent in it fail.
-    if (readsAsInteger(out.written())) {
+    // an exponent in it fail. `g_write` leaves it off.
+    if (with_zero and readsAsInteger(out.written())) {
         try out.put('.');
         try out.put('0');
     }

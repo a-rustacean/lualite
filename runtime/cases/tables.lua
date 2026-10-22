@@ -64,3 +64,34 @@ for i = 1, 5 do counters[i] = i * i end
 local sum = 0
 for k, v in pairs(counters) do sum = sum + k + v end
 show(sum)
+
+-- next's resume key: an integer inside the array part resumes without a
+-- presence check, so a hole key works; every other absent key raises
+local hole = { "a", nil, "c" }
+show(next(hole, 2))
+local keyed = { [1] = "a", [3] = "c" }
+show(pcall(next, keyed, 2))
+show(pcall(next, { 1, 2, 3 }, 4))
+show(pcall(next, {}, 1))
+show(pcall(next, { 1, 2, 3 }, 2.0))
+show(pcall(next, { 1, 2, 3 }, 0))
+show(pcall(next, { 1, 2, 3 }, -1))
+
+-- integer keys past 2^32 are ordinary hash keys, not array indexes
+local far = {}
+far[4294967297] = "far"
+show(far[4294967297])
+show(pcall(next, far, 4294967297))
+far[4294967297] = nil
+show(far[4294967297])
+
+-- ipairs walks through __index and stops only where __index yields nil
+local base = { [1] = "a", [2] = "b", [3] = "c" }
+local derived = setmetatable({}, { __index = base })
+for i, v in ipairs(derived) do io.write(i, v, " ") end
+print()
+local counted = setmetatable({}, {
+  __index = function(_, k) if k <= 3 then return k * 10 end end,
+})
+for i, v in ipairs(counted) do io.write(i, "=", v, " ") end
+print()

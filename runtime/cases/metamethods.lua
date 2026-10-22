@@ -107,17 +107,21 @@ end)
 -- an error raised by __close replaces a normal exit
 do
   local log = {}
-  local c1 <close> = setmetatable({}, { __close = function() log[#log + 1] = "1" end })
-  local c2 <close> = setmetatable({}, { __close = function() log[#log + 1] = "2"; error("close fail") end })
-  local ok, err = pcall(function()
+  local ok1, err1 = pcall(function()
     local c3 <close> = setmetatable({}, { __close = function() log[#log + 1] = "3" end })
   end)
-  show(ok, tostring(err):gsub(".*: ", ""), table.concat(log, ","))
+  show(ok1, tostring(err1):gsub(".*: ", ""), table.concat(log, ","))
+  local ok2, err2 = pcall(function()
+    local c1 <close> = setmetatable({}, { __close = function() log[#log + 1] = "1" end })
+    local c2 <close> = setmetatable({}, { __close = function() log[#log + 1] = "2"; error("close fail") end })
+  end)
+  show(ok2, tostring(err2):gsub(".*: ", ""), table.concat(log, ","))
 end
 
 -- string/number coercion in arithmetic and comparison
 show("10" + 5, "3.5" * 2, "0x10" + 0)
-show("10" == 10, "10" < 10, " 10" + 0)
+show("10" == 10, " 10" + 0)
+raises(function() return "10" < 10 end)
 raises(function() return "10" + "20" end)
 raises(function() return "abc" + 1 end)
 show(10 // "3", 10 % "3")
@@ -130,7 +134,7 @@ show(3.0 == 3, math.type(3.0), math.type(3))
 show(2^53, 2^53 + 1, 1e308 * 10)
 show(math.maxinteger // 2, math.mininteger // -1 == math.mininteger)
 raises(function() return math.mininteger // -1 end)
-show(0 // 0)
+raises(function() return 0 // 0 end)
 raises(function() return 7 // 0 end)
 raises(function() return 7 % 0 end)
 raises(function() return 7 / 0 end)
@@ -179,8 +183,13 @@ show(brk)
 show(select("#", load("return 1, 2, 3")))
 show(load("return 1, 2, 3")())
 show(load("this is not lua"))
-show(load(function() return "return 42" end)())
-show(load(function() error("reader fail") end))
+local once42 = false
+show(load(function()
+  if once42 then return nil end
+  once42 = true
+  return "return 42"
+end)())
+show(pcall(load, function() error("reader fail") end))
 show(load(""))
 show(load("return"))
 show(select("#", load("return")()))

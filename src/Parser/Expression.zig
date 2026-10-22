@@ -146,6 +146,14 @@ fn parseInfix(parser: *Parser, first: Ast.Expression, limit: u8) Parser.Error!As
 fn parseSimple(parser: *Parser) Parser.Error!Ast.Expression {
     const token = try parser.peek();
 
+    // the token this expression was asked for was rejected by the lexer, so
+    // the slot it stood in is filled rather than reported empty too: the
+    // reference never gets past the lexer's own complaint
+    if (parser.lexer_gap) |gap| {
+        parser.lexer_gap = null;
+        return .{ .nil = try parser.box(Ast.NilExpression, .{ .span = gap }) };
+    }
+
     return switch (token.kind) {
         .nil => {
             _ = try parser.next();

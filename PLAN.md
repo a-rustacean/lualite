@@ -19,9 +19,9 @@ The front-end is complete for its scope and has no stubs:
 - `src/Semantic.zig` + `src/Semantic/*.zig` — the resolver, its scope tree and
   the checks Lua performs. See Phase 1 below.
 
-261 tests pass (`zig build test`), 68 differential cases against a reference Lua
+262 tests pass (`zig build test`), 68 differential cases against a reference Lua
 5.4 agree (`differential/run.sh`), 2393 corpus files agree (`corpus/run.sh`), and
-9 runtime cases compare stdout, stderr and exit status against the reference
+17 runtime cases compare stdout, stderr and exit status against the reference
 (`runtime/run.sh`).
 `grep` for `TODO`, `unimplemented`, `@panic` across `src/` finds nothing.
 
@@ -68,7 +68,7 @@ closed; the corpus run and the differential harness in `corpus/` and
    semantics live in `src/Number.zig`. Verified against 84 cases generated from
    the reference.
    - The `i`, `f` and `n` suffixes belong here rather than being a separate gap.
-     The lexer rejects all three as malformed numbers, and so does Lua 5.4.7, so
+     The lexer rejects all three as malformed numbers, and so does Lua 5.4.9, so
      nothing is broken today; the suffix is simply part of what this item has to
      decide, and the answer is that 5.4 has none of them.
 2. ~~**String decoding is not Lua-faithful.**~~ **Closed.** The decoder now
@@ -211,12 +211,39 @@ contexts, and broad standard library coverage remain open.
 
 Dynamic text chunks are now supported through `load`, `loadfile`, and `dofile`.
 Each compiled chunk keeps its parse arena and semantic program alive for
-returned closures, and `load` can bind an explicit environment.
+returned closures, and `load` can bind an explicit environment. A reader's
+pieces join the way the reference joins them: a number is appended like a
+string, `nil` or an empty string ends the chunk and compiles what there is, and
+anything else stops with `reader function must return a string`. What the
+caller then sees follows `lua_load`'s errfunc: called from the main chunk the
+message carries that chunk's line *and* the top-level handler's traceback
+inside it, while under `pcall` it comes back bare — no position, no traceback —
+and a table the reader raised comes back as the same table. Such failures are
+returned as `nil, message`, not raised. A refused parse renders its expected
+side the way `luaX_token2str` does: `<name> expected near '1'`, with the class
+tokens (`<eof>`, `<string>`, `<integer>`, `<number>`) bare and keywords and
+punctuators quoted. Binary chunks are refused in both directions — by mode
+(`attempt to load a text chunk (mode is 'x')`) and by header before the body is
+read — and `string.dump` refuses the functions it is given, so no dump from the
+reference can execute here.
+
+Numeric `for` follows `forprep` in `lvm.c`. An integer initial value *and*
+step take the integer path, where only the limit converts: floored, or raised
+to a ceil for a descending loop, numeric strings included, with a float outside
+the integer range clipped to the nearest bound or skipping the loop entirely.
+Anything else takes the float path, where all three values become floats
+whatever could have been integral, so `for i = 1, "3", "1"` counts `1.0, 2.0,
+3.0` and a float step makes the control variable float even with integer ends.
+The float path checks limit, then step, then initial value, and a value that
+will not convert names itself through `luaG_forerror`:
+`bad 'for' limit (number expected, got string)`, with `'for' step is zero`
+after the conversions — and an integer path still checks the step first, the
+way the reference orders it.
 
 Coroutines are `std.Io.fiber` threads sharing one VM between them: a yield
 parks the whole Zig call stack on its own host stack and the next resume
 continues inside it. `create`, `resume`, `yield`, `status`, `running`,
-`isyieldable`, `close` and `wrap` behave as in 5.4.7, including error returns
+`isyieldable`, `close` and `wrap` behave as in 5.4.9, including error returns
 from `resume`, positions on `wrap` errors, `__close` handlers during `close`,
 and `cannot resume dead/non-suspended coroutine` guards.
 
@@ -266,6 +293,9 @@ truncating-write, and append modes; file `read` (`*n`, `*l`, `*L`, `*a`, byte
 counts, and several formats at once), `write`, `flush`, `close`, `seek`,
 `lines`, and `setvbuf`; `io.open`, `io.tmpfile`, `io.write`, `io.flush`,
 `io.close`, `io.type`, `io.read`, `io.input`, `io.output`, and `io.lines`.
+Both `io.write` and `file:write` format numbers the way `g_write` does —
+integers as digits and floats through `%.14g` with no `.0`, so `1.0` goes out
+as `1` where `tostring` keeps the suffix.
 File handles are tables over an internal `FileHandle` with a protected
 metatable whose `__index` carries the methods, whose `__close` closes, and
 whose `__name` is `FILE*` so error messages name the type the way the
@@ -315,7 +345,11 @@ The CLI's `--check` mode runs only the lexer, parser, and semantic pass. The
 differential and corpus harnesses use it so accepted scripts are not executed
 as a side effect of front-end checks. A first runtime smoke comparison against
 the reference also caught and fixed table-constructor list fields being stored
-too early when a keyed field uses the same numeric index. Numeric strings now
+too early when a keyed field uses the same numeric index. Constructors now
+size their parts the way `lcode.c` does — the array part exactly the list
+fields written to it, the hash part the next power of two over its record
+count — evaluate every field in source order, and grow the list part to the
+exact size each `SETLIST` needs rather than rounding. Numeric strings now
 coerce for arithmetic and unary minus, while bitwise operations and comparisons
 keep their stricter Lua behavior; failed numeric coercion still falls through to
 the other operand's metamethod.
@@ -328,8 +362,13 @@ runtime gaps are the rest of `os` (`setlocale`, `tmpname`, host-local time),
 edge-case compatibility across Lua's runtime semantics, and a few
 representation differences: file handles are tables rather than userdata (so
 `type(io.stdout)` says `table` where the reference says `userdata`), uncaught
-errors print no stack traceback, and rare OS-level `io` failures surface as
-the host's `RuntimeError` instead of `nil` plus a message plus an errno.
+errors print no stack traceback anywhere (the cases show reader failures under
+`pcall`, where the reference prints none either), `string.dump` refuses every
+function — the mirror of the binary-chunk refusal — a table's hash-part
+iteration order can differ where the reference's own is not reproducible even
+run to run, a native function's printed address is an internal ordinal rather
+than a pointer, and rare OS-level `io` failures surface as the host's
+`RuntimeError` instead of `nil` plus a message plus an errno.
 Dynamic binary chunks and incremental/generational collector modes are also
 unsupported.
 
@@ -338,23 +377,25 @@ unsupported.
 Three harnesses, at three scales, and they are not interchangeable.
 
 - **`differential/run.sh`** — 68 files written by hand to make the two front ends
-  disagree, compared against a reference Lua 5.4.7. Where both refuse, it checks
+  disagree, compared against a reference Lua 5.4.9. Where both refuse, it checks
   that lualite names the right construct, from a keyword in an `.expect` file.
   This is the one that can say what the right answer *is*.
 - **`corpus/run.sh`** — 2393 files across 9 sources, ~21 MB, nothing written by
   hand. It compares the verdict only, which is the trade for finding divergences
   nobody thought to look for. It found the false rejection on a reused label name
   and the crash on an oversized file. See `corpus/RUN-REPORT.md`.
-- **Unit tests**, colocated, 261 of them.
+- **Unit tests**, colocated, 262 of them.
 
 What the parser harnesses cannot see is what a program computes. That is what
 `runtime/run.sh` is for: it runs each `runtime/cases/*.lua` under both
 interpreters and diffs stdout, stderr and the exit status, after normalising
 `0x…` object addresses (reference Lua seeds its string hash per process —
 `luai_makeseed` in `lstate.c` — so `pairs` over string keys also differs run to
-run; cases avoid depending on that order). Its nine cases cover the number and
-string models, tables, functions and closures, control flow, metatables, error
-messages, `string.format`, and coroutines. Two front-end bugs were found by hand rather than
+run; cases avoid depending on that order). Its seventeen cases cover the number
+and string models, tables and constructors, functions and closures, control
+flow, `goto`, metatables, metamethods, error messages, `string.format`,
+strings, the standard library, `load` and its refusals, `io`, coroutines, and
+deep recursion. Two front-end bugs were found by hand rather than
 by the harnesses: the `u16` slot overflow needs a generated file with 65536
 locals, and the `\` before a CRLF needs a string literal nobody writes by
 accident.

@@ -196,83 +196,89 @@ inline fn isExponentMark(c: u8, hex: bool) bool {
     return if (hex) (c == 'p') or (c == 'P') else (c == 'e') or (c == 'E');
 }
 
-// index of the first character at or after `i` that is not a numeral digit
-fn digitRunEnd(source: []const u8, i: usize, hex: bool) usize {
-    var end = i;
-
-    while (end < source.len and isNumeralDigit(source[end], hex)) : (end += 1) {}
-
-    return end;
-}
-
 // start points at a digit, or at a `.` immediately followed by a digit.
 //
-// Lua's numeral grammar:
-//
-//     digits ('.' digits?)? exponent?
-//   | '.' digits exponent?
-//   | '0' ('x' | 'X') hexdigits ('.' hexdigits?)? hexexponent?
-//
-// An exponent sign is only accepted right after an exponent mark, so `1e-5` is
-// one numeral while `1-5` is a subtraction. The literal needs at least one digit
-// and may not touch a `.` or a letter, which is what makes `0x`, `1e`, `3a` and
-// `1..2` malformed.
+// The scanner is `read_numeral`'s, greedy the way the reference's is: hex
+// digits and dots join the token in any base, exponent marks swallow their
+// one sign and keep going, and then a single letter forces its way in. That
+// is what puts `3a4`, `1..2` and `1e5e5` in front of the error whole rather
+// than cut down to the first character that failed. What decides
+// well-formed is the shape `luaO_str2num` accepts — `numeralShapeIsGood`.
+// An exponent sign is only accepted right after an exponent mark, so
+// `1e-5` is one numeral while `1-5` is a subtraction.
 fn lexNumber(lexer: *const @This(), reporter: *Diagnostic.Reporter, start: usize) Error!Token {
     const source = lexer.source;
 
     var curr = start;
-    var is_float = false;
     var hex = false;
 
     if (source[curr] == '.') {
         // `.5`, the caller already confirmed a digit follows the dot
-        is_float = true;
         curr += 1;
     } else if ((source[curr] == '0') and (curr + 1 < source.len) and
         ((source[curr + 1] == 'x') or (source[curr + 1] == 'X')))
     {
         hex = true;
         curr += 2; // `0x`
+    } else {
+        curr += 1;
     }
 
-    const int_end = digitRunEnd(source, curr, hex);
-    const int_digits = int_end - curr;
-    curr = int_end;
-
-    var digits = int_digits;
-
-    // optional fractional part, the digits after the dot are optional
-    if ((curr < source.len) and (source[curr] == '.')) {
-        is_float = true;
-        curr += 1;
-
-        const frac_end = digitRunEnd(source, curr, hex);
-        digits += frac_end - curr;
-        curr = frac_end;
-    }
-
-    // optional exponent
-    if ((curr < source.len) and isExponentMark(source[curr], hex)) {
-        is_float = true;
-        curr += 1;
-
-        if ((curr < source.len) and ((source[curr] == '+') or (source[curr] == '-'))) {
+    while (curr < source.len) {
+        const c = source[curr];
+        if (isExponentMark(c, hex)) {
             curr += 1;
+            if ((curr < source.len) and ((source[curr] == '+') or (source[curr] == '-'))) {
+                curr += 1;
+            }
+        } else if (isHexDigit(c) or (c == '.')) {
+            curr += 1;
+        } else {
+            break;
         }
-
-        const exp_end = digitRunEnd(source, curr, hex);
-        if (exp_end == curr) return report(reporter, .malformed_number, start, curr);
-        curr = exp_end;
     }
+    // a numeral touching a letter is malformed, and the letter joins the
+    // token the way the reference's `save_and_next` forces it in
+    if ((curr < source.len) and isAlpha(source[curr])) curr += 1;
 
-    // a second dot is never part of a numeral, so `1..2` is malformed
-    if ((curr < source.len) and (source[curr] == '.')) return report(reporter, .malformed_number, start, curr);
-    // a numeral touching a letter is malformed, e.g. `3a`
-    if ((curr < source.len) and isAlpha(source[curr])) return report(reporter, .malformed_number, start, curr);
-    // rejects `0x` and `0x.`
-    if (digits == 0) return report(reporter, .malformed_number, start, curr);
+    const text = source[start..curr];
+    if (!numeralShapeIsGood(text, hex)) return report(reporter, .malformed_number, start, curr);
+    const is_float = blk: {
+        for (text) |c| {
+            if ((c == '.') or isExponentMark(c, hex)) break :blk true;
+        }
+        break :blk false;
+    };
 
     return mkTokenEnd(if (is_float) .float else .decimal, start, curr);
+}
+
+// The shape `luaO_str2num` accepts for a numeral the scanner has consumed
+// whole: a significand of base digits with at most one dot, then at most
+// one exponent with its optional sign and at least one digit, and nothing
+// left over. This is what rejects `0x`, `0x.`, `1e`, `1e+`, `1..2`,
+// `1.2.3`, `1e5e5` and every token a forced letter has joined.
+fn numeralShapeIsGood(text: []const u8, hex: bool) bool {
+    var i: usize = if (hex) 2 else 0; // past the `0x` the scanner consumed
+    var digits: usize = 0;
+
+    while ((i < text.len) and isNumeralDigit(text[i], hex)) : (i += 1) digits += 1;
+    if ((i < text.len) and (text[i] == '.')) {
+        i += 1;
+        while ((i < text.len) and isNumeralDigit(text[i], hex)) : (i += 1) digits += 1;
+    }
+    if (digits == 0) return false; // `0x`, `0x.`
+
+    if (i < text.len) {
+        if (!isExponentMark(text[i], hex)) return false;
+        i += 1;
+        if ((i < text.len) and ((text[i] == '+') or (text[i] == '-'))) i += 1;
+        var exponent_digits: usize = 0;
+        while ((i < text.len) and isDigit(text[i])) : (i += 1) exponent_digits += 1;
+        if (exponent_digits == 0) return false; // `1e`, `1e+`, `1.e`
+    }
+
+    return i == text.len;
 }
 
 // tries to lex a long string or comment, returns null if no start pattern found

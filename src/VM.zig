@@ -176,6 +176,60 @@ fn shortSource(buffer: *[61]u8, name: []const u8) []const u8 {
     return buffer[0 .. prefix.len + piece.len + suffix.len];
 }
 
+/// `LUA_SIGNATURE[0]`: the byte whose presence at the head of a source
+/// turns a load into a binary one, whatever the rest of it says.
+const binary_chunk_intro: u8 = 0x1b;
+
+/// How far a binary header has come with the bytes pulled so far: `.more`
+/// while the next check still needs bytes the reader might give, `.failed`
+/// the moment a field disagrees, and `.valid` once the thirty-one header
+/// bytes all check out — as far as the format can be judged without a
+/// bytecode reader behind it.
+const BinaryVerdict = union(enum) { more, failed: []const u8, valid };
+
+/// `checkHeader`'s tests, in order and over the stream as a whole: the
+/// signature, the version and format bytes, `LUAC_DATA`, the three type
+/// sizes, and the `lua_Integer` and `lua_Number` the header must carry to
+/// declare the producer's layout.
+fn binaryLoadVerdict(source: []const u8) BinaryVerdict {
+    const signature = "\x1bLua";
+    if (source.len < signature.len) return .more;
+    if (!std.mem.eql(u8, source[0..signature.len], signature)) return .{ .failed = "not a binary chunk" };
+    if (source.len < 5) return .more;
+    if (source[4] != 0x54) return .{ .failed = "version mismatch" };
+    if (source.len < 6) return .more;
+    if (source[5] != 0) return .{ .failed = "format mismatch" };
+    if (source.len < 12) return .more;
+    if (!std.mem.eql(u8, source[6..12], "\x19\x93\r\n\x1a\n")) return .{ .failed = "corrupted chunk" };
+    if (source.len < 13) return .more;
+    if (source[12] != 4) return .{ .failed = "Instruction size mismatch" };
+    if (source.len < 14) return .more;
+    if (source[13] != 8) return .{ .failed = "lua_Integer size mismatch" };
+    if (source.len < 15) return .more;
+    if (source[14] != 8) return .{ .failed = "lua_Number size mismatch" };
+    if (source.len < 23) return .more;
+    if (!std.mem.eql(u8, source[15..23], "\x78\x56\x00\x00\x00\x00\x00\x00")) return .{ .failed = "integer format mismatch" };
+    if (source.len < 31) return .more;
+    if (!std.mem.eql(u8, source[23..31], "\x00\x00\x00\x00\x00\x28\x77\x40")) return .{ .failed = "float format mismatch" };
+    return .valid;
+}
+
+/// `luaU_undump`'s name: an `=` or `@` intro dropped, a source carrying the
+/// signature read as `binary string`, and any other name as itself.
+fn binaryErrorPrefix(chunk_name: []const u8) []const u8 {
+    if (chunk_name.len > 0 and (chunk_name[0] == '=' or chunk_name[0] == '@')) return chunk_name[1..];
+    if (chunk_name.len > 0 and chunk_name[0] == binary_chunk_intro) return "binary string";
+    return chunk_name;
+}
+
+/// Whether a diagnostic's own token ends where the text does, which is the
+/// lexer starving for input rather than objecting to what it has.
+fn noteStarvedToken(diagnostics: *const @import("Diagnostic.zig").Reporter, source: []const u8, flag: *bool) void {
+    if (diagnostics.errors.items.len == 0) return;
+    const span = diagnostics.errors.items[0].span;
+    flag.* = @as(usize, span.end) >= source.len;
+}
+
 /// The part of the VM that says where the interpreter is: the running
 /// program, the call frames and the values in transit. A coroutine owns one of
 /// these while it is suspended, which is what makes it resumable; everything
@@ -609,26 +663,109 @@ pub const VM = struct {
                 if (try vm.execRepeatIteration(node)) break;
             },
             .numeric_for => |node| {
-                const initial = try vm.numberValue(node.initial);
-                const limit = try vm.numberValue(node.limit);
-                const step = if (node.step) |expr| try vm.numberValue(expr) else Number.Number.fromInt(1);
-                // `luaV_forprep` refuses a zero step the first time around:
-                // a literal zero cannot reach here because the front end
-                // refuses it, but a variable holding one arrives at runtime
-                const zero_step = if (step.isInt()) step.int == 0 else step.float == 0;
-                if (zero_step) return vm.raise("'for' step is zero", .{});
+                // Reference `luaV_forprep` (lvm.c): an integer initial value
+                // *and* step run the loop over integers (only the limit is
+                // coerced); anything else runs it over floats, so the control
+                // variable's type depends on the *step*'s type and a value
+                // that will not convert names itself through `luaG_forerror`.
+                const initial_value = try vm.eval(node.initial);
+                const limit_value = try vm.eval(node.limit);
+                const step_value: Value = if (node.step) |expr| try vm.eval(expr) else .{ .number = .{ .int = 1 } };
                 const slot = try vm.localSlot(node.name);
-                var current = initial;
-                while (if (Number.less(step, Number.Number.fromInt(0))) !Number.less(current, limit) else !Number.less(limit, current)) {
-                    try vm.tick();
-                    try vm.declareCell(slot, .{ .number = current });
-                    try vm.execBlock(&node.block);
-                    if (vm.exec.returned or vm.exec.goto_name != null) break;
-                    if (vm.exec.breaking) {
-                        vm.exec.breaking = false;
-                        break;
+                if (initial_value == .number and initial_value.number.isInt() and
+                    step_value == .number and step_value.number.isInt())
+                {
+                    const initial = initial_value.number.int;
+                    const step = step_value.number.int;
+                    if (step == 0) return vm.raise("'for' step is zero", .{});
+                    // `forlimit`: the limit is floored (or raised to a ceil for
+                    // a descending loop) into an integer; one that lands
+                    // outside the integer range clips to the nearest bound —
+                    // or skips the loop when it is already on the far side.
+                    const limit: i64 = limit_blk: {
+                        const number = arithmeticNumber(limit_value) orelse
+                            return vm.raise("bad 'for' limit (number expected, got {s})", .{limit_value.typeName()});
+                        if (number == .int) break :limit_blk number.int;
+                        const bound = number.float;
+                        // `luaV_flttointeger`: floor, and one up from there when
+                        // the loop runs down — the inequality is what lets a
+                        // limit outside the bounds fall through to the clip
+                        const floored = @floor(bound);
+                        const rounded = if (step < 0 and floored != bound) floored + 1 else floored;
+                        const max_bound: f64 = @floatFromInt(Number.Number.max_int);
+                        const min_bound: f64 = @floatFromInt(Number.Number.min_int);
+                        if (rounded >= min_bound and rounded < max_bound)
+                            break :limit_blk @intFromFloat(rounded);
+                        // out of integer range: `luai_numlt(0, flim)` decides
+                        // which side of the loop it sits on
+                        if (bound > 0) {
+                            if (step < 0) return;  // a descending loop starts past it
+                            break :limit_blk Number.Number.max_int;
+                        } else {
+                            if (step > 0) return;  // an ascending loop starts past it
+                            break :limit_blk Number.Number.min_int;
+                        }
+                    };
+                    if (if (step > 0) initial > limit else initial < limit) return;  // starts past the limit
+                    // The reference stores the *remaining* iterations after
+                    // the first, in unsigned arithmetic.
+                    const ulimit: u64 = @bitCast(limit);
+                    const uinit: u64 = @bitCast(initial);
+                    var remaining: u64 = if (step > 0) count_blk: {
+                        var count = ulimit -% uinit;
+                        if (step != 1) count /= @as(u64, @bitCast(step));
+                        break :count_blk count;
+                    } else count_blk: {
+                        // `-(step + 1)` avoids negating `mininteger` itself
+                        const divisor = @as(u64, @bitCast(0 -% (step +% 1))) + 1;
+                        break :count_blk (uinit -% ulimit) / divisor;
+                    };
+                    var current = initial;
+                    while (true) {
+                        try vm.tick();
+                        try vm.declareCell(slot, .{ .number = .{ .int = current } });
+                        try vm.execBlock(&node.block);
+                        if (vm.exec.returned or vm.exec.goto_name != null) break;
+                        if (vm.exec.breaking) {
+                            vm.exec.breaking = false;
+                            break;
+                        }
+                        if (remaining == 0) break;
+                        remaining -= 1;
+                        current +%= step;
                     }
-                    current = Number.add(current, step);
+                } else {
+                    // Floats all the way: `for i = 1, "3", "1"` counts 1.0,
+                    // 2.0, 3.0. The reference checks the values in limit,
+                    // step, initial-value order.
+                    const limit_number = arithmeticNumber(limit_value) orelse
+                        return vm.raise("bad 'for' limit (number expected, got {s})", .{limit_value.typeName()});
+                    const step_number = arithmeticNumber(step_value) orelse
+                        return vm.raise("bad 'for' step (number expected, got {s})", .{step_value.typeName()});
+                    const initial_number = arithmeticNumber(initial_value) orelse
+                        return vm.raise("bad 'for' initial value (number expected, got {s})", .{initial_value.typeName()});
+                    const initial_float = initial_number.toFloat();
+                    const limit_float = limit_number.toFloat();
+                    const step_float = step_number.toFloat();
+                    if (step_float == 0) return vm.raise("'for' step is zero", .{});
+                    if (if (step_float > 0) limit_float < initial_float else initial_float < limit_float) return;  // starts past the limit
+                    var current = initial_float;
+                    while (true) {
+                        try vm.tick();
+                        try vm.declareCell(slot, .{ .number = .{ .float = current } });
+                        try vm.execBlock(&node.block);
+                        if (vm.exec.returned or vm.exec.goto_name != null) break;
+                        if (vm.exec.breaking) {
+                            vm.exec.breaking = false;
+                            break;
+                        }
+                        // `floatforloop`: advance, and keep going while the
+                        // index is still within the limit in the step's
+                        // direction — a NaN comparison ends the loop.
+                        current += step_float;
+                        const within = if (step_float > 0) current <= limit_float else limit_float <= current;
+                        if (!within) break;
+                    }
                 }
             },
             .generic_for => |node| {
@@ -1082,6 +1219,11 @@ pub const VM = struct {
             .next => {
                 const table = try vm.checkTable(args, 1, "next", "next");
                 const key = if (args.len == 1 or args[1] == .nil) null else args[1];
+                // A resume key the walk cannot continue from is refused the
+                // way `findindex` refuses it, and without a position: the
+                // reference reports it against `next`'s own C frame, never
+                // against the line that called it.
+                if (key) |given| if (!table.resumableNextKey(given)) return vm.raisePlain("invalid key to 'next'", .{});
                 const pair = table.next(key);
                 if (pair) |entry| return vm.allocator.dupe(Value, &.{ entry.key, entry.value }) catch return error.OutOfMemory;
                 return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
@@ -1093,7 +1235,10 @@ pub const VM = struct {
                 const previous: i64 = if (args.len > 1) try intArgument(args[1]) else 0;
                 const index = std.math.add(i64, previous, 1) catch return error.RuntimeError;
                 const key: Value = .{ .number = Number.Number.fromInt(index) };
-                const value = if (args[0] == .table) args[0].table.get(key) else try vm.getTableIndex(args[0], key);
+                // `ipairsaux` reads through `lua_geti`, so a subject table's
+                // `__index` runs: 5.4 walks past the array's own end if the
+                // metamethod keeps answering
+                const value = try vm.getTableIndex(args[0], key);
                 if (value == .nil) return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
                 return vm.allocator.dupe(Value, &.{ key, value }) catch return error.OutOfMemory;
             },
@@ -1792,7 +1937,12 @@ pub const VM = struct {
 
         if (value == .nil or (value == .boolean and !value.boolean)) {
             output.appendSlice(vm.allocator, whole) catch return error.OutOfMemory;
-        } else try vm.appendReplacementValue(output, value);
+        } else switch (value) {
+            .string, .number => try vm.appendReplacementValue(output, value),
+            // `add_value` refuses whatever `lua_isstring` does not take, which
+            // is everything else a table lookup or the call came back with
+            else => return vm.raise("invalid replacement value (a {s})", .{value.typeName()}),
+        }
     }
 
     fn appendGsubTemplate(vm: *VM, output: *std.ArrayList(u8), source: []const u8, result: Pattern.Result, template: []const u8) Error!void {
@@ -3354,7 +3504,7 @@ pub const VM = struct {
         for (args[first - 1 ..], first..) |value, argument| {
             const bytes = switch (value) {
                 .string => |string| string.slice(),
-                .number => |number| vm.numberBytes(number),
+                .number => |number| vm.writeNumberBytes(number),
                 else => {
                     const text = try vm.checkString(args, argument, short, long);
                     try vm.writeHandleBytes(handle, text);
@@ -4685,39 +4835,203 @@ pub const VM = struct {
                 else => return vm.typeError(1, short, long, "function", args[0]),
             }
         }
-        if (std.mem.indexOfScalar(u8, mode, 't') == null) {
-            const message = std.fmt.allocPrint(vm.allocator, "attempt to load a text chunk (mode is '{s}')", .{mode}) catch return error.OutOfMemory;
-            defer vm.allocator.free(message);
-            return vm.loadFailure(message);
-        }
         if (args.len > 0 and (args[0] == .function or args[0] == .native_function)) {
             var pieces: std.ArrayList(u8) = .empty;
             defer pieces.deinit(vm.allocator);
-            while (true) {
-                const results = try vm.invokeCallableValues(args[0], &.{});
-                defer vm.allocator.free(results);
-                // `generic_reader`: nil (or nothing) ends the chunk, and a
-                // number is a piece like any other, since `lua_isstring`
-                // accepts one. A function that never returns nil is the
-                // reference's own infinite read, so the loop is honest.
-                const piece = if (results.len == 0) .nil else results[0];
-                if (piece == .nil) break;
-                switch (piece) {
-                    .string => |string| pieces.appendSlice(vm.allocator, string.slice()) catch return error.OutOfMemory,
-                    .number => |number| pieces.appendSlice(vm.allocator, vm.numberBytes(number)) catch return error.OutOfMemory,
-                    else => return vm.loadFailure("reader function must return a string"),
-                }
+            // The reader's first piece alone decides the shape of the load:
+            // its value type is checked before the mode is even consulted,
+            // an empty or nil piece ends the chunk, and its first byte turns
+            // the load binary or text, the way `f_parser`'s `zgetc` does.
+            switch (try vm.pullLoadPiece(args[0], &pieces)) {
+                .eof => {},
+                .failed => |result| return result,
+                .piece => if (pieces.items[0] == binary_chunk_intro) {
+                    if (std.mem.indexOfScalar(u8, mode, 'b') == null)
+                        return vm.loadModeRefusal("binary", mode);
+                    // The header is checked with only the bytes pulled so
+                    // far, pulling another piece just when a check still
+                    // needs bytes: a reader that fails later never runs once
+                    // a check has said no, and end of input is a truncation
+                    while (true) {
+                        switch (binaryLoadVerdict(pieces.items)) {
+                            .valid => return vm.loadBinaryUnsupported(chunk_name),
+                            .failed => |reason| return vm.loadBinaryFailure(chunk_name, reason),
+                            .more => {},
+                        }
+                        switch (try vm.pullLoadPiece(args[0], &pieces)) {
+                            .piece => {},
+                            .failed => |result| return result,
+                            .eof => break,
+                        }
+                    }
+                    return vm.loadBinaryFailure(chunk_name, "truncated chunk");
+                } else {
+                    if (std.mem.indexOfScalar(u8, mode, 't') == null)
+                        return vm.loadModeRefusal("text", mode);
+                    // The reference parses as the pieces arrive, so a reader
+                    // is asked for another piece only while its text could
+                    // still use one: a failure whose token ends where the
+                    // text does is the lexer starving, and more input may
+                    // complete or confirm it, while a failure with text
+                    // behind the token is the parser's answer. A parse that
+                    // stands so far is no answer at all — only end of input
+                    // confirms it.
+                    var starving: ?[]Value = null;
+                    while (true) {
+                        switch (try vm.pullLoadPiece(args[0], &pieces)) {
+                            .failed => |result| {
+                                // the reader's own error supersedes whatever
+                                // an earlier round kept
+                                if (starving) |old| vm.allocator.free(old);
+                                return result;
+                            },
+                            .eof => break,
+                            .piece => {
+                                var token_at_end = false;
+                                const attempt = try vm.loadCompileProbe(pieces.items, chunk_name, args, &token_at_end);
+                                if (attempt.len == 0 or attempt[0] != .nil) {
+                                    // parses so far; the next round decides,
+                                    // and a kept failure is answered by it
+                                    vm.allocator.free(attempt);
+                                    if (starving) |old| vm.allocator.free(old);
+                                    starving = null;
+                                } else if (!token_at_end) {
+                                    if (starving) |old| vm.allocator.free(old);
+                                    return attempt;
+                                } else {
+                                    if (starving) |old| vm.allocator.free(old);
+                                    starving = attempt;
+                                }
+                            },
+                        }
+                    }
+                    if (starving) |failure| return failure;
+                    return vm.loadCompile(pieces.items, chunk_name, args);
+                },
             }
+            // an empty chunk is still a text chunk, and still owes the mode
+            if (std.mem.indexOfScalar(u8, mode, 't') == null)
+                return vm.loadModeRefusal("text", mode);
             return vm.loadCompile(pieces.items, chunk_name, args);
         }
         const source = if (args[0] == .number) vm.numberBytes(args[0].number) else args[0].string.slice();
+        if (source.len > 0 and source[0] == binary_chunk_intro) {
+            if (std.mem.indexOfScalar(u8, mode, 'b') == null)
+                return vm.loadModeRefusal("binary", mode);
+            return switch (binaryLoadVerdict(source)) {
+                .valid => vm.loadBinaryUnsupported(chunk_name),
+                .failed => |reason| vm.loadBinaryFailure(chunk_name, reason),
+                .more => vm.loadBinaryFailure(chunk_name, "truncated chunk"),
+            };
+        }
+        if (std.mem.indexOfScalar(u8, mode, 't') == null)
+            return vm.loadModeRefusal("text", mode);
         return vm.loadCompile(source, chunk_name, args);
+    }
+
+    /// One `generic_reader` round: append the reader's next piece and report
+    /// whether there is one. Nil — or nothing returned — ends the chunk, and
+    /// so does an empty piece, which `luaZ_fill` reads as end of input. A
+    /// number is a piece like any other, since `lua_isstring` accepts one.
+    /// The two ways the round itself can fail come back as the load's
+    /// failure half, the way the reference's protected parser hands them
+    /// over: nil plus the message.
+    const LoadPiece = union(enum) { piece, eof, failed: []Value };
+
+    fn pullLoadPiece(vm: *VM, reader: Value, pieces: *std.ArrayList(u8)) Error!LoadPiece {
+        const saved_error = vm.exec.thrown_error;
+        vm.exec.thrown_error = null;
+        const results = vm.invokeCallableValues(reader, &.{}) catch |err| switch (err) {
+            // a reader that raises gives the load its error object, thrown
+            // shape and position intact, rather than raising through it
+            error.RuntimeError => {
+                const thrown = vm.exec.thrown_error orelse .nil;
+                vm.exec.thrown_error = saved_error;
+                return .{ .failed = try vm.loadPair(thrown) };
+            },
+            else => {
+                vm.exec.thrown_error = saved_error;
+                return err;
+            },
+        };
+        vm.exec.thrown_error = saved_error;
+        defer vm.allocator.free(results);
+        const piece = if (results.len == 0) .nil else results[0];
+        switch (piece) {
+            .nil => return .eof,
+            .string => |string| {
+                const slice = string.slice();
+                if (slice.len == 0) return .eof;
+                pieces.appendSlice(vm.allocator, slice) catch return error.OutOfMemory;
+                return .piece;
+            },
+            .number => |number| {
+                pieces.appendSlice(vm.allocator, vm.numberBytes(number)) catch return error.OutOfMemory;
+                return .piece;
+            },
+            // The reference's `luaL_error` from inside the load:
+            // `luaL_where` gives the load call's line, or nothing at all
+            // where the caller is itself a native, as it is under `pcall`.
+            // The traceback it appends where an error handler is installed
+            // is a gap lualite shares with every other untraced error.
+            else => {
+                var buffer: [192]u8 = undefined;
+                const message = if (try vm.errorPosition(1, &buffer)) |position|
+                    std.fmt.allocPrint(vm.allocator, "{s}reader function must return a string", .{position}) catch return error.OutOfMemory
+                else
+                    vm.allocator.dupe(u8, "reader function must return a string") catch return error.OutOfMemory;
+                defer vm.allocator.free(message);
+                return .{ .failed = try vm.loadFailure(message) };
+            },
+        }
+    }
+
+    /// The failure half of a load that stopped on the reader's own error:
+    /// nil plus the error object exactly as it was thrown.
+    fn loadPair(vm: *VM, failure: Value) Error![]Value {
+        return vm.allocator.dupe(Value, &.{ .nil, failure }) catch return error.OutOfMemory;
+    }
+
+    /// `checkmode`'s refusal: a bare raise from the parser, carrying the
+    /// mode as written and no position of its own.
+    fn loadModeRefusal(vm: *VM, kind: []const u8, mode: []const u8) Error![]Value {
+        const message = std.fmt.allocPrint(vm.allocator, "attempt to load a {s} chunk (mode is '{s}')", .{ kind, mode }) catch return error.OutOfMemory;
+        defer vm.allocator.free(message);
+        return vm.loadFailure(message);
+    }
+
+    /// `luaU_undump` refusing the chunk: the name is shown the way the
+    /// undumper shows it — an `=` or `@` intro dropped, a signature-named
+    /// source reading as `binary string` — and the reason follows with no
+    /// line, since a binary chunk has none.
+    fn loadBinaryFailure(vm: *VM, chunk_name: []const u8, reason: []const u8) Error![]Value {
+        const message = std.fmt.allocPrint(vm.allocator, "{s}: bad binary format ({s})", .{ binaryErrorPrefix(chunk_name), reason }) catch return error.OutOfMemory;
+        defer vm.allocator.free(message);
+        return vm.loadFailure(message);
+    }
+
+    /// A chunk whose header checks out, which the reference would happily
+    /// execute and lualite cannot: there is no bytecode reader behind its
+    /// tree-walking evaluator. The refusal stands where execution would.
+    fn loadBinaryUnsupported(vm: *VM, chunk_name: []const u8) Error![]Value {
+        const message = std.fmt.allocPrint(vm.allocator, "{s}: cannot load binary chunks", .{binaryErrorPrefix(chunk_name)}) catch return error.OutOfMemory;
+        defer vm.allocator.free(message);
+        return vm.loadFailure(message);
     }
 
     /// Compile `source` as the chunk `chunk_name`, with `args[3]` as the
     /// environment when present, and hand back the loaded function. Every
     /// compile failure is a `nil, message` pair, never a raise.
     fn loadCompile(vm: *VM, source: []const u8, chunk_name: []const u8, args: []const Value) Error![]Value {
+        var token_at_end = false;
+        return vm.loadCompileProbe(source, chunk_name, args, &token_at_end);
+    }
+
+    /// The same compile, also reporting whether a syntax failure's token
+    /// ends where the text does: that is the lexer starving for input
+    /// rather than objecting to it, and so the one sort of failure a
+    /// reader's next piece could still change.
+    fn loadCompileProbe(vm: *VM, source: []const u8, chunk_name: []const u8, args: []const Value, token_at_end: *bool) Error![]Value {
         var arena_ptr = vm.allocator.create(std.heap.ArenaAllocator) catch return error.OutOfMemory;
         arena_ptr.* = .init(vm.allocator);
         var arena_transferred = false;
@@ -4734,29 +5048,38 @@ pub const VM = struct {
         const chunk = parser.parseChunk() catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.ReportFailed, error.ParserFailed => {
+                // the message is built while the arena still holds the source
+                // it points into; freeing first is a use-after-free that reads
+                // fine on a small chunk and faults on a large one
+                noteStarvedToken(&diagnostics, owned_source, token_at_end);
+                const failure = try vm.loadSyntaxFailure(&diagnostics, owned_source, chunk_name);
                 arena_ptr.deinit();
                 vm.allocator.destroy(arena_ptr);
                 arena_transferred = true;
-                return vm.loadSyntaxFailure(&diagnostics, owned_source, chunk_name);
+                return failure;
             },
         };
         const semantics = arena.create(Semantic.Program) catch return error.OutOfMemory;
         semantics.* = Semantic.analyze(arena, &diagnostics, &chunk) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.ReportFailed => {
+                noteStarvedToken(&diagnostics, owned_source, token_at_end);
+                const failure = try vm.loadSyntaxFailure(&diagnostics, owned_source, chunk_name);
                 arena_ptr.deinit();
                 vm.allocator.destroy(arena_ptr);
                 arena_transferred = true;
-                return vm.loadSyntaxFailure(&diagnostics, owned_source, chunk_name);
+                return failure;
             },
         };
         semantics.source = owned_source;
         semantics.chunk_name = arena.dupe(u8, chunk_name) catch return error.OutOfMemory;
         if (diagnostics.errors.items.len != 0) {
+            noteStarvedToken(&diagnostics, owned_source, token_at_end);
+            const failure = try vm.loadSyntaxFailure(&diagnostics, owned_source, chunk_name);
             arena_ptr.deinit();
             vm.allocator.destroy(arena_ptr);
             arena_transferred = true;
-            return vm.loadSyntaxFailure(&diagnostics, owned_source, chunk_name);
+            return failure;
         }
         vm.owned_program_arenas.append(vm.allocator, arena_ptr) catch return error.OutOfMemory;
         arena_transferred = true;
@@ -4919,10 +5242,19 @@ pub const VM = struct {
         };
     }
 
-    // a closer named as itself, except end of file, which reads `<eof>` with
-    // no quotes around it — `luaX_token2str`'s split
+    // a closer named as itself, except the tokens whose text stands for a
+    // whole class, which `luaX_token2str` leaves bare: `<eof>`, `<name>`,
+    // `<integer>`, `<number>` and `<string>`
     fn closerWhat(buffer: []u8, kind: @import("Token.zig").Kind) []const u8 {
-        if (kind == .eof) return "<eof> expected";
+        const class: ?[]const u8 = switch (kind) {
+            .eof => "<eof>",
+            .ident => "<name>",
+            .decimal => "<integer>",
+            .float => "<number>",
+            .str, .long_str => "<string>",
+            else => null,
+        };
+        if (class) |text| return std.fmt.bufPrint(buffer, "{s} expected", .{text}) catch "syntax error";
         const text = @import("Token.zig").luaText(kind) orelse "token";
         return std.fmt.bufPrint(buffer, "'{s}' expected", .{text}) catch "syntax error";
     }
@@ -4954,7 +5286,7 @@ pub const VM = struct {
         const io = vm.io orelse return vm.loadFailure("file loading is unavailable");
         const path: ?[]const u8 = if (args.len > 0 and args[0] == .string) args[0].string.slice() else null;
         const source = if (path) |filename| std.Io.Dir.cwd().readFileAlloc(io, filename, vm.allocator, .unlimited) catch |err| {
-            const message = std.fmt.allocPrint(vm.allocator, "cannot open {s}: {t}", .{ filename, err }) catch return error.OutOfMemory;
+            const message = std.fmt.allocPrint(vm.allocator, "cannot open {s}: {s}", .{ filename, fileErrorMessage(@errorName(err)) }) catch return error.OutOfMemory;
             defer vm.allocator.free(message);
             return vm.loadFailure(message);
         } else blk: {
@@ -4963,7 +5295,14 @@ pub const VM = struct {
             break :blk reader.interface.allocRemaining(vm.allocator, .unlimited) catch return vm.loadFailure("cannot read stdin");
         };
         defer vm.allocator.free(source);
-        const name = vm.interner.intern(path orelse "=stdin") catch return error.OutOfMemory;
+        // `luaL_loadfilex` names the chunk after the file behind an `@`,
+        // which is what makes its positions read `file:line: ` rather than
+        // `[string "file"]:line: `
+        const name = if (path) |filename| blk: {
+            const with_intro = std.fmt.allocPrint(vm.allocator, "@{s}", .{filename}) catch return error.OutOfMemory;
+            defer vm.allocator.free(with_intro);
+            break :blk vm.interner.intern(with_intro) catch return error.OutOfMemory;
+        } else vm.interner.intern("=stdin") catch return error.OutOfMemory;
         const mode: Value = if (args.len > 1) args[1] else .nil;
         const environment: Value = if (args.len > 2) args[2] else .nil;
         return vm.baseLoad(&.{ .{ .string = vm.interner.intern(source) catch return error.OutOfMemory }, .{ .string = name }, mode, environment });
@@ -5608,6 +5947,12 @@ pub const VM = struct {
         return Number.toBytes(number, &vm.number_buffer) catch "?";
     }
 
+    /// `g_write`'s format for a number, which leaves the `.0` off a whole float
+    /// where `tostring` keeps it
+    fn writeNumberBytes(vm: *VM, number: Number.Number) []const u8 {
+        return Number.toWriteBytes(number, &vm.number_buffer) catch "?";
+    }
+
     fn newTable(vm: *VM) Error!*Table {
         const table = Table.create(vm.allocator, vm.tracker) catch return error.OutOfMemory;
         vm.owned_tables.append(vm.allocator, table) catch {
@@ -5705,9 +6050,34 @@ pub const VM = struct {
 
     fn evalTableConstructor(vm: *VM, constructor: *const Ast.TableConstructor) Error!Value {
         const table = try vm.newTable();
+
+        // `OP_NEWTABLE` sizes both parts up front from what the parser counted:
+        // the array to the list fields — minus a trailing multi-result field,
+        // which `lastlistfield` does not count because its length is unknown —
+        // and the hash part to `2^ceillog2(nrec)` nodes. Both sizes are
+        // observable: a keyed integer field inside the static count lands in
+        // the (still empty) array instead of the hash, and the record fields
+        // take the pre-sized hash without a rehash.
+        var static_count: u32 = 0;
+        var records: u32 = 0;
+        for (constructor.fields) |field| switch (field) {
+            .expression => static_count += 1,
+            .named, .indexed => records += 1,
+        };
+        if (constructor.fields.len != 0) switch (constructor.fields[constructor.fields.len - 1]) {
+            .expression => |item| switch (item.expression) {
+                .vararg, .function_call => static_count -= 1,
+                else => {},
+            },
+            else => {},
+        };
+        table.prealloc(
+            static_count,
+            if (records == 0) 0 else @as(u32, 1) << @intCast(Table.ceillog2(records)),
+        ) catch return error.OutOfMemory;
+
         var list_values: std.ArrayList(Value) = .empty;
         defer list_values.deinit(vm.allocator);
-        var next: i64 = 1;
         for (constructor.fields, 0..) |field, field_index| switch (field) {
             .expression => |item| {
                 const is_last = field_index + 1 == constructor.fields.len;
@@ -5741,9 +6111,15 @@ pub const VM = struct {
                 table.set(key, value) catch return error.OutOfMemory;
             },
         };
-        for (list_values.items) |value| {
-            table.set(.{ .number = .{ .int = next } }, value) catch return error.OutOfMemory;
-            next += 1;
+
+        // `OP_SETLIST`: grow the array to exactly the run's last index when it
+        // does not fit — exact, not to a power of two — and then write the run
+        // straight into the array part, which is why a keyed field that moved
+        // into the array during the grow is overwritten by the list value that
+        // lands on it.
+        table.resizeArrayTo(@intCast(list_values.items.len)) catch return error.OutOfMemory;
+        for (list_values.items, 0..) |value, index| {
+            table.array[index] = value;
         }
         return .{ .table = table };
     }
@@ -5781,14 +6157,6 @@ pub const VM = struct {
                 },
                 else => return vm.raise("attempt to get length of a {s} value", .{value.typeName()}),
             },
-        };
-    }
-
-    fn numberValue(vm: *VM, expr: Ast.Expression) Error!Number.Number {
-        return switch (try vm.eval(expr)) {
-            .number => |number| number,
-            .string => |string| Number.parse(string.slice()) orelse return error.RuntimeError,
-            else => error.RuntimeError,
         };
     }
 
