@@ -45,7 +45,7 @@ for file in "$CASES"/*.lua; do
   lua_out=$("$LUA" -e 'local _, e = loadfile("'"$file"'") if e then io.stderr:write(e) end' 2>&1)
 
   # the diagnostics are coloured, which the greps below would trip over
-  lite_out=$("$LUALITE" --check "$file" 2>&1 | sed $'s/\033\\[[0-9;]*m//g')
+  lite_out=$("$LUALITE" --check "$file" 2>&1 | LC_ALL=C sed $'s/\033\\[[0-9;]*m//g')
 
   if [ -n "$lua_out" ]; then
     # the reference refuses the file, so lualite has to as well

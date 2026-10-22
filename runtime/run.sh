@@ -51,7 +51,11 @@ if [ ! -x "$LUALITE" ]; then
 fi
 
 normalize() {
-  sed -E \
+  # LC_ALL=C keeps sed treating the stream as opaque bytes: under a UTF-8
+  # locale macOS sed refuses a case whose output holds a byte sequence that
+  # is not valid UTF-8, and a normalize that produces nothing on both sides
+  # would pass a real difference silently
+  LC_ALL=C sed -E \
     -e $'s/\033\\[[0-9;]*m//g' \
     -e 's/0x[0-9a-fA-F]+/0xADDR/g'
 }
