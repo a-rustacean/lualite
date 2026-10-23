@@ -75,3 +75,42 @@ show(string.format("%s %s %s", true, nil, 12.5))
 show(pcall(string.format, "%z", 1))
 show(pcall(string.format, "%+s", "x"))
 show(pcall(string.format, "%+q", "x"))
+
+-- %q serializes floats as hex literals so they scan back exactly, with
+-- spellings for the infinities and NaN
+show(string.format("%q|%q|%q", 1.0, -0.0, 5e-324))
+show(string.format("%q|%q|%q", 1e300, 1/0, -1/0))
+show(string.format("%q|%q", 0/0, 2^53))
+
+-- %a is the platform's hex float
+show(string.format("%a|%a|%A", 1.0, 0.1, 3.5))
+show(string.format("%a|%a", 5e-324, 1/0))
+
+-- a bare %s carries embedded zeros, but a modified one refuses them
+show(#string.format("%10s", "abc"))
+show(pcall(string.format, "%5s", "a\0b"))
+show(#string.format("%s", "a\0b"))
+
+-- a long string is not padded by a width that has no precision
+local long = string.rep("x", 100)
+show(#string.format("%99s", long), #string.format("%99s", long:sub(2)), #string.format("%.5s", long))
+
+-- rejected specifications, checked before the value is consumed
+show(pcall(string.format, "%100d", 1))
+show(pcall(string.format, "%.100f", 1))
+show(pcall(string.format, "%1.2.3f", 1))
+show(pcall(string.format, "%5.3.2d", 1))
+show(pcall(string.format, "%#d", 1))
+show(pcall(string.format, "%05c", 65))
+show(pcall(string.format, "%.2c", 65))
+show(pcall(string.format, "%"))
+show(pcall(string.format, "%5"))
+show(pcall(string.format, "%d"))
+
+-- unsigned conversions see two's complement bits
+show(string.format("%x|%X|%o|%u", -1, math.mininteger, -1, -1))
+show(string.format("%d|%d", math.mininteger, math.maxinteger))
+
+-- %c takes any integer and narrows it to a byte
+show(string.format("%c|%c|%c", 256, -1, 65.0))
+show(pcall(string.format, "%c", 65.5))
