@@ -8,8 +8,24 @@
 
 set -euo pipefail
 
-LUA=${LUA:-/tmp/lua-5.4.7/src/lua}
+LUA=${LUA:-}
 HERE=$(cd "$(dirname "$0")" && pwd)
+
+# /tmp is wiped between sessions, so prefer a nix-provided lua and fall back
+# to the other locations the harnesses know about
+if [ -z "$LUA" ]; then
+  nix_lua=$(nix eval --raw nixpkgs#lua5_4.outPath 2>/dev/null)/bin/lua
+  for candidate in \
+    "$nix_lua" \
+    /tmp/lua-5.4.7/src/lua \
+    /var/folders/97/_qcnlbz94c311tpc5jsvnyyh0000gn/T/opencode/lua/lua-5.4.7/src/lua
+  do
+    if [ -x "$candidate" ]; then
+      LUA=$candidate
+      break
+    fi
+  done
+fi
 SOURCE="$HERE/../src/Number.golden.lua"
 TARGET="$HERE/../src/Number.golden.txt"
 

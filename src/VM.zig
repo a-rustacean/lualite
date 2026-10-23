@@ -5706,15 +5706,8 @@ pub const VM = struct {
                 vm.raiseArgument(argument, short, long, "number has no integer representation", .{}),
             .string => |string| blk: {
                 const parsed = Number.parse(string.slice()) orelse return vm.typeError(argument, short, long, "number", value);
-                break :blk switch (parsed) {
-                    .int => |integer| integer,
-                    .float => |float| blk2: {
-                        const truncated = @trunc(float);
-                        if (truncated != float or std.math.isNan(float) or std.math.isInf(float))
-                            return vm.raiseArgument(argument, short, long, "number has no integer representation", .{});
-                        break :blk2 @as(i64, @intFromFloat(truncated));
-                    },
-                };
+                break :blk parsed.toIntExact() orelse
+                    vm.raiseArgument(argument, short, long, "number has no integer representation", .{});
             },
             else => vm.typeError(argument, short, long, "number", value),
         };

@@ -30,10 +30,7 @@ pub const Number = union(enum) {
     pub fn toIntExact(n: Number) ?i64 {
         return switch (n) {
             .int => |v| v,
-            .float => |f| if (f == @trunc(f) and f >= -9.2233720368547758e18 and f <= 9.2233720368547758e18)
-                @intFromFloat(f)
-            else
-                null,
+            .float => |f| floatToIntExact(f),
         };
     }
 
@@ -157,28 +154,105 @@ fn floatMod(a: f64, b: f64) f64 {
 
 // --- comparison ---
 
-/// `<` on the widened form, so one of each compares as the float Lua would.
-/// NaN makes every comparison false, which falls out of IEEE rather than needing
-/// a check of its own.
+/// `l_intfitsf`: an integer within ±2^53 becomes a float without rounding, so
+/// a mixed comparison can be done in floats. Outside that the reference
+/// converts the float towards the integer side instead, which keeps
+/// `maxinteger < 2^63` true and `maxinteger == 2^63` false.
+fn intFitsFloat(i: i64) bool {
+    return i >= -9007199254740992 and i <= 9007199254740992;
+}
+
+const min_integer_as_float: f64 = -9223372036854775808.0;
+
+/// `luaV_flttointeger` with `F2Ifloor`, or with `F2Iceil` when `ceil` is set:
+/// the rounded value, or null when it is NaN or beyond the integer range. The
+/// upper bound is exclusive because 2^63 is not an `i64`.
+fn floatToIntRounded(f: f64, comptime ceil: bool) ?i64 {
+    var rounded = @floor(f);
+    if (ceil and rounded != f) rounded += 1;
+    if (!(rounded >= min_integer_as_float and rounded < -min_integer_as_float)) return null;
+    return @intFromFloat(rounded);
+}
+
+/// `F2Ieq`: the float must already be integral.
+fn floatToIntExact(f: f64) ?i64 {
+    if (f != @trunc(f)) return null;
+    return floatToIntRounded(f, false);
+}
+
+fn lessIntFloat(i: i64, f: f64) bool {
+    if (intFitsFloat(i)) return @as(f64, @floatFromInt(i)) < f;
+    // `i < f` is `i < ceil(f)`, and a float beyond the range is above every
+    // integer exactly when it is positive
+    if (floatToIntRounded(f, true)) |ceiling| return i < ceiling;
+    return f > 0;
+}
+
+fn lessFloatInt(f: f64, i: i64) bool {
+    if (intFitsFloat(i)) return f < @as(f64, @floatFromInt(i));
+    if (floatToIntRounded(f, false)) |floored| return floored < i;
+    return f < 0;
+}
+
+fn lessEqIntFloat(i: i64, f: f64) bool {
+    if (intFitsFloat(i)) return @as(f64, @floatFromInt(i)) <= f;
+    if (floatToIntRounded(f, false)) |floored| return i <= floored;
+    return f > 0;
+}
+
+fn lessEqFloatInt(f: f64, i: i64) bool {
+    if (intFitsFloat(i)) return f <= @as(f64, @floatFromInt(i));
+    if (floatToIntRounded(f, true)) |ceiling| return ceiling <= i;
+    return f < 0;
+}
+
+/// `<` with the reference's mixed rules. NaN makes every comparison false,
+/// which falls out of IEEE rather than needing a check of its own.
 pub fn less(a: Number, b: Number) bool {
-    return switch (pair(a, b)) {
-        .both_int => |ints| ints[0] < ints[1],
-        .mixed => |m| m.a.toFloat() < m.b.toFloat(),
+    return switch (a) {
+        .int => |i| switch (b) {
+            .int => |j| i < j,
+            .float => |f| lessIntFloat(i, f),
+        },
+        .float => |f| switch (b) {
+            .int => |i| lessFloatInt(f, i),
+            .float => |g| f < g,
+        },
     };
 }
 
 pub fn lessEq(a: Number, b: Number) bool {
-    return switch (pair(a, b)) {
-        .both_int => |ints| ints[0] <= ints[1],
-        .mixed => |m| m.a.toFloat() <= m.b.toFloat(),
+    return switch (a) {
+        .int => |i| switch (b) {
+            .int => |j| i <= j,
+            .float => |f| lessEqIntFloat(i, f),
+        },
+        .float => |f| switch (b) {
+            .int => |i| lessEqFloatInt(f, i),
+            .float => |g| f <= g,
+        },
     };
 }
 
-/// `==` is true across the two, since `1 == 1.0`. Only this one crosses over.
+/// `==` is true across the two, since `1 == 1.0`. The reference converts both
+/// sides to integers, so a float outside the integer range — or one with a
+/// fraction — never equals an integer.
 pub fn equal(a: Number, b: Number) bool {
-    return switch (pair(a, b)) {
-        .both_int => |ints| ints[0] == ints[1],
-        .mixed => |m| m.a.toFloat() == m.b.toFloat(),
+    return switch (a) {
+        .int => |i| switch (b) {
+            .int => |j| i == j,
+            .float => |f| blk: {
+                const fi = floatToIntExact(f) orelse break :blk false;
+                break :blk fi == i;
+            },
+        },
+        .float => |f| switch (b) {
+            .int => |i| blk: {
+                const fi = floatToIntExact(f) orelse break :blk false;
+                break :blk fi == i;
+            },
+            .float => |g| f == g,
+        },
     };
 }
 
@@ -330,11 +404,19 @@ fn parseInt(text: []const u8) ?i64 {
 }
 
 /// The float half, which is what the standard library's `strtod` does and what
-/// Lua hands the rest of a numeral to.
+/// Lua hands the rest of a numeral to. `l_str2d` first looks for the first of
+/// `.xXnN` and refuses the numeral when it is `n` or `N`, which is how `inf`
+/// and `nan` — words C's `strtod` would accept — stay non-numerals in Lua.
 fn parseFloatText(text: []const u8) ?Number {
     const trimmed = std.mem.trim(u8, text, &std.ascii.whitespace);
     if (trimmed.len == 0) return null;
-
+    for (trimmed) |c| {
+        switch (c) {
+            '.', 'x', 'X' => break,
+            'n', 'N' => return null,
+            else => {},
+        }
+    }
     const f = std.fmt.parseFloat(f64, trimmed) catch return null;
     return .{ .float = f };
 }

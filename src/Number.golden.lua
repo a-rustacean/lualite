@@ -145,3 +145,26 @@ show(3 .. "", "string")
 show(3.5 .. "", "string")
 show(1.0 .. "", "string")
 show(1.0 + 0.0, "float")
+-- mixed integer/float comparisons stay exact past the window a float can hold
+-- every integer in: past ±2^53 the reference converts the float towards the
+-- integer side rather than rounding the integer to a float
+show(9007199254740992 == 9007199254740992.0, "boolean")
+show(9007199254740993 == 9007199254740993.0, "boolean")
+show(9007199254740993 < 9007199254740994.0, "boolean")
+show(9223372036854775807 < 2^63, "boolean")
+show(9223372036854775807 == 2^63, "boolean")
+show(9223372036854775807 <= 2^63, "boolean")
+show(9223372036854775807 >= 2^63, "boolean")
+show(2^63 > 9223372036854775807, "boolean")
+show(-9223372036854775807 - 1 == -2^63, "boolean")
+show(-9223372036854775807 - 1 <= -2^63, "boolean")
+show(9223372036854775807 < 1e19, "boolean")
+show(9223372036854775807 < (0/0), "boolean")
+
+-- `l_str2d` refuses a numeral whose first special character is `n`, so words
+-- C's strtod would accept are not numbers to Lua
+bad('"inf" + 1', "attempt to")
+bad('"nan" + 1', "attempt to")
+bad('" INF " + 1', "attempt to")
+show("1e9999" + 0, "float")
+show("0x1p9999" + 0, "float")
