@@ -224,13 +224,17 @@ from the caller's frame rather than the callee's last expression.
 
 Dynamic text chunks are now supported through `load`, `loadfile`, and `dofile`.
 Each compiled chunk keeps its parse arena and semantic program alive for
-returned closures, and `load` can bind an explicit environment. A reader's
+returned closures, and `load` can bind an explicit environment, nil included:
+`lua_isnone` is what separates an absent fourth argument from an explicit nil,
+and a nil environment makes the chunk's globals refuse to be indexed. A
+reader's
 pieces join the way the reference joins them: a number is appended like a
 string, `nil` or an empty string ends the chunk and compiles what there is, and
 anything else stops with `reader function must return a string`. What the
 caller then sees follows `lua_load`'s errfunc: called from the main chunk the
-message carries that chunk's line *and* the top-level handler's traceback
-inside it, while under `pcall` it comes back bare — no position, no traceback —
+message carries that chunk's line (the reference also folds the top-level
+handler's traceback into it, which is the untraced-error gap), while under
+`pcall` it comes back bare — no position, no traceback —
 and a table the reader raised comes back as the same table. Such failures are
 returned as `nil, message`, not raised. A refused parse renders its expected
 side the way `luaX_token2str` does: `<name> expected near '1'`, with the class
@@ -252,6 +256,15 @@ will not convert names itself through `luaG_forerror`:
 `bad 'for' limit (number expected, got string)`, with `'for' step is zero`
 after the conversions — and an integer path still checks the step first, the
 way the reference orders it.
+
+Mixed integer/float comparisons follow `LTintfloat` and its siblings in
+`lvm.c`: an integer whose magnitude fits a float (through 2^53) is compared as
+a float, a larger one sends the float through `F2Iceil` or `F2Ifloor` with its
+upper bound exclusive, and equality converts through `F2Ieq`, so no fractional
+or out-of-range float equals an integer. A numeral whose first character is
+`n` or `N` is refused before the C library's parser sees it, keeping
+`tonumber("inf")` and `tonumber("nan")` nil, while an overflowing literal such
+as `1e9999` is still infinity.
 
 Coroutines are `std.Io.fiber` threads sharing one VM between them: a yield
 parks the whole Zig call stack on its own host stack and the next resume
@@ -292,7 +305,11 @@ Lua 5.4's xoshiro256** state initialization and unbiased integer projection;
 unary metamethod behavior, plus callable tables (`__call`), `__tostring`, and
 the table iteration hook `__pairs`. Strings share the standard string-library
 metatable, so ordinary string indexing, assignment hooks, and `getmetatable`
-use Lua's type-level metatable behavior.
+use Lua's type-level metatable behavior. Runtime type errors name a value
+through `luaT_objtypename`: a table whose metatable carries a string `__name`
+is reported under that name by every `luaG_typeerror`, order, `for`, call and
+length message, and `luaL_typeerror` does the same; only the `attempt to %s a
+'%s' with a '%s'` wording in `lstrlib.c` keeps the plain `luaL_typename`.
 The `os` library provides `clock`, `time`, `date`, `difftime`, `getenv`,
 `execute` (through the host shell), `remove`, `rename`, `setlocale`, `exit`, and
 `tmpname`. `setlocale` answers without a locale database: `"C"` is the only
@@ -328,10 +345,21 @@ answers `nil, "cannot close standard file"`, a failing `opencheck` (what
 `io.input(name)`, `io.output(name)`, and `io.lines(name)` use) raises
 `cannot open file '%s' (%s)` while plain `io.open` returns `nil, path:
 strerror, errno`, and a negative read count tries for a buffer it cannot have
-and fails with `not enough memory`. Update files (`w+`, `r+`, `a+`) share one
-position between their sides the way a C `FILE*` does: a read flushes a
-pending write and starts where it ended, a write jumps to where the reads left
-off, and `seek()` reports whichever side last moved. Line iterators are bound
+and fails with `not enough memory`. An open mode must start in `r`, `w`, or
+`a`, may then carry one `+` followed only by `b`s, and only after that check
+does the C library decide whether the file opens. Update files (`w+`, `r+`,
+`a+`) follow the C stream position, read-ahead and all: a read first flushes a
+pending write and starts where it ended, while a write that follows a read
+without a seek lands where the last block fill ended — the unread part of the
+buffer is dropped — so a four-byte read from a large file puts the write at
+4096, whereas a read of a whole block or more bypasses the buffer and leaves
+the two positions together. `flush` on a reading stream puts the position back
+where the reads stopped. `seek()` reports whichever side last moved.
+Appending streams start at the end of the file even for reading and write
+there whatever the position says, though the position itself still advances
+from where it was. Writing to a stream whose mode did not open it for writing
+answers `nil, "Bad file descriptor", 9`, and a read follows the same rule.
+Line iterators are bound
 functions over the handle, end without a value at EOF, raise `file is already
 closed` when reused after a close, and `io.lines(name)` hands the file back
 as its fourth result so a generic for can close it. File handles close when
