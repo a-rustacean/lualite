@@ -174,3 +174,23 @@ collectgarbage("restart")
 show(collectgarbage("isrunning"))
 show(collectgarbage("collect"))
 show(collectgarbage("step"))
+
+-- os.setlocale answers "C" for a query and for a request for "C", which is
+-- the only locale this runtime carries; other names answer nil. os.tmpname
+-- is mkstemp-shaped, so only its shape and uniqueness are asserted.
+show(type(os.setlocale), type(os.tmpname))
+show(os.setlocale())
+show(os.setlocale(nil, "numeric"))
+show(os.setlocale("C"))
+show(os.setlocale("C", "collate"))
+show(os.setlocale("zz_ZZ"))
+raises(os.setlocale, "C", "bogus")
+raises(os.setlocale, "C", {})
+raises(os.setlocale, true)
+local tmp_one = os.tmpname()
+local tmp_two = os.tmpname()
+show(type(tmp_one), #tmp_one, tmp_one:sub(1, 9), tmp_one ~= tmp_two)
+local tmp_file = io.open(tmp_one)
+show(tmp_file ~= nil)
+tmp_file:close()
+show(os.remove(tmp_one), os.remove(tmp_two))

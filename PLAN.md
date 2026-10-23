@@ -209,6 +209,19 @@ traceable; native errors add a position only when a Lua function called them
 directly, the way `luaL_where` sees it. Some Lua runtime semantics, less common multiple-result
 contexts, and broad standard library coverage remain open.
 
+Indexing failures follow `luaV_finishget`/`finishset`: the message names only
+the value at the head of the chain — `attempt to index a nil value (field 'a')`
+even when it was `t.a.b` that failed — and the traceable suffix follows
+`getobjname`, with locals and upvalues by name, constants by value, globals
+through their key, and parentheses transparent. A global name is looked up
+through `_ENV`, so a nil environment is reported as the binding it is: a
+shadowing local as `(local '_ENV')`, a function's own environment as
+`(upvalue '_ENV')`. Metatable chains stop at `MAXTAGLOOP` (2000) with
+`'__index' chain too long; possible loop` (or `'__newindex'`). The position
+such an error carries is the caller's own line: it survives calls into
+`__index` functions and `pcall`, the way the reference reads `currentline`
+from the caller's frame rather than the callee's last expression.
+
 Dynamic text chunks are now supported through `load`, `loadfile`, and `dofile`.
 Each compiled chunk keeps its parse arena and semantic program alive for
 returned closures, and `load` can bind an explicit environment. A reader's
@@ -281,7 +294,14 @@ the table iteration hook `__pairs`. Strings share the standard string-library
 metatable, so ordinary string indexing, assignment hooks, and `getmetatable`
 use Lua's type-level metatable behavior.
 The `os` library provides `clock`, `time`, `date`, `difftime`, `getenv`,
-`execute` (through the host shell), `remove`, `rename`, and `exit`.
+`execute` (through the host shell), `remove`, `rename`, `setlocale`, `exit`, and
+`tmpname`. `setlocale` answers without a locale database: `"C"` is the only
+locale this runtime carries and the one every category starts in, so a query
+and a request for `"C"` answer `"C"` while any other name — including the
+environment lookup `""` performs — answers nil. `tmpname` follows the POSIX
+`mkstemp` template, `/tmp/lua_` plus six characters drawn from a state of its
+own (so `math.random`'s stream is untouched), created exclusively and left
+closed on disk for the caller to remove.
 `date` supports UTC conversion, date tables, and common `strftime` directives;
 `time(table)` normalizes and updates calendar fields using UTC. Host-local
 timezone conversion, locale, and process-control functions remain open. File
@@ -337,7 +357,10 @@ stdin. `collectgarbage` supports collect, step, stop, restart, count, and
 isrunning. Automatic and requested sweeps run at interpreter statement
 boundaries to keep temporary AST evaluation values safe. Sweeps are postponed
 through nested interpreted calls because caller expression temporaries are held
-in the host stack; they resume after the outer statement. The count currently
+in the host stack; they resume after the outer statement. The string and file
+metatables are explicit roots because only VM fields reach them; without that,
+a full collect frees the file metatable and later file handles index freed
+memory. The count currently
 covers tracked object allocations, not every auxiliary buffer. Incremental and
 generational collector modes are still open.
 
@@ -358,8 +381,9 @@ the other operand's metamethod.
 
 The core metatable hooks and string pattern matcher are implemented, and the
 `io` library now covers the file and default-stream surface. The largest
-runtime gaps are the rest of `os` (`setlocale`, `tmpname`, host-local time),
-edge-case compatibility across Lua's runtime semantics, and a few
+runtime gaps are host-local time and the host locale database (`setlocale`
+answers only for `"C"`), edge-case compatibility across Lua's runtime
+semantics, and a few
 representation differences: file handles are tables rather than userdata (so
 `type(io.stdout)` says `table` where the reference says `userdata`), uncaught
 errors print no stack traceback anywhere (the cases show reader failures under

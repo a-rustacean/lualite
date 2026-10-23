@@ -70,3 +70,52 @@ show(xpcall(function() return 1 end, function(e) return e end))
 -- calls of non-functions
 raises(function() local t = {} return t.missing() end)
 raises(function() return (nil)() end)
+
+-- indexing values that carry no __index: the message says where the value
+-- came from, parenthesis is transparent, and the reported position is the
+-- caller's own line even after an __index function has run
+raises(function() local x; return x.y end)
+raises(function() local x; return x[1] end)
+raises(function() local x; return (function() return x.y end)() end)
+raises(function() return no_such_global_name.x end)
+raises(function() local t = {}; return t.a.b end)
+raises(function() local t = {}; return t.a:method() end)
+raises(function() return (5).x.y end)
+raises(function() local t; return (t).x end)
+raises(function() local x; x.y = 1 end)
+raises(function() no_such_global_name.x = 1 end)
+raises(function() local t = {}; t.a.b = 1 end)
+raises(function() local s = "x"; s.y = 1 end)
+
+local function nil_index() return nil end
+raises(function()
+  local t = setmetatable({}, { __index = nil_index })
+  return t.a.b
+end)
+
+local chain_a, chain_b = {}, {}
+setmetatable(chain_a, { __index = chain_b })
+setmetatable(chain_b, { __index = chain_a })
+raises(function() return chain_a.missing end)
+
+local write_a, write_b = {}, {}
+setmetatable(write_a, { __newindex = write_b })
+setmetatable(write_b, { __newindex = write_a })
+raises(function() write_a.missing = 1 end)
+
+-- a global name is looked up through _ENV, and that binding is what a
+-- type error names
+raises(function() local _E = nil; local _ENV = _E; return print(1) end)
+raises(function() local _E = nil; local _ENV = _E; some_global = 1 end)
+raises(function()
+  local _E = nil
+  local _ENV = _E
+  local function inner() return print(1) end
+  return inner()
+end)
+raises(function()
+  local _E = nil
+  local _ENV = _E
+  local function inner() some_global = 1 end
+  return inner()
+end)

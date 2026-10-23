@@ -114,6 +114,10 @@ fn seedRandomState(first: u64, second: u64) [4]u64 {
     return state;
 }
 
+/// `mkstemp`'s replacement alphabet, which keeps generated names within the
+/// characters every filesystem accepts.
+const temp_name_alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
 fn lineAt(source: []const u8, offset: u32) usize {
     const at = @min(@as(usize, offset), source.len);
     var line: usize = 1;
@@ -391,6 +395,7 @@ pub const VM = struct {
     text_scratch: [8][64]u8 = undefined,
     text_scratch_slot: u3 = 0,
     rng_state: [4]u64 = seedRandomState(0x6c75616c697465, 0x72616e646f6d),
+    tmp_name_state: [4]u64 = seedRandomState(0x746d706e616d65, 0x6c75616c697465),
     gc_stopped: bool = false,
     gc_pending: bool = false,
     // Where the deferred sweep stands in the cycle the reference's collector
@@ -610,18 +615,34 @@ pub const VM = struct {
                 } else {
                     var receiver = try vm.getName(definition.name.first);
                     const traversed_fields = if (definition.name.method != null) definition.name.fields.len else definition.name.fields.len - 1;
-                    for (definition.name.fields[0..traversed_fields]) |field| {
-                        receiver = try vm.getTableIndex(receiver, .{ .string = vm.interner.intern(field.name) catch return error.OutOfMemory });
+                    // Each read goes through what the last one found and names
+                    // itself the way `varinfo` does: the first name resolves
+                    // itself, every later step is the field that was read
+                    var note_buffer: [192]u8 = undefined;
+                    for (definition.name.fields[0..traversed_fields], 0..) |field, step| {
+                        const note = if (step == 0)
+                            vm.identifierDescription(definition.name.first, &note_buffer)
+                        else
+                            std.fmt.bufPrint(&note_buffer, " (field '{s}')", .{definition.name.fields[step - 1].name}) catch "";
+                        receiver = try vm.getTableIndex(receiver, .{ .string = vm.interner.intern(field.name) catch return error.OutOfMemory }, note);
                     }
+                    // The last field is written through this receiver, so one
+                    // that is not a table is refused the way the write is
                     const table = switch (receiver) {
                         .table => |table| table,
-                        else => return error.RuntimeError,
+                        else => {
+                            const note = if (traversed_fields == 0)
+                                vm.identifierDescription(definition.name.first, &note_buffer)
+                            else
+                                std.fmt.bufPrint(&note_buffer, " (field '{s}')", .{definition.name.fields[traversed_fields - 1].name}) catch "";
+                            return vm.raiseIndexFailure(receiver, note);
+                        },
                     };
                     const final_name = if (definition.name.method) |method|
                         method.name
                     else
                         definition.name.fields[definition.name.fields.len - 1].name;
-                    try vm.setTableIndex(.{ .table = table }, .{ .string = vm.interner.intern(final_name) catch return error.OutOfMemory }, function);
+                    try vm.setTableIndex(.{ .table = table }, .{ .string = vm.interner.intern(final_name) catch return error.OutOfMemory }, function, "");
                 }
             },
             .assignment => |assign| {
@@ -639,7 +660,17 @@ pub const VM = struct {
                     const value: Value = if (i < values.len) values[i] else .nil;
                     switch (target) {
                         .name => |name| try vm.setName(name, value),
-                        .index => |index| try vm.setTableIndex(index.receiver, index.key, value),
+                        .index => |index| {
+                            // The receiver's expression is still in hand, so
+                            // the refusal can name the value it was given
+                            var note_buffer: [192]u8 = undefined;
+                            const receiver_expression = switch (assign.variables[i]) {
+                                .field => |field| field.object,
+                                .index => |expression| expression.object,
+                                .name => unreachable,
+                            };
+                            try vm.setTableIndex(index.receiver, index.key, value, vm.operandDescription(receiver_expression, &note_buffer));
+                        },
                     }
                 }
             },
@@ -889,7 +920,7 @@ pub const VM = struct {
                 }
                 const key = Value{ .string = vm.interner.intern(name.name) catch return error.OutOfMemory };
                 const environment = try vm.environmentValue(name);
-                try vm.setTableIndex(environment, key, value);
+                try vm.setTableIndex(environment, key, value, vm.environmentNote(name));
             },
         }
     }
@@ -897,13 +928,14 @@ pub const VM = struct {
     fn getName(vm: *VM, name: Ast.Identifier) Error!Value {
         return switch (vm.exec.semantics.resolutions.get(name.span.start) orelse return error.MissingResolution) {
             .local => |slot| vm.exec.locals[slot].value,
-            .global => if (std.mem.eql(u8, name.name, "_ENV"))
-                vm.exec.active_environment.value
-            else
-                try vm.getTableIndex(
+            .global => blk: {
+                if (std.mem.eql(u8, name.name, "_ENV")) break :blk vm.exec.active_environment.value;
+                break :blk try vm.getTableIndex(
                     try vm.environmentValue(name),
                     .{ .string = vm.interner.intern(name.name) catch return error.OutOfMemory },
-                ),
+                    vm.environmentNote(name),
+                );
+            },
             .upvalue => |slot| if (slot < vm.exec.upvalues.len) vm.exec.upvalues[slot].value else error.MissingResolution,
         };
     }
@@ -913,6 +945,18 @@ pub const VM = struct {
             .local => |slot| if (slot < vm.exec.locals.len) vm.exec.locals[slot].value else error.MissingResolution,
             .upvalue => |slot| if (slot < vm.exec.upvalues.len) vm.exec.upvalues[slot].value else error.MissingResolution,
             .global => vm.exec.active_environment.value,
+        };
+    }
+
+    /// The `varinfo` tail for the `_ENV` lookup an unresolved global performs:
+    /// the value that could not be indexed is the `_ENV` binding itself, and
+    /// the reference names that binding. A function's own environment is the
+    /// `_ENV` upvalue every global-using chunk gets, so only a shadowing local
+    /// is spoken of as a local.
+    fn environmentNote(vm: *VM, name: Ast.Identifier) []const u8 {
+        return switch (vm.exec.semantics.environment_resolutions.get(name.span.start) orelse .global) {
+            .local => " (local '_ENV')",
+            .upvalue, .global => " (upvalue '_ENV')",
         };
     }
 
@@ -926,8 +970,18 @@ pub const VM = struct {
             .string => |node| .{ .string = vm.interner.intern(node.value) catch return error.OutOfMemory },
             .variable => |variable| switch (variable.*) {
                 .name => |name| try vm.getName(name),
-                .field => |field| try vm.getTableIndex(try vm.eval(field.object), .{ .string = vm.interner.intern(field.name.name) catch return error.OutOfMemory }),
-                .index => |index| try vm.getTableIndex(try vm.eval(index.object), try vm.eval(index.index)),
+                .field => |field| {
+                    var note_buffer: [192]u8 = undefined;
+                    const note = vm.operandDescription(field.object, &note_buffer);
+                    const object = try vm.eval(field.object);
+                    return try vm.getTableIndex(object, .{ .string = vm.interner.intern(field.name.name) catch return error.OutOfMemory }, note);
+                },
+                .index => |index| {
+                    var note_buffer: [192]u8 = undefined;
+                    const note = vm.operandDescription(index.object, &note_buffer);
+                    const object = try vm.eval(index.object);
+                    return try vm.getTableIndex(object, try vm.eval(index.index), note);
+                },
             },
             .parenthesized => |node| try vm.eval(node.expression),
             .unary => |node| try vm.evalUnary(node.operator, node.expression),
@@ -1010,7 +1064,8 @@ pub const VM = struct {
         const callable = if (call.method) |method| blk: {
             const receiver = try vm.eval(call.expression);
             const key = Value{ .string = vm.interner.intern(method.name) catch return error.OutOfMemory };
-            const method_value = try vm.getTableIndex(receiver, key);
+            var receiver_note_buffer: [192]u8 = undefined;
+            const method_value = try vm.getTableIndex(receiver, key, vm.operandDescription(call.expression, &receiver_note_buffer));
             vm.exec.error_offset = call.span.start;
             if (!try vm.isCallable(method_value)) {
                 var description_buffer: [192]u8 = undefined;
@@ -1046,7 +1101,8 @@ pub const VM = struct {
         };
         const results = if (call.method) |method| blk: {
             const receiver = try vm.eval(call.expression);
-            const method_value = try vm.getTableIndex(receiver, .{ .string = vm.interner.intern(method.name) catch return error.OutOfMemory });
+            var receiver_note_buffer: [192]u8 = undefined;
+            const method_value = try vm.getTableIndex(receiver, .{ .string = vm.interner.intern(method.name) catch return error.OutOfMemory }, vm.operandDescription(call.expression, &receiver_note_buffer));
             vm.exec.error_offset = call.span.start;
             if (!try vm.isCallable(method_value)) {
                 var description_buffer: [192]u8 = undefined;
@@ -1238,7 +1294,7 @@ pub const VM = struct {
                 // `ipairsaux` reads through `lua_geti`, so a subject table's
                 // `__index` runs: 5.4 walks past the array's own end if the
                 // metamethod keeps answering
-                const value = try vm.getTableIndex(args[0], key);
+                const value = try vm.getTableIndex(args[0], key, "");
                 if (value == .nil) return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
                 return vm.allocator.dupe(Value, &.{ key, value }) catch return error.OutOfMemory;
             },
@@ -1304,7 +1360,9 @@ pub const VM = struct {
             .os_execute => return vm.osExecute(args),
             .os_remove => return vm.osRemove(args),
             .os_rename => return vm.osRename(args),
+            .os_setlocale => return vm.osSetLocale(args),
             .os_exit => return vm.osExit(args),
+            .os_tmpname => return vm.osTmpName(args),
             .io_open => return vm.ioOpen(args),
             .io_write => return vm.ioWrite(args),
             .io_flush => return vm.ioFlush(args),
@@ -1917,7 +1975,7 @@ pub const VM = struct {
             // is the index, and the first capture is refused if still open
             if (captures.len != 0 and captures[0].unfinished) return vm.patternError(.{ .kind = .unfinished_capture });
             const key = if (captures.len != 0) try vm.patternCapture(source, captures[0]) else Value{ .string = vm.interner.intern(whole) catch return error.OutOfMemory };
-            value = try vm.getTableIndex(replacement, key);
+            value = try vm.getTableIndex(replacement, key, "");
         } else if (replacement == .function or replacement == .native_function) {
             // `push_captures` pushes them all, so any still open is refused
             if (hasUnfinishedCapture(captures)) return vm.patternError(.{ .kind = .unfinished_capture });
@@ -3411,6 +3469,65 @@ pub const VM = struct {
         return vm.allocator.dupe(Value, &.{.{ .boolean = true }}) catch return error.OutOfMemory;
     }
 
+    /// `os.setlocale` answers from the C library's locale database, which this
+    /// runtime does not carry. `"C"` needs none of it: it always installs, and
+    /// every category starts there, so a query and a request for `"C"` both
+    /// answer `"C"`, while any other name — including the environment lookup
+    /// `""` performs — comes back nil the way an unavailable locale does.
+    fn osSetLocale(vm: *VM, args: []const Value) Error![]Value {
+        const short = "setlocale";
+        const long = "os.setlocale";
+        const locale: ?[]const u8 = if (args.len >= 1 and args[0] != .nil)
+            try vm.checkString(args, 1, short, long)
+        else
+            null;
+        const category = try vm.optString(args, 2, "all", short, long);
+        const known = [_][]const u8{ "all", "collate", "ctype", "monetary", "numeric", "time" };
+        var valid = false;
+        for (known) |candidate| {
+            if (std.mem.eql(u8, category, candidate)) {
+                valid = true;
+                break;
+            }
+        }
+        if (!valid) return vm.raiseArgument(2, short, long, "invalid option '{s}'", .{category});
+        if (locale) |name| {
+            if (!std.mem.eql(u8, name, "C")) return vm.allocator.dupe(Value, &.{.nil}) catch return error.OutOfMemory;
+        }
+        const c_locale = vm.interner.intern("C") catch return error.OutOfMemory;
+        return vm.allocator.dupe(Value, &.{.{ .string = c_locale }}) catch return error.OutOfMemory;
+    }
+
+    /// `os.tmpname` on POSIX is `mkstemp` over `/tmp/lua_XXXXXX`: the file is
+    /// created exclusively, closed at once and left on disk for its owner to
+    /// remove, and a name that cannot be placed is an error, not a return.
+    fn osTmpName(vm: *VM, args: []const Value) Error![]Value {
+        _ = args;
+        const io = vm.io orelse return error.RuntimeError;
+        const prefix = "/tmp/lua_";
+        var name_buffer: [prefix.len + 6]u8 = undefined;
+        @memcpy(name_buffer[0..prefix.len], prefix);
+        // `mkstemp` draws from the C library's own entropy, not from the
+        // runtime's `math.random` stream, and this state keeps it that way.
+        vm.tmp_name_state[0] ^= @intCast(std.Io.Clock.real.now(io).toNanoseconds());
+        var attempts: usize = 0;
+        while (attempts < 100) : (attempts += 1) {
+            var sample = nextRandomState(&vm.tmp_name_state);
+            for (name_buffer[prefix.len..]) |*slot| {
+                slot.* = temp_name_alphabet[@as(usize, @intCast(sample % temp_name_alphabet.len))];
+                sample /= temp_name_alphabet.len;
+            }
+            const file = std.Io.Dir.cwd().createFile(io, &name_buffer, .{ .exclusive = true }) catch |err| switch (err) {
+                error.PathAlreadyExists => continue,
+                else => return vm.raise("unable to generate a unique filename", .{}),
+            };
+            file.close(io);
+            const interned = vm.interner.intern(&name_buffer) catch return error.OutOfMemory;
+            return vm.allocator.dupe(Value, &.{.{ .string = interned }}) catch return error.OutOfMemory;
+        }
+        return vm.raise("unable to generate a unique filename", .{});
+    }
+
     fn osExit(vm: *VM, args: []const Value) Error![]Value {
         if (args.len >= 2 and args[1] != .boolean) return error.RuntimeError;
         const code_value = if (args.len == 0) Value{ .boolean = true } else args[0];
@@ -4178,12 +4295,12 @@ pub const VM = struct {
 
     /// `lua_geti`.
     fn tableGetIndex(vm: *VM, receiver: Value, index: i64) Error!Value {
-        return vm.getTableIndex(receiver, intKey(index));
+        return vm.getTableIndex(receiver, intKey(index), "");
     }
 
     /// `lua_seti`.
     fn tableSetIndex(vm: *VM, receiver: Value, index: i64, value: Value) Error!void {
-        try vm.setTableIndex(receiver, intKey(index), value);
+        try vm.setTableIndex(receiver, intKey(index), value, "");
     }
 
     fn tableInsert(vm: *VM, args: []const Value) Error![]Value {
@@ -4485,6 +4602,10 @@ pub const VM = struct {
         const old_varargs = vm.exec.varargs;
         const old_environment = vm.exec.active_environment;
         const old_semantics = vm.exec.semantics;
+        // `currentline` in the reference names the position of the caller's
+        // own instruction, which stays put while the call runs; the offset the
+        // call site left behind has to survive the callee's expressions.
+        const caller_offset = vm.exec.error_offset;
         const saved_results = vm.exec.results;
         const locals_root_start = vm.exec.suspended_locals.items.len;
         const varargs_root_start = vm.exec.suspended_varargs.items.len;
@@ -4500,7 +4621,7 @@ pub const VM = struct {
         vm.exec.suspended_varargs.append(vm.allocator, old_varargs) catch return error.OutOfMemory;
         vm.exec.suspended_results.append(vm.allocator, saved_results.items) catch return error.OutOfMemory;
         vm.exec.active_functions.append(vm.allocator, function) catch return error.OutOfMemory;
-        vm.exec.error_frames.append(vm.allocator, .{ .program = function.semantics, .call_offset = vm.exec.error_offset }) catch return error.OutOfMemory;
+        vm.exec.error_frames.append(vm.allocator, .{ .program = function.semantics, .call_offset = caller_offset }) catch return error.OutOfMemory;
         defer _ = vm.exec.error_frames.pop();
         const called_semantics = function.semantics;
         const frame_size = called_semantics.functions[function.function_index].frame_size;
@@ -4526,6 +4647,7 @@ pub const VM = struct {
             vm.exec.varargs = old_varargs;
             vm.exec.active_environment = old_environment;
             vm.exec.semantics = old_semantics;
+            vm.exec.error_offset = caller_offset;
             vm.exec.suspended_locals.shrinkRetainingCapacity(locals_root_start);
             vm.exec.suspended_varargs.shrinkRetainingCapacity(varargs_root_start);
             vm.exec.suspended_results.shrinkRetainingCapacity(results_root_start);
@@ -4729,6 +4851,7 @@ pub const VM = struct {
             for (coroutine.transfer) |value| try roots.append(vm.allocator, value);
         }
         if (vm.string_metatable) |metatable| try roots.append(vm.allocator, .{ .table = metatable });
+        if (vm.file_metatable) |metatable| try roots.append(vm.allocator, .{ .table = metatable });
         if (vm.default_input) |table| try roots.append(vm.allocator, .{ .table = table });
         if (vm.default_output) |table| try roots.append(vm.allocator, .{ .table = table });
         if (vm.default_error) |table| try roots.append(vm.allocator, .{ .table = table });
@@ -5883,7 +6006,9 @@ pub const VM = struct {
         try vm.putNative(library, "execute", .os_execute);
         try vm.putNative(library, "remove", .os_remove);
         try vm.putNative(library, "rename", .os_rename);
+        try vm.putNative(library, "setlocale", .os_setlocale);
         try vm.putNative(library, "exit", .os_exit);
+        try vm.putNative(library, "tmpname", .os_tmpname);
         vm.globals.set(.{ .string = vm.interner.intern("os") catch return error.OutOfMemory }, .{ .table = library }) catch return error.OutOfMemory;
     }
 
@@ -5983,30 +6108,40 @@ pub const VM = struct {
         return meta.get(.{ .string = vm.interner.intern(name) catch return error.OutOfMemory });
     }
 
-    fn getTableIndex(vm: *VM, receiver: Value, key: Value) Error!Value {
-        return vm.getTableIndexDepth(receiver, key, 0);
+    /// `MAXTAGLOOP`
+    const max_tag_loop = 2000;
+
+    fn getTableIndex(vm: *VM, receiver: Value, key: Value, note: []const u8) Error!Value {
+        return vm.getTableIndexDepth(receiver, key, 0, note);
     }
 
-    fn getTableIndexDepth(vm: *VM, receiver: Value, key: Value, depth: usize) Error!Value {
-        if (depth >= 200) return error.RuntimeError;
+    /// `luaV_finishget`: a receiver with no `__index` is a type error rather
+    /// than a missing value — only a table reads nil. The `note` is the
+    /// receiver's `varinfo` tail, which can describe the value at the head of
+    /// the chain but not one the walk itself reached.
+    fn getTableIndexDepth(vm: *VM, receiver: Value, key: Value, depth: usize, note: []const u8) Error!Value {
+        if (depth >= max_tag_loop) return vm.raise("'__index' chain too long; possible loop", .{});
         if (receiver == .table) {
             const value = receiver.table.get(key);
             if (value != .nil) return value;
         }
         const index = try vm.valueMetamethod(receiver, "__index");
-        if (index == .nil) return if (receiver == .table) .nil else error.RuntimeError;
+        if (index == .nil) {
+            if (receiver == .table) return .nil;
+            return vm.raiseIndexFailure(receiver, note);
+        }
         return switch (index) {
             .function, .native_function => blk: {
                 const values = try vm.invokeCallableValues(index, &.{ receiver, key });
                 defer vm.allocator.free(values);
                 break :blk if (values.len == 0) .nil else values[0];
             },
-            else => vm.getTableIndexDepth(index, key, depth + 1),
+            else => vm.getTableIndexDepth(index, key, depth + 1, ""),
         };
     }
 
-    fn setTableIndex(vm: *VM, receiver: Value, key: Value, value: Value) Error!void {
-        return vm.setTableIndexDepth(receiver, key, value, 0);
+    fn setTableIndex(vm: *VM, receiver: Value, key: Value, value: Value, note: []const u8) Error!void {
+        return vm.setTableIndexDepth(receiver, key, value, 0, note);
     }
 
     /// `luaH_newkey` refuses the keys nothing can be stored under. The
@@ -6024,8 +6159,8 @@ pub const VM = struct {
         }
     }
 
-    fn setTableIndexDepth(vm: *VM, receiver: Value, key: Value, value: Value, depth: usize) Error!void {
-        if (depth >= 200) return error.RuntimeError;
+    fn setTableIndexDepth(vm: *VM, receiver: Value, key: Value, value: Value, depth: usize, note: []const u8) Error!void {
+        if (depth >= max_tag_loop) return vm.raise("'__newindex' chain too long; possible loop", .{});
         if (receiver == .table) {
             if (receiver.table.get(key) != .nil) {
                 receiver.table.set(key, value) catch return error.OutOfMemory;
@@ -6034,7 +6169,7 @@ pub const VM = struct {
         }
         const newindex = try vm.valueMetamethod(receiver, "__newindex");
         if (newindex == .nil) {
-            if (receiver != .table) return error.RuntimeError;
+            if (receiver != .table) return vm.raiseIndexFailure(receiver, note);
             try vm.checkStorableKey(key, false);
             receiver.table.set(key, value) catch return error.OutOfMemory;
         } else {
@@ -6043,7 +6178,7 @@ pub const VM = struct {
                     const values = try vm.invokeCallableValues(newindex, &.{ receiver, key, value });
                     vm.allocator.free(values);
                 },
-                else => try vm.setTableIndexDepth(newindex, key, value, depth + 1),
+                else => try vm.setTableIndexDepth(newindex, key, value, depth + 1, ""),
             }
         }
     }
@@ -6177,16 +6312,12 @@ pub const VM = struct {
     /// carry their kind, and indexed reads are fields.
     fn operandDescription(vm: *VM, expression: Ast.Expression, buffer: []u8) []const u8 {
         switch (expression) {
+            // parens are transparent to where a value came from: the register
+            // behind `("x")` holds the constant the same as `"x"` does
+            .parenthesized => |node| return vm.operandDescription(node.expression, buffer),
             .string => |node| return std.fmt.bufPrint(buffer, " (constant '{s}')", .{node.value}) catch "",
             .variable => |variable| switch (variable.*) {
-                .name => |name| {
-                    const kind: []const u8 = switch (vm.exec.semantics.resolutions.get(name.span.start) orelse .global) {
-                        .local => "local",
-                        .upvalue => "upvalue",
-                        .global => "global",
-                    };
-                    return std.fmt.bufPrint(buffer, " ({s} '{s}')", .{ kind, name.name }) catch "";
-                },
+                .name => |name| return vm.identifierDescription(name, buffer),
                 .field => |field| {
                     switch (field.object) {
                         .variable => |object| switch (object.*) {
@@ -6207,6 +6338,23 @@ pub const VM = struct {
             else => {},
         }
         return "";
+    }
+
+    /// The ` (local 'x')` half of `varinfo` for a name, told from the
+    /// resolution the semantic pass settled on
+    fn identifierDescription(vm: *VM, name: Ast.Identifier, buffer: []u8) []const u8 {
+        const kind: []const u8 = switch (vm.exec.semantics.resolutions.get(name.span.start) orelse .global) {
+            .local => "local",
+            .upvalue => "upvalue",
+            .global => "global",
+        };
+        return std.fmt.bufPrint(buffer, " ({s} '{s}')", .{ kind, name.name }) catch "";
+    }
+
+    /// `luaG_typeerror`'s refusal for a receiver that nothing can be read
+    /// through or written to
+    fn raiseIndexFailure(vm: *VM, receiver: Value, note: []const u8) Error {
+        return vm.raise("attempt to index a {s} value{s}", .{ receiver.typeName(), note });
     }
 
     fn isCallable(vm: *VM, value: Value) Error!bool {
