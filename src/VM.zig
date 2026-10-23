@@ -5488,7 +5488,10 @@ pub const VM = struct {
         arena_transferred = true;
 
         const closure_env = vm.allocator.create(@import("Value.zig").Cell) catch return error.OutOfMemory;
-        closure_env.* = .{ .value = if (args.len > 3 and args[3] != .nil) args[3] else .{ .table = vm.globals } };
+        // `lua_isnone` is what distinguishes no environment from an explicit
+        // nil one, and a nil environment is a value: the chunk's `_ENV`
+        // upvalue becomes nil and its globals refuse to be indexed
+        closure_env.* = .{ .value = if (args.len > 3) args[3] else .{ .table = vm.globals } };
         vm.owned_cells.append(vm.allocator, closure_env) catch {
             vm.allocator.destroy(closure_env);
             return error.OutOfMemory;

@@ -155,3 +155,22 @@ show(pcall(load, function() error("reader boom", 0) end))
 local thrown = { code = 5 }
 local ok, failed, err = pcall(load, function() error(thrown, 0) end)
 show(ok, failed == nil, err == thrown)
+
+-- an explicit nil environment is a value, not an absent argument: the chunk's
+-- _ENV upvalue is nil and its globals refuse to be indexed
+local noenv = load("return x", "envchunk", "t", nil)
+show(pcall(noenv))
+local numbered = load("return x", "envchunk", "t", 5)
+show(pcall(numbered))
+
+-- a reader that answers something other than a string or nil is refused with
+-- the load call's position; under pcall the message carries no traceback
+local table_reader = function() return {} end
+show(pcall(load, table_reader))
+local once = 0
+local mixed = function()
+  once = once + 1
+  if once == 1 then return 1 end
+  return nil
+end
+show(load(mixed))
