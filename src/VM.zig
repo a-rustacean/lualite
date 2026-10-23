@@ -21,9 +21,22 @@ const FileHandle = struct {
     owns_file: bool = true,
     closed: bool = false,
     auto_close: bool = false,
+    /// `a` and `a+`: every write lands at the end of the file whatever the
+    /// stream position says, though the position still advances from where
+    /// it was
+    append: bool = false,
     /// Which side of an update file last moved the shared position; a `w+`
     /// stream reports where the writes left off, not the reader's stale copy
     last_side: enum { read, write } = .read,
+    /// The C library fills a block at a time and keeps the look-ahead past
+    /// the bytes it has handed out, so a write that follows a read without a
+    /// seek lands where the last fill ended. Zig's reader fetches the
+    /// caller's bytes and a whole block in one call, which puts its `pos` a
+    /// caller's worth further on, so update streams carry the reference's
+    /// own accounting here: the descriptor position and how much of the
+    /// current fill is still unclaimed.
+    c_fd: u64 = 0,
+    c_buffered: u64 = 0,
     reader: ?std.Io.File.Reader = null,
     writer: ?std.Io.File.Writer = null,
     writer_interface: ?*std.Io.Writer = null,
@@ -3567,7 +3580,15 @@ pub const VM = struct {
         table.metatable = vm.file_metatable;
         const handle = vm.allocator.create(FileHandle) catch return error.OutOfMemory;
         errdefer vm.allocator.destroy(handle);
-        handle.* = .{ .allocator = vm.allocator, .io = io, .file = file, .table = table, .readable = readable, .writable = writable };
+        handle.* = .{
+            .allocator = vm.allocator,
+            .io = io,
+            .file = file,
+            .table = table,
+            .readable = readable,
+            .writable = writable,
+            .append = append_mode or append_update_mode,
+        };
         if (readable) handle.reader = file.reader(io, &handle.reader_buffer);
         if (writable) {
             if (append_mode or append_update_mode) {
@@ -3575,6 +3596,9 @@ pub const VM = struct {
                 const stat = file.stat(io) catch |err| return vm.osFileFailure(err, path);
                 writer.pos = stat.size;
                 handle.writer = writer;
+                // a C stream opened for appending starts at the end of the
+                // file even for reading, unlike `r+` and `w+`
+                if (handle.reader) |*reader| reader.seekTo(stat.size) catch return error.RuntimeError;
             } else {
                 handle.writer = file.writer(io, &handle.writer_buffer);
             }
@@ -3591,8 +3615,11 @@ pub const VM = struct {
     /// front of a binary 'b' — which is the shape the second half of the C
     /// expression describes.
     fn checkOpenMode(mode: []const u8) bool {
-        if (mode.len > 0 and std.mem.indexOfScalar(u8, "rwa", mode[0]) != null) return true;
-        return mode.len == 3 and mode[2] == 'b';
+        if (mode.len == 0 or std.mem.indexOfScalar(u8, "rwa", mode[0]) == null) return false;
+        var rest = mode[1..];
+        if (rest.len > 0 and rest[0] == '+') rest = rest[1..];
+        for (rest) |byte| if (byte != 'b') return false;
+        return true;
     }
 
     fn ioTmpFile(vm: *VM, args: []const Value) Error![]Value {
@@ -3634,18 +3661,47 @@ pub const VM = struct {
 
     fn writeHandleBytes(vm: *VM, handle: *FileHandle, bytes: []const u8) Error!void {
         _ = vm;
-        // An update stream has to jump to where the reads left off before it
-        // writes again, the way a C `FILE*` carries its one position across
-        // both directions
-        if (handle.last_side == .read) {
-            if (handle.reader) |*reader| {
-                const position = reader.logicalPos();
-                if (handle.writer) |*writer| {
-                    writer.interface.flush() catch return error.RuntimeError;
-                    writer.seekTo(position) catch return error.RuntimeError;
+        const was_reading = handle.last_side == .read;
+        // Where the stream itself thinks it is, before this write
+        const stream_position: u64 = if (handle.reader) |*reader|
+            reader.logicalPos()
+        else if (handle.writer) |*writer|
+            writer.pos + writer.interface.buffered().len
+        else
+            0;
+        if (was_reading) {
+            // Switching from reading to writing the way a C `FILE*` does:
+            // the position stays where the last read-ahead fill left the
+            // descriptor, so bytes the reader had buffered but never handed
+            // out are forgotten. An append stream writes at the end
+            // regardless and keeps the position where the reads left it.
+            if (!handle.append) {
+                if (handle.reader != null) {
+                    if (handle.writer) |*writer| {
+                        writer.seekTo(handle.c_fd) catch return error.RuntimeError;
+                        handle.c_buffered = 0;
+                    }
                 }
             }
             handle.last_side = .write;
+        }
+        if (handle.append) {
+            const writer = if (handle.writer) |*writer| writer else {
+                if (handle.writer_interface) |interface| {
+                    interface.writeAll(bytes) catch return error.RuntimeError;
+                    return;
+                }
+                return error.RuntimeError;
+            };
+            writer.interface.flush() catch return error.RuntimeError;
+            const size = (handle.file.stat(handle.io) catch return error.RuntimeError).size;
+            writer.seekTo(size) catch return error.RuntimeError;
+            writer.interface.writeAll(bytes) catch return error.RuntimeError;
+            writer.interface.flush() catch return error.RuntimeError;
+            // the bytes landed at the end, but the stream still counts them
+            // from the position it had
+            writer.pos = stream_position + bytes.len;
+            return;
         }
         if (handle.writer_interface) |writer| {
             writer.writeAll(bytes) catch return error.RuntimeError;
@@ -3659,6 +3715,16 @@ pub const VM = struct {
         const long = "io.write";
         const table = vm.default_output orelse try vm.standardFile(false);
         const handle = try vm.fileHandleArgument(.{ .table = table }, 1, short, long);
+        if (args.len == 0) return vm.allocator.dupe(Value, &.{.{ .table = table }}) catch return error.OutOfMemory;
+        if (!handle.writable) {
+            // `g_write` still checks every argument before it discovers
+            // that the stream takes none of them
+            for (args, 1..) |value, argument| {
+                if (value == .number) continue;
+                _ = try vm.checkString(args, argument, short, long);
+            }
+            return vm.osFileFailure(error.BadFileDescriptor, null);
+        }
         try vm.writeValues(handle, args, 1, short, long);
         return vm.allocator.dupe(Value, &.{.{ .table = table }}) catch return error.OutOfMemory;
     }
@@ -3667,11 +3733,7 @@ pub const VM = struct {
         _ = args;
         const table = vm.default_output orelse try vm.standardFile(false);
         const handle = try vm.fileHandleArgument(.{ .table = table }, 1, "flush", "io.flush");
-        if (handle.writer_interface) |writer| {
-            writer.flush() catch return error.RuntimeError;
-        } else if (handle.writer) |*writer| {
-            writer.interface.flush() catch return error.RuntimeError;
-        } else return error.RuntimeError;
+        try flushFileHandle(handle);
         return vm.allocator.dupe(Value, &.{.{ .boolean = true }}) catch return error.OutOfMemory;
     }
 
@@ -4069,7 +4131,30 @@ pub const VM = struct {
             }
         }
         handle.last_side = .read;
+        handle.c_fd = position;
+        handle.c_buffered = 0;
         return vm.singleNumber(.{ .int = @intCast(position) });
+    }
+
+    /// `fflush`: pending writes go out, and a reading update stream drops
+    /// the bytes it read ahead and moves its position back to what it has
+    /// actually handed out, which is what the C library does on a flush of
+    /// an input stream.
+    fn flushFileHandle(handle: *FileHandle) Error!void {
+        if (handle.writable and handle.last_side == .read) {
+            if (handle.reader) |*reader| {
+                const position = reader.logicalPos();
+                reader.interface.tossBuffered();
+                reader.pos = position;
+                handle.c_fd = position;
+                handle.c_buffered = 0;
+            }
+        }
+        if (handle.writer_interface) |writer| {
+            writer.flush() catch return error.RuntimeError;
+        } else if (handle.writer) |*writer| {
+            writer.interface.flush() catch return error.RuntimeError;
+        }
     }
 
     fn fileFlush(vm: *VM, args: []const Value) Error![]Value {
@@ -4077,13 +4162,9 @@ pub const VM = struct {
         const long = "?";
         if (args.len == 0) return vm.typeError(1, short, long, "FILE*", null);
         const handle = try vm.fileHandleArgument(args[0], 1, short, long);
-        // `fflush` on a read stream is a no-op that still succeeds; the
-        // answer is the success flag, not the file the way `write` has it
-        if (handle.writer_interface) |writer| {
-            writer.flush() catch return error.RuntimeError;
-        } else if (handle.writer) |*writer| {
-            writer.interface.flush() catch return error.RuntimeError;
-        }
+        // `fflush` on a read stream still succeeds; the answer is the
+        // success flag, not the file the way `write` has it
+        try flushFileHandle(handle);
         return vm.allocator.dupe(Value, &.{.{ .boolean = true }}) catch return error.OutOfMemory;
     }
 
@@ -4093,6 +4174,15 @@ pub const VM = struct {
         if (args.len == 0) return vm.typeError(1, short, long, "FILE*", null);
         const handle = try vm.fileHandleArgument(args[0], 1, short, long);
         if (args.len == 1) return vm.allocator.dupe(Value, &.{args[0]}) catch return error.OutOfMemory;
+        if (!handle.writable) {
+            // `g_write` still checks every argument before it discovers
+            // that the stream takes none of them
+            for (args[1..], 2..) |value, argument| {
+                if (value == .number) continue;
+                _ = try vm.checkString(args, argument, short, long);
+            }
+            return vm.osFileFailure(error.BadFileDescriptor, null);
+        }
         try vm.writeValues(handle, args, 2, short, long);
         return vm.allocator.dupe(Value, &.{args[0]}) catch return error.OutOfMemory;
     }
@@ -4129,9 +4219,116 @@ pub const VM = struct {
                 writer.interface.flush() catch return error.RuntimeError;
                 const position = writer.pos;
                 if (handle.reader) |*reader| reader.seekTo(position) catch return error.RuntimeError;
+                handle.c_fd = position;
+                handle.c_buffered = 0;
             }
             handle.last_side = .read;
         }
+        const tracked = handle.writable and !handle.append and handle.reader != null;
+        const before = if (tracked) handle.reader.?.logicalPos() else 0;
+        const value = try vm.readFormatInner(handle, format, argument, short, long);
+        if (tracked) try vm.noteReadAhead(handle, format, before);
+        return value;
+    }
+
+    /// Reproduce the position a C `FILE*` would report after the read that
+    /// just happened. Its buffer takes a whole block, and the unclaimed part
+    /// of that block survives until the next seek, flush or write: a
+    /// `fread` of something at least a block long reads straight into the
+    /// caller's buffer, while byte-at-a-time reads and the 1 KiB chunks of
+    /// `*a` always go through it.
+    fn noteReadAhead(vm: *VM, handle: *FileHandle, format: Value, before: u64) Error!void {
+        _ = vm;
+        const reader = &handle.reader.?;
+        const after = reader.logicalPos();
+        const size = (handle.file.stat(handle.io) catch return error.RuntimeError).size;
+        const block: u64 = handle.reader_buffer.len;
+        var pos = before;
+        var remaining = if (after >= before) after - before else 0;
+
+        const ReadPattern = enum { request, bytes, chunks, peek };
+        const pattern: ReadPattern = switch (format) {
+            .number => |number| if (number.toIntExact() == 0) .peek else .request,
+            .string => |string| blk: {
+                const text = string.slice();
+                const body = if (text.len > 0 and text[0] == '*') text[1..] else text;
+                break :blk if (body.len > 0 and body[0] == 'a') .chunks else .bytes;
+            },
+            else => .bytes,
+        };
+
+        switch (pattern) {
+            .request => {
+                if (handle.c_buffered > 0) {
+                    const take = @min(remaining, handle.c_buffered);
+                    handle.c_buffered -= take;
+                    pos += take;
+                    remaining -= take;
+                }
+                if (remaining > 0) {
+                    if (remaining >= block) {
+                        handle.c_fd = pos + remaining;
+                        handle.c_buffered = 0;
+                    } else {
+                        const fill = @min(block, size - pos);
+                        handle.c_fd = pos + fill;
+                        handle.c_buffered = fill - @min(remaining, fill);
+                    }
+                }
+            },
+            .bytes => {
+                while (remaining > 0) {
+                    if (handle.c_buffered == 0) {
+                        const fill = @min(block, size - pos);
+                        handle.c_fd = pos + fill;
+                        handle.c_buffered = fill;
+                        if (fill == 0) break;
+                    }
+                    const take = @min(remaining, handle.c_buffered);
+                    handle.c_buffered -= take;
+                    pos += take;
+                    remaining -= take;
+                }
+            },
+            .chunks => {
+                // `*a` reads in `LUAL_BUFFERSIZE` (1 KiB) pieces
+                const chunk: u64 = 1024;
+                while (remaining > 0) {
+                    var want: u64 = @min(remaining, chunk);
+                    if (handle.c_buffered >= want) {
+                        handle.c_buffered -= want;
+                        pos += want;
+                        remaining -= want;
+                        continue;
+                    }
+                    const take = handle.c_buffered;
+                    handle.c_buffered = 0;
+                    pos += take;
+                    want -= take;
+                    remaining -= take;
+                    const fill = @min(block, size - pos);
+                    handle.c_fd = pos + fill;
+                    handle.c_buffered = fill;
+                    if (fill == 0) break;
+                    const eat = @min(want, fill);
+                    handle.c_buffered -= eat;
+                    pos += eat;
+                    remaining -= eat;
+                    if (eat < want) break;
+                }
+            },
+            .peek => {
+                // `test_eof` takes a byte and pushes it back
+                if (handle.c_buffered == 0) {
+                    const fill = @min(block, size - pos);
+                    handle.c_fd = pos + fill;
+                    handle.c_buffered = fill;
+                }
+            },
+        }
+    }
+
+    fn readFormatInner(vm: *VM, handle: *FileHandle, format: Value, argument: usize, short: []const u8, long: []const u8) Error!Value {
         if (format == .number) {
             const count = format.number.toIntExact() orelse
                 return vm.raiseArgument(argument, short, long, "number has no integer representation", .{});
@@ -4197,6 +4394,12 @@ pub const VM = struct {
             },
             'n' => {
                 const reader = &handle.reader.?.interface;
+                // `read_number` reads the longest *numeral* prefix and pushes
+                // back the look-ahead byte, so a line that does not start with
+                // a number leaves the stream where it was (initial spaces
+                // alone are eaten). The scanner below is that sequence:
+                // spaces, sign, `0[xX]`, integral digits, point and fraction,
+                // exponent — each step only advancing over its own characters.
                 while (true) {
                     const next = reader.peek(1) catch |err| switch (err) {
                         error.EndOfStream => {
@@ -4210,18 +4413,84 @@ pub const VM = struct {
                 }
                 var token: std.ArrayList(u8) = .empty;
                 defer token.deinit(vm.allocator);
-                while (true) {
-                    const next = reader.peek(1) catch |err| switch (err) {
-                        error.EndOfStream => break,
-                        else => return error.RuntimeError,
-                    };
-                    const byte = next[0];
-                    if (!(std.ascii.isAlphanumeric(byte) or byte == '+' or byte == '-' or byte == '.')) break;
-                    token.append(vm.allocator, byte) catch return error.OutOfMemory;
+                var byte: ?u8 = try peekLoadByte(reader);
+
+                // optional sign
+                if (byte) |b| if (b == '+' or b == '-') {
+                    token.append(vm.allocator, b) catch return error.OutOfMemory;
                     reader.toss(1);
+                    byte = try peekLoadByte(reader);
+                };
+
+                var hex = false;
+                var digits: usize = 0;
+                if (byte) |b| if (b == '0') {
+                    token.append(vm.allocator, b) catch return error.OutOfMemory;
+                    reader.toss(1);
+                    byte = try peekLoadByte(reader);
+                    if (byte) |marker| {
+                        if (marker == 'x' or marker == 'X') {
+                            token.append(vm.allocator, marker) catch return error.OutOfMemory;
+                            reader.toss(1);
+                            byte = try peekLoadByte(reader);
+                            hex = true;
+                        } else {
+                            digits = 1;
+                        }
+                    } else {
+                        digits = 1;
+                    }
+                };
+
+                // integral part
+                while (byte) |b| {
+                    const digit = if (hex) std.ascii.isHex(b) else std.ascii.isDigit(b);
+                    if (!digit) break;
+                    token.append(vm.allocator, b) catch return error.OutOfMemory;
+                    reader.toss(1);
+                    byte = try peekLoadByte(reader);
+                    digits += 1;
                 }
+
+                // decimal point and fraction
+                if (byte) |b| if (b == '.') {
+                    token.append(vm.allocator, b) catch return error.OutOfMemory;
+                    reader.toss(1);
+                    byte = try peekLoadByte(reader);
+                    while (byte) |d| {
+                        const digit = if (hex) std.ascii.isHex(d) else std.ascii.isDigit(d);
+                        if (!digit) break;
+                        token.append(vm.allocator, d) catch return error.OutOfMemory;
+                        reader.toss(1);
+                        byte = try peekLoadByte(reader);
+                        digits += 1;
+                    }
+                };
+
+                // exponent mark, only after a digit
+                if (digits > 0) if (byte) |e| {
+                    const mark = if (hex) (e == 'p' or e == 'P') else (e == 'e' or e == 'E');
+                    if (mark) {
+                        token.append(vm.allocator, e) catch return error.OutOfMemory;
+                        reader.toss(1);
+                        byte = try peekLoadByte(reader);
+                        if (byte) |s| if (s == '+' or s == '-') {
+                            token.append(vm.allocator, s) catch return error.OutOfMemory;
+                            reader.toss(1);
+                            byte = try peekLoadByte(reader);
+                        };
+                        while (byte) |d| {
+                            if (!std.ascii.isDigit(d)) break;
+                            token.append(vm.allocator, d) catch return error.OutOfMemory;
+                            reader.toss(1);
+                            byte = try peekLoadByte(reader);
+                        }
+                    }
+                };
+
+                // a failed read ends an iterator's file the way any nil does
                 const number = Number.parse(token.items) orelse {
-                    if (token.items.len == 0 and handle.auto_close) closeFileHandle(handle);
+                    if (handle.auto_close) closeFileHandle(handle);
                     return .nil;
                 };
                 return .{ .number = number };
@@ -4241,6 +4510,17 @@ pub const VM = struct {
                 return .{ .string = string };
             },
         }
+    }
+
+    /// The byte `read_number`'s scanner would read next, or null at end of
+    /// input. It peeks rather than takes because the reference pushes its
+    /// look-ahead back with `ungetc`.
+    fn peekLoadByte(reader: *std.Io.Reader) Error!?u8 {
+        const next = reader.peek(1) catch |err| switch (err) {
+            error.EndOfStream => return null,
+            else => return error.RuntimeError,
+        };
+        return next[0];
     }
 
     /// Which metamethods a value has to offer for `checktab` to accept it in
