@@ -715,7 +715,7 @@ pub const VM = struct {
                     // or skips the loop when it is already on the far side.
                     const limit: i64 = limit_blk: {
                         const number = arithmeticNumber(limit_value) orelse
-                            return vm.raise("bad 'for' limit (number expected, got {s})", .{limit_value.typeName()});
+                            return vm.raise("bad 'for' limit (number expected, got {s})", .{try vm.objectTypeName(limit_value)});
                         if (number == .int) break :limit_blk number.int;
                         const bound = number.float;
                         // `luaV_flttointeger`: floor, and one up from there when
@@ -770,11 +770,11 @@ pub const VM = struct {
                     // 2.0, 3.0. The reference checks the values in limit,
                     // step, initial-value order.
                     const limit_number = arithmeticNumber(limit_value) orelse
-                        return vm.raise("bad 'for' limit (number expected, got {s})", .{limit_value.typeName()});
+                        return vm.raise("bad 'for' limit (number expected, got {s})", .{try vm.objectTypeName(limit_value)});
                     const step_number = arithmeticNumber(step_value) orelse
-                        return vm.raise("bad 'for' step (number expected, got {s})", .{step_value.typeName()});
+                        return vm.raise("bad 'for' step (number expected, got {s})", .{try vm.objectTypeName(step_value)});
                     const initial_number = arithmeticNumber(initial_value) orelse
-                        return vm.raise("bad 'for' initial value (number expected, got {s})", .{initial_value.typeName()});
+                        return vm.raise("bad 'for' initial value (number expected, got {s})", .{try vm.objectTypeName(initial_value)});
                     const initial_float = initial_number.toFloat();
                     const limit_float = limit_number.toFloat();
                     const step_float = step_number.toFloat();
@@ -1216,14 +1216,14 @@ pub const VM = struct {
             .native_function => |function| vm.invokeNativeValues(function, args, site),
             .table => |table| blk: {
                 const method = try vm.metamethod(table, "__call");
-                if (method == .nil) return vm.raisePlain("attempt to call a {s} value", .{callable.typeName()});
+                if (method == .nil) return vm.raisePlain("attempt to call a {s} value", .{try vm.objectTypeName(callable)});
                 const arguments = vm.allocator.alloc(Value, args.len + 1) catch return error.OutOfMemory;
                 defer vm.allocator.free(arguments);
                 arguments[0] = callable;
                 @memcpy(arguments[1..], args);
                 break :blk try vm.invokeCallableInfo(method, arguments, depth + 1, site);
             },
-            else => return vm.raisePlain("attempt to call a {s} value", .{callable.typeName()}),
+            else => return vm.raisePlain("attempt to call a {s} value", .{try vm.objectTypeName(callable)}),
         };
     }
 
@@ -1402,7 +1402,7 @@ pub const VM = struct {
         if (args.len < 1) return vm.raiseArgument(1, short, long, "function expected, got no value", .{});
         const body = args[0];
         if (body != .function and body != .native_function)
-            return vm.raiseArgument(1, short, long, "function expected, got {s}", .{body.typeName()});
+            return vm.raiseArgument(1, short, long, "function expected, got {s}", .{try vm.messageTypeName(body)});
         const object = vm.tracker.alloc(ValueModule.Thread, .thread) catch return error.OutOfMemory;
         errdefer vm.tracker.free(object);
         const coroutine = vm.allocator.create(Coroutine) catch return error.OutOfMemory;
@@ -4273,7 +4273,7 @@ pub const VM = struct {
         if (value == .string) return std.math.cast(i64, value.string.slice().len) orelse return error.RuntimeError;
         const method = try vm.valueMetamethod(value, "__len");
         if (method != .nil) return vm.lengthAnswer(method, value);
-        return vm.raisePlain("attempt to get length of a {s} value", .{value.typeName()});
+        return vm.raisePlain("attempt to get length of a {s} value", .{try vm.objectTypeName(value)});
     }
 
     /// `luaL_len`'s conversion of what `__len` answered: an integer, or a
@@ -4564,8 +4564,8 @@ pub const VM = struct {
         if (left == .number and right == .number) return Number.less(left.number, right.number);
         const method = try vm.binaryMetamethod(left, right, "__lt");
         if (method == .nil) {
-            const left_name = left.typeName();
-            const right_name = right.typeName();
+            const left_name = try vm.objectTypeName(left);
+            const right_name = try vm.objectTypeName(right);
             if (std.mem.eql(u8, left_name, right_name))
                 return vm.raisePlain("attempt to compare two {s} values", .{left_name});
             return vm.raisePlain("attempt to compare {s} with {s}", .{ left_name, right_name });
@@ -5571,7 +5571,7 @@ pub const VM = struct {
         const left_to_blame = left != .number;
         const blame = if (left_to_blame) left else right;
         const description = if (left_to_blame) descriptions.left else descriptions.right;
-        return vm.raise("attempt to perform arithmetic on a {s} value{s}", .{ blame.typeName(), description });
+        return vm.raise("attempt to perform arithmetic on a {s} value{s}", .{ try vm.objectTypeName(blame), description });
     }
 
     fn raisePlain(vm: *VM, comptime fmt: []const u8, args: anytype) Error {
@@ -6265,12 +6265,12 @@ pub const VM = struct {
                 else
                     return vm.raise("attempt to unm a 'string' with a 'string'", .{}),
                 .table => try vm.invokeUnaryMetamethod(value, "__unm", description),
-                else => return vm.raise("attempt to perform arithmetic on a {s} value{s}", .{ value.typeName(), description }),
+                else => return vm.raise("attempt to perform arithmetic on a {s} value{s}", .{ try vm.objectTypeName(value), description }),
             },
             .bitwise_not => switch (value) {
                 .number => |n| .{ .number = Number.bitNot(n) catch return vm.raise("number has no integer representation{s}", .{description}) },
                 .table, .string => try vm.invokeUnaryMetamethod(value, "__bnot", description),
-                else => return vm.raise("attempt to perform bitwise operation on a {s} value{s}", .{ value.typeName(), description }),
+                else => return vm.raise("attempt to perform bitwise operation on a {s} value{s}", .{ try vm.objectTypeName(value), description }),
             },
             .length => switch (value) {
                 .string => |s| .{ .number = Number.Number.fromInt(s.len) },
@@ -6283,7 +6283,7 @@ pub const VM = struct {
                     }
                     break :blk .{ .number = Number.Number.fromInt(table.len()) };
                 },
-                else => return vm.raise("attempt to get length of a {s} value", .{value.typeName()}),
+                else => return vm.raise("attempt to get length of a {s} value", .{try vm.objectTypeName(value)}),
             },
         };
     }
@@ -6344,10 +6344,21 @@ pub const VM = struct {
         return std.fmt.bufPrint(buffer, " ({s} '{s}')", .{ kind, name.name }) catch "";
     }
 
+    /// `luaT_objtypename`: a table carrying a string `__name` in its metatable
+    /// reports that name in runtime errors, the way the reference reports named
+    /// userdata, and every other value reports its basic type.
+    fn objectTypeName(vm: *VM, value: Value) Error![]const u8 {
+        if (value == .table) {
+            const name = try vm.metamethod(value.table, "__name");
+            if (name == .string) return name.string.slice();
+        }
+        return value.typeName();
+    }
+
     /// `luaG_typeerror`'s refusal for a receiver that nothing can be read
     /// through or written to
     fn raiseIndexFailure(vm: *VM, receiver: Value, note: []const u8) Error {
-        return vm.raise("attempt to index a {s} value{s}", .{ receiver.typeName(), note });
+        return vm.raise("attempt to index a {s} value{s}", .{ try vm.objectTypeName(receiver), note });
     }
 
     fn isCallable(vm: *VM, value: Value) Error!bool {
@@ -6359,7 +6370,7 @@ pub const VM = struct {
     }
 
     fn callFailure(vm: *VM, callable: Value, description: []const u8) Error {
-        return vm.raise("attempt to call a {s} value{s}", .{ callable.typeName(), description });
+        return vm.raise("attempt to call a {s} value{s}", .{ try vm.objectTypeName(callable), description });
     }
 
     fn binaryMetamethod(vm: *VM, left: Value, right: Value, name: []const u8) Error!Value {
@@ -6371,8 +6382,8 @@ pub const VM = struct {
         const method = try vm.valueMetamethod(operand, name);
         if (method == .nil) {
             if (std.mem.eql(u8, name, "__unm"))
-                return vm.raise("attempt to perform arithmetic on a {s} value{s}", .{ operand.typeName(), description });
-            return vm.raise("attempt to perform bitwise operation on a {s} value{s}", .{ operand.typeName(), description });
+                return vm.raise("attempt to perform arithmetic on a {s} value{s}", .{ try vm.objectTypeName(operand), description });
+            return vm.raise("attempt to perform bitwise operation on a {s} value{s}", .{ try vm.objectTypeName(operand), description });
         }
         const results = try vm.invokeCallableValues(method, &.{ operand, operand });
         defer vm.allocator.free(results);
@@ -6430,11 +6441,11 @@ pub const VM = struct {
                     const left_to_blame = left != .number;
                     const blame = if (left_to_blame) left else right;
                     const description = if (left_to_blame) descriptions.left else descriptions.right;
-                    return vm.raise("attempt to perform bitwise operation on a {s} value{s}", .{ blame.typeName(), description });
+                    return vm.raise("attempt to perform bitwise operation on a {s} value{s}", .{ try vm.objectTypeName(blame), description });
                 },
                 .less_than, .less_equal, .greater_than, .greater_equal => {
-                    const left_name = left.typeName();
-                    const right_name = right.typeName();
+                    const left_name = try vm.objectTypeName(left);
+                    const right_name = try vm.objectTypeName(right);
                     if (std.mem.eql(u8, left_name, right_name))
                         return vm.raise("attempt to compare two {s} values", .{left_name});
                     return vm.raise("attempt to compare {s} with {s}", .{ left_name, right_name });
@@ -6472,7 +6483,7 @@ pub const VM = struct {
                     const blame = if (left_to_blame) left else right;
                     const blame_expression = if (left_to_blame) node.left else node.right;
                     return vm.raise("attempt to concatenate a {s} value{s}", .{
-                        blame.typeName(),
+                        try vm.objectTypeName(blame),
                         vm.operandDescription(blame_expression, &description_buffer),
                     });
                 }

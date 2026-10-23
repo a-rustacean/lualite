@@ -205,3 +205,17 @@ show(load("return function() return 'inner' end")()())
 raises(load, 42)
 local vf = load("local t = ... return select('#', ...), t")
 show(vf(1, 2, 3))
+
+-- a metatable's __name is the type every runtime error reports, the way
+-- luaT_objtypename prefers it over the basic type
+local named = setmetatable({}, { __name = "Widget" })
+raises(function() return named + 1 end)
+raises(function() return named .. "x" end)
+raises(function() return #named end)
+raises(function() return named() end)
+raises(function() return named < named end)
+raises(function() return named ^ 2 end)
+raises(function() local x = 1; for i = 1, named do end end)
+raises(function() return named.missing.deeper end)
+raises(function() return named & 1 end)
+raises(function() return -named end)
